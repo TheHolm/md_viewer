@@ -11,13 +11,10 @@ use gtk4::glib::translate::IntoGlib;
 use gtk4::{gdk, gio, glib, pango};
 use md_viewer::graphics::{Image, RasterSettings};
 use md_viewer::layout;
-use md_viewer::{Align, Block, Diagram, Inline, Math, Style, Table};
+use md_viewer::{Align, Block, Diagram, Inline, Math, Origin, Style, Table, Target, APP_ID};
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
-
-/// The application ID registered with GTK.
-const APP_ID: &str = "io.github.TheHolm.md_viewer";
 
 /// The name of the text tag that centres display math on its line.
 const DISPLAY_MATH_TAG: &str = "math-display";
@@ -64,8 +61,9 @@ const CSS: &str = r#"
 #[derive(Parser, Debug)]
 #[command(version = md_viewer::version(), about = "View a Markdown document")]
 struct Args {
-    /// The Markdown file to view.
-    file: PathBuf,
+    /// The Markdown file to view. Without it the window starts empty, with
+    /// a button to open a document.
+    file: Option<PathBuf>,
 }
 
 /// Parses the command line and runs the application.
@@ -82,8 +80,16 @@ fn main() -> glib::ExitCode {
     app.connect_startup(|app| {
         load_css();
         quit_on_signals(app);
+        gtk4::Window::set_default_icon_name(APP_ID);
+        app.set_accels_for_action("win.open", &["<Control>o"]);
+        app.set_accels_for_action("window.close", &["<Control>w"]);
     });
-    app.connect_activate(move |app| build_window(app, args.file.clone()));
+    app.connect_activate(move |app| {
+        let window = DocWindow::new(app);
+        if let Some(file) = &args.file {
+            open_file(&window, file.clone(), Origin::CommandLine);
+        }
+    });
     app.run_with_args(&[env!("CARGO_PKG_NAME")])
 }
 
@@ -95,7 +101,7 @@ const QUIT_SIGNALS: [i32; 2] = [2, 15];
 fn quit_on_signals(app: &adw::Application) {
     for signal in QUIT_SIGNALS {
         let app = app.downgrade();
-        glib::unix_signal_add_local(signal, move || {
+        glib_unix::unix_signal_add_local(signal, move || {
             if let Some(app) = app.upgrade() {
                 app.quit();
             }
@@ -107,7 +113,7 @@ fn quit_on_signals(app: &adw::Application) {
 /// Installs the document widget styling for the whole application.
 fn load_css() {
     let provider = gtk4::CssProvider::new();
-    provider.load_from_data(CSS);
+    provider.load_from_string(CSS);
     if let Some(display) = gdk::Display::default() {
         gtk4::style_context_add_provider_for_display(
             &display,
@@ -162,66 +168,216 @@ impl Resizable {
     }
 }
 
-/// Builds and shows the main window, then loads `path` into it.
-fn build_window(app: &adw::Application, path: PathBuf) {
-    let view = gtk4::TextView::builder()
-        .editable(false)
-        .cursor_visible(false)
-        .wrap_mode(gtk4::WrapMode::WordChar)
-        .top_margin(12)
-        .bottom_margin(12)
-        .left_margin(layout::DOCUMENT_MARGIN)
-        .right_margin(layout::DOCUMENT_MARGIN)
-        .build();
-    create_tags(&view.buffer().tag_table());
-    let scrolled = gtk4::ScrolledWindow::builder()
-        .vexpand(true)
-        .hscrollbar_policy(gtk4::PolicyType::Never)
-        .child(&view)
-        .build();
-    let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    content.append(&adw::HeaderBar::new());
-    content.append(&scrolled);
+/// One viewer window: a header bar with an "Open" button over either the
+/// empty start page or a document.
+struct DocWindow {
+    /// The application this window belongs to, for opening new windows.
+    app: adw::Application,
+    /// The top-level window.
+    window: adw::ApplicationWindow,
+    /// Holds the header bar; its content is the start page or the document.
+    toolbar: adw::ToolbarView,
+    /// The document shown, or `None` while the window shows the start page.
+    document: RefCell<Option<PathBuf>>,
+}
 
-    let window = adw::ApplicationWindow::builder()
-        .application(app)
-        .title(md_viewer::window_title(&path))
-        .default_width(800)
-        .default_height(900)
-        .content(&content)
-        .build();
-    window.present();
+impl DocWindow {
+    /// Builds and shows a window with the empty start page, and installs
+    /// its `win.open` action (the header bar button, the start page button
+    /// and Ctrl+O).
+    fn new(app: &adw::Application) -> Rc<Self> {
+        let open_button = gtk4::Button::builder()
+            .icon_name("document-open-symbolic")
+            .tooltip_text("Open a Document (Ctrl+O)")
+            .action_name("win.open")
+            .build();
+        let header = adw::HeaderBar::new();
+        header.pack_start(&open_button);
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+        toolbar.set_content(Some(&start_page()));
 
-    let resizable = Rc::new(Resizable::default());
-    {
-        let resizable = resizable.clone();
-        view.add_tick_callback(move |view, _| {
-            resizable.update(view.width());
-            glib::ControlFlow::Continue
+        let window = adw::ApplicationWindow::builder()
+            .application(app)
+            .title(md_viewer::APP_NAME)
+            .default_width(800)
+            .default_height(900)
+            .content(&toolbar)
+            .build();
+        let this = Rc::new(DocWindow {
+            app: app.clone(),
+            window,
+            toolbar,
+            document: RefCell::new(None),
         });
+
+        // The action holds the only strong reference to the window state, so
+        // the state lives exactly as long as the window: removing the action
+        // when the window closes breaks the window -> action -> state cycle.
+        let open = gio::SimpleAction::new("open", None);
+        let state = this.clone();
+        open.connect_activate(move |_, _| choose_file(&state));
+        this.window.add_action(&open);
+        this.window.connect_close_request(|window| {
+            window.remove_action("open");
+            glib::Propagation::Proceed
+        });
+        this.window.present();
+        this
     }
 
-    // Read, render and rasterize on the I/O thread pool, then fill the view
-    // back on the main thread.
-    let settings = raster_settings(&view);
+    /// Replaces the window's content with a fresh document view titled
+    /// after `path`, and returns the view to fill.
+    fn show_document(&self, path: &Path) -> gtk4::TextView {
+        let view = gtk4::TextView::builder()
+            .editable(false)
+            .cursor_visible(false)
+            .wrap_mode(gtk4::WrapMode::WordChar)
+            .top_margin(12)
+            .bottom_margin(12)
+            .left_margin(layout::DOCUMENT_MARGIN)
+            .right_margin(layout::DOCUMENT_MARGIN)
+            .build();
+        create_tags(&view.buffer().tag_table());
+        let scrolled = gtk4::ScrolledWindow::builder()
+            .vexpand(true)
+            .hscrollbar_policy(gtk4::PolicyType::Never)
+            .child(&view)
+            .build();
+        self.toolbar.set_content(Some(&scrolled));
+        self.window.set_title(Some(&md_viewer::window_title(path)));
+        self.document.replace(Some(path.to_path_buf()));
+        view
+    }
+}
+
+/// The page an empty window shows: an invitation to open a document.
+fn start_page() -> adw::StatusPage {
+    let button = gtk4::Button::builder()
+        .label("Open…")
+        .action_name("win.open")
+        .halign(gtk4::Align::Center)
+        .css_classes(["pill", "suggested-action"])
+        .build();
+    adw::StatusPage::builder()
+        .icon_name("text-x-generic-symbolic")
+        .title("Open a Markdown Document")
+        .description("Or pass a file on the command line: md_viewer FILE")
+        .child(&button)
+        .build()
+}
+
+/// Shows the file chooser over `window` and opens the picked document,
+/// in `window` itself if it is still empty and in a new window otherwise.
+/// Cancelling the chooser does nothing.
+fn choose_file(window: &Rc<DocWindow>) {
+    let filters = gio::ListStore::new::<gtk4::FileFilter>();
+    let markdown = gtk4::FileFilter::new();
+    markdown.set_name(Some("Markdown"));
+    for mime_type in md_viewer::MARKDOWN_MIME_TYPES {
+        markdown.add_mime_type(mime_type);
+    }
+    for pattern in md_viewer::MARKDOWN_PATTERNS {
+        markdown.add_pattern(pattern);
+    }
+    let all = gtk4::FileFilter::new();
+    all.set_name(Some("All Files"));
+    all.add_pattern("*");
+    filters.append(&markdown);
+    filters.append(&all);
+
+    let dialog = gtk4::FileDialog::builder()
+        .title("Open a Document")
+        .modal(true)
+        .filters(&filters)
+        .default_filter(&markdown)
+        .build();
+    let folder = md_viewer::chooser_folder(window.document.borrow().as_deref());
+    if let Some(folder) = folder {
+        dialog.set_initial_folder(Some(&gio::File::for_path(folder)));
+    }
+    let window = window.clone();
+    glib::spawn_future_local(async move {
+        let file = match dialog.open_future(Some(&window.window)).await {
+            Ok(file) => file,
+            Err(error) if error.matches(gtk4::DialogError::Dismissed) => return,
+            Err(error) => return show_error(&window.window, &error.to_string()),
+        };
+        match file.path() {
+            Some(path) => open_file(&window, path, Origin::Chooser),
+            None => show_error(
+                &window.window,
+                &format!("Cannot open {}: not a local file", file.uri()),
+            ),
+        }
+    });
+}
+
+/// Shows `message` in an alert dialog over `window`.
+fn show_error(window: &adw::ApplicationWindow, message: &str) {
+    let dialog = adw::AlertDialog::new(Some("Cannot Open Document"), Some(message));
+    dialog.add_response("close", "Close");
+    dialog.present(Some(window));
+}
+
+/// Reports a document that could not be opened: on stderr with exit status
+/// 1 for the command line argument, in a dialog over `window` otherwise.
+fn report_open_error(window: &DocWindow, origin: Origin, message: &str) {
+    if origin.exits_on_error() {
+        eprintln!("{message}");
+        std::process::exit(1);
+    }
+    show_error(&window.window, message);
+}
+
+/// Opens the document at `path` from `window`.
+///
+/// The file is read on the I/O thread pool first, so a failure is reported
+/// (see `report_open_error`) before any window changes. The document is
+/// then shown in `window` or a new window (`md_viewer::open_target`), and
+/// rendered and rasterized on the pool, with settings taken from the new
+/// view, before the view is filled back on the main thread.
+fn open_file(window: &Rc<DocWindow>, path: PathBuf, origin: Origin) {
+    let window = window.clone();
     glib::spawn_future_local(async move {
         let worker_path = path.clone();
-        let result = gio::spawn_blocking(move || {
-            md_viewer::open_document(&worker_path).map(|mut blocks| {
-                md_viewer::graphics::render_document(&mut blocks, &settings);
-                blocks
-            })
-        })
-        .await;
-        match result {
-            Ok(Ok(blocks)) => fill_view(&view, &blocks, &resizable),
+        let text = match gio::spawn_blocking(move || md_viewer::read_document(&worker_path)).await {
+            Ok(Ok(text)) => text,
             Ok(Err(error)) => {
-                eprintln!("{}", md_viewer::error_message(&path, &error));
-                std::process::exit(1);
+                let message = md_viewer::error_message(&path, &error);
+                return report_open_error(&window, origin, &message);
             }
             Err(_) => {
-                eprintln!("Rendering {} failed unexpectedly", path.display());
-                std::process::exit(1);
+                let message = format!("Reading {} failed unexpectedly", path.display());
+                return report_open_error(&window, origin, &message);
+            }
+        };
+        let has_document = window.document.borrow().is_some();
+        let target = match md_viewer::open_target(has_document) {
+            Target::SameWindow => window,
+            Target::NewWindow => DocWindow::new(&window.app),
+        };
+        let view = target.show_document(&path);
+        let resizable = Rc::new(Resizable::default());
+        {
+            let resizable = resizable.clone();
+            view.add_tick_callback(move |view, _| {
+                resizable.update(view.width());
+                glib::ControlFlow::Continue
+            });
+        }
+        let settings = raster_settings(&view);
+        let rendered = gio::spawn_blocking(move || {
+            let mut blocks = md_viewer::render(&text);
+            md_viewer::graphics::render_document(&mut blocks, &settings);
+            blocks
+        })
+        .await;
+        match rendered {
+            Ok(blocks) => fill_view(&view, &blocks, &resizable),
+            Err(_) => {
+                let message = format!("Rendering {} failed unexpectedly", path.display());
+                report_open_error(&target, origin, &message);
             }
         }
     });
@@ -235,9 +391,7 @@ fn raster_settings(view: &gtk4::TextView) -> RasterSettings {
         .font_description()
         .and_then(|font| layout::font_size_px(font.size(), font.is_size_absolute(), pango::SCALE))
         .unwrap_or(layout::DEFAULT_FONT_PX);
-    // `style_context().color()` is the GTK 4.8 way to read the text colour.
-    #[allow(deprecated)]
-    let color = view.style_context().color();
+    let color = view.color();
     let channel = layout::color_channel;
     RasterSettings {
         font_px,

@@ -41,28 +41,22 @@ fn version_flag() {
     );
 }
 
-/// `--help` describes the program and its `FILE` argument.
+/// `--help` describes the program and its optional `FILE` argument.
 #[test]
 fn help_flag() {
     let output = run(&["--help"]);
     assert!(output.status.success());
     let help = String::from_utf8_lossy(&output.stdout);
     assert!(help.contains("View a Markdown document"), "{help}");
-    assert!(help.contains("<FILE>"), "{help}");
+    assert!(help.contains("[FILE]"), "{help}");
 }
 
-/// Without a file the program prints usage and exits with status 2.
-#[test]
-fn missing_argument() {
-    let output = run(&[]);
-    assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("<FILE>"));
-}
-
-/// More than one file is rejected the same way.
+/// More than one file is an argument error: usage and status 2.
 #[test]
 fn too_many_arguments() {
-    assert_eq!(run(&["a.md", "b.md"]).status.code(), Some(2));
+    let output = run(&["a.md", "b.md"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("[FILE]"));
 }
 
 /// With a display, a file that cannot be read is reported on stderr and
@@ -81,13 +75,12 @@ fn unreadable_file_exits_with_error() {
     assert!(stderr.contains("missing.md"), "{stderr}");
 }
 
-/// Opens `fixture` (relative to `tests/fixtures`), lets it run for a few
-/// seconds, then sends SIGTERM and checks that the viewer stayed up, shut
-/// down cleanly (status 0) and printed no GTK criticals or panics.
-fn open_and_close(fixture: &str) {
-    let path = format!("{}/tests/fixtures/{fixture}", env!("CARGO_MANIFEST_DIR"));
+/// Starts the viewer with `args`, lets it run for a few seconds, then sends
+/// SIGTERM and checks that the viewer stayed up, shut down cleanly (status
+/// 0) and printed no GTK criticals or panics.
+fn run_and_close(args: &[&str]) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_md_viewer"))
-        .arg(&path)
+        .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -108,6 +101,21 @@ fn open_and_close(fixture: &str) {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("CRITICAL"), "{stderr}");
     assert!(!stderr.contains("panicked"), "{stderr}");
+}
+
+/// Opens `fixture` (relative to `tests/fixtures`) with `run_and_close`.
+fn open_and_close(fixture: &str) {
+    let path = format!("{}/tests/fixtures/{fixture}", env!("CARGO_MANIFEST_DIR"));
+    run_and_close(&[&path]);
+}
+
+/// With a display and no file, the viewer opens its empty start window,
+/// keeps running and exits cleanly on SIGTERM.
+#[test]
+fn no_file_opens_empty_window() {
+    if have_display() {
+        run_and_close(&[]);
+    }
 }
 
 /// With a display, the showcase document (every feature) opens, keeps

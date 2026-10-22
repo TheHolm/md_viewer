@@ -6,6 +6,56 @@ changes** summary (what also appears in the GitHub Release body) and a
 added at the top. `scripts/extract-release-notes.sh` prints just one release's
 section for the GitHub Release body.
 
+## v0.3.0 — Open files from the GUI, app icon and menu entry
+
+### User-facing changes
+
+- The app has an icon and a menu entry: GNOME (and other desktops) show
+  "MD Viewer" with its icon in the app grid, the dock and Alt+Tab, and it is
+  offered under "Open With" for Markdown files.
+- `FILE` is now optional. Started without one, the window offers an
+  "Open…" button.
+- An Open button in the header bar (and Ctrl+O) picks a document with the
+  system file chooser. It opens in a new window; an empty window is reused.
+  Ctrl+W closes a window.
+- A document picked in the GUI that cannot be opened is reported in a
+  dialog, and the app keeps running. A bad `FILE` on the command line still
+  prints the error and exits with status 1.
+- Needs GTK 4.18 and libadwaita 1.7 or newer (Debian trixie, Ubuntu 26.04
+  and FreeBSD 15 all ship them).
+
+### Details
+
+- Dependencies: gtk4 0.9 → 0.11 (feature `v4_18`), libadwaita 0.7 → 0.9
+  (`v1_7`), glib 0.20 → 0.22. The feature levels are pinned to the oldest
+  target, Debian trixie. glib 0.22 moved `unix_signal_add_local` into the
+  new `glib-unix` crate; `CssProvider::load_from_data` became
+  `load_from_string` and `style_context().color()` became `color()`.
+- `src/main.rs`: each window is a `DocWindow` (an `adw::ToolbarView` with a
+  header bar over an `adw::StatusPage` start page or the document view) with
+  a `win.open` action. `gtk4::FileDialog` picks the file (filtered to
+  Markdown, starting in the current document's folder). The file is read on
+  the I/O pool before any window changes, so a failure leaves the window as
+  it was and shows an `adw::AlertDialog`. The default window icon is set to
+  the application ID for desktops that use window icons.
+- `src/lib.rs`: `APP_ID`, `MARKDOWN_MIME_TYPES`, `MARKDOWN_PATTERNS`,
+  `Origin` (command line or chooser, and whether an error exits),
+  `open_target` (reuse an empty window or open a new one) and
+  `chooser_folder`.
+- `data/`: `io.github.TheHolm.md_viewer.desktop`, a scalable icon and a
+  symbolic icon. GNOME matches the window to the `.desktop` file by the
+  application ID, which is why there was no icon before.
+- Packaging: the `.deb` (cargo-deb `assets`) and the FreeBSD `.pkg` install
+  them under `share/applications` and `share/icons/hicolor`; the release
+  pipeline checks that both packages contain them.
+- Tests: `tests/desktop.rs` (the `.desktop` file agrees with `APP_ID` and
+  the MIME types, passes `desktop-file-validate` when installed, the icons
+  render, and both packages install every file in `data/`); the CLI tests
+  start the empty window; the opening decisions are tested in
+  `tests/document_io.rs`. The chooser's response and the error dialog need
+  user interaction and are checked by hand, so `main.rs` line coverage is
+  about 87% (about 94% overall).
+
 ## v0.2.0 — Tables, math, chemistry and Mermaid diagrams
 
 ### User-facing changes

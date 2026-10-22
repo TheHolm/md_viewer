@@ -16,8 +16,8 @@ asks to commit" rule below, which exists partly for this reason.
 
 `md_viewer` is a small GTK4/libadwaita desktop application for viewing
 Markdown documents. It is a viewer only: it opens the file given on the
-command line, renders it read-only in a scrollable window, and never writes
-to it. The window title is "MD Viewer" (prefixed with the open file's name)
+command line (or picked with the file chooser), renders it read-only in a
+scrollable window, and never writes to it. The window title is "MD Viewer" (prefixed with the open file's name)
 and the application ID is `io.github.TheHolm.md_viewer`. The package,
 library and binary are all named `md_viewer`. Version: declared in the
 `VERSION` file at the repository root, the single source of the version (see
@@ -26,8 +26,13 @@ library and binary are all named `md_viewer`. Version: declared in the
 ## Stack
 
 - Rust 2021 edition, toolchain 1.98 (the version CI builds with)
-- `gtk4` (feature `v4_8`) - GUI toolkit
-- `adw` / libadwaita (feature `v1_2`) - GNOME application shell
+- `gtk4` 0.11 (feature `v4_18`) - GUI toolkit
+- `adw` / libadwaita 0.9 (feature `v1_7`) - GNOME application shell
+- `glib-unix` - GLib's Unix API (SIGINT/SIGTERM handling)
+
+The GTK/libadwaita feature levels are pinned to the oldest target, Debian
+trixie (GTK 4.18, libadwaita 1.7); Ubuntu 26.04 and FreeBSD 15 ship newer.
+Raise them only when every target platform ships the newer version.
 - `pulldown-cmark` - CommonMark parser (with the tables, strikethrough,
   task list and math extensions enabled)
 - `mathra` - LaTeX math (including mhchem `\ce{}`/`\pu{}`) to SVG, pure Rust,
@@ -58,10 +63,17 @@ run there; runtime verification on a real FreeBSD system is a manual step.
 
 ## Layout
 
-- `src/main.rs` - the GTK4/libadwaita GUI: the application, a window with a
-  header bar and a read-only `GtkTextView` inside a `GtkScrolledWindow`.
-  Deliberately thin: it walks the library's blocks and handles errors and
-  exit codes. Text goes into the buffer with one `GtkTextTag` per `Style`;
+- `src/main.rs` - the GTK4/libadwaita GUI: the application and its windows.
+  Each window is a `DocWindow`: an `adw::ToolbarView` with a header bar
+  (Open button) over either the empty start page (`adw::StatusPage`, shown
+  when no `FILE` is given) or a read-only `GtkTextView` inside a
+  `GtkScrolledWindow`. The `win.open` action (Ctrl+O) runs a
+  `gtk4::FileDialog`; the picked file opens in a new window, except that an
+  empty window is reused (`md_viewer::open_target`). The file is read before
+  any window changes: a failure for the command line `FILE` goes to stderr
+  with exit status 1, one for a picked file to an `adw::AlertDialog`
+  (`md_viewer::Origin`). Ctrl+W closes a window. Deliberately thin: it walks
+  the library's blocks and handles errors and exit codes. Text goes into the buffer with one `GtkTextTag` per `Style`;
   formulas are inserted as paintables (`ScaledTexture`, which draws a
   device-pixel texture at its logical size for HiDPI), lowered by a `rise`
   tag to line up baselines, display math centred; tables become a `GtkGrid`
@@ -72,16 +84,20 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   sizes them from their content and the view width: tables at their natural
   width capped to the view (wider ones scroll), diagrams scaled down to fit.
   Widget styling is the `CSS` constant; sizes and classes come from
-  `md_viewer::layout`. SIGINT/SIGTERM quit cleanly through the main loop. Reading, rendering and rasterizing
-  run on `gio::spawn_blocking` (the I/O thread pool), not the GTK main loop,
-  with `RasterSettings` (font size, scale factor, text colour) taken from the
-  view first; the result is awaited from a `glib::spawn_future_local` block
-  so the widgets are built back on the main thread.
+  `md_viewer::layout`. SIGINT/SIGTERM quit cleanly through the main loop.
+  Reading, rendering and rasterizing run on `gio::spawn_blocking` (the I/O
+  thread pool), not the GTK main loop, with `RasterSettings` (font size,
+  scale factor, text colour) taken from the new view first; the results are
+  awaited from a `glib::spawn_future_local` block so the widgets are built
+  back on the main thread.
 - `src/lib.rs` - all non-GUI logic, exposed publicly so the GUI and the
   integration tests share exactly one implementation: the app version
-  (`version`, the `VERSION` file embedded at compile time), reading the document
-  (`read_document`, and `open_document` = read + render, which is what the
-  GUI calls), the error text for an unreadable file (`error_message`), the
+  (`version`, the `VERSION` file embedded at compile time), the application
+  ID (`APP_ID`, which the `.desktop` file and icons are named after), the
+  Markdown MIME types and file patterns (`MARKDOWN_MIME_TYPES`,
+  `MARKDOWN_PATTERNS`), the decisions made when opening a document
+  (`Origin`, `open_target`, `chooser_folder`), reading the document
+  (`read_document`, and `open_document` = read + render), the error text for an unreadable file (`error_message`), the
   window title (`window_title`), the Markdown renderer (`render`) and Pango
   markup for table cells (`pango_markup`, `escape_markup`, and the shared
   colour constants). `render` turns Markdown into a `Vec<Block>`:
@@ -119,25 +135,41 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   - `layout.rs` - the `md_viewer::layout` functions
   - `cli.rs` - the binary end to end: `--version`, `--help` and argument
     errors always; with a display (`DISPLAY`/`WAYLAND_DISPLAY` set) also an
-    unreadable file (status 1) and opening both fixtures, checking that the
-    viewer stays up, prints no GTK criticals and exits 0 on SIGTERM. Without
-    a display those tests print "skipped" and pass
+    unreadable file (status 1), the empty start window (no `FILE`) and
+    opening both fixtures, checking that the viewer stays up, prints no GTK
+    criticals and exits 0 on SIGTERM. Without a display those tests print
+    "skipped" and pass
+  - `desktop.rs` - the files in `data/`: the `.desktop` file agrees with
+    `APP_ID`, `APP_NAME` and `MARKDOWN_MIME_TYPES` and passes
+    `desktop-file-validate` (skipped if not installed), the icons render at
+    their sizes (the symbolic one with fills only), and both the `.deb`
+    assets and the FreeBSD staging in `release.yaml` install every file
   - `fixtures/showcase.md` - a document using every supported feature, for
     manual visual checks (`cargo run -- tests/fixtures/showcase.md`)
   - `fixtures/fallbacks.md` - formulas and diagrams that fail to render and
     math in aligned table cells, for the GUI's fallback paths
   - `document_io.rs` - reading a document from disk, including failure paths,
-    and the window title
+    the window title, and the opening decisions (`Origin`, `open_target`,
+    `chooser_folder`)
   - `version.rs` - that `VERSION` is one `X.Y.Z` line, that `version()`
     reports it, and that the copy in `Cargo.toml` matches it
+- `data/` - desktop integration, installed by both packages:
+  `io.github.TheHolm.md_viewer.desktop` (listed in the app grid, offered for
+  `text/markdown`) and the icons under `icons/hicolor/` (`scalable/apps`,
+  full colour, and `symbolic/apps`, fills only). GNOME matches a window to
+  the `.desktop` file by the application ID, so every name here must be
+  `APP_ID`
 - `VERSION` - the app version, one `X.Y.Z` line; the single source of the
   version
 - `Cargo.toml` - package metadata (its `version` is a copy of `VERSION`),
   dependencies, the `tempfile` dev-dependency and the `cargo-deb` metadata
+  (including `assets`: the binary, docs and every file in `data/`)
 - `.woodpecker/release.yaml` - the Woodpecker CI workflow: on `v*` tags it
   first checks the tag and `Cargo.toml` against `VERSION`, then builds a Debian trixie `.deb`, an Ubuntu 26.04 `.deb` and a FreeBSD `.pkg`,
   then publishes them to the GitHub mirror's Releases (needs a
-  `github_token` secret in Woodpecker). Every package step is required.
+  `github_token` secret in Woodpecker). Every package step is required and
+  checks that its package contains the binary, the `.desktop` file and the
+  icon.
 - `scripts/` - CI helpers: `check-version.sh` (checks `VERSION` is `X.Y.Z`,
   that `Cargo.toml` matches it and, given a tag, that the tag is
   `v<VERSION>`), `build-freebsd-pkg.py` (writes a `.pkg` from a staged
@@ -190,13 +222,13 @@ run there; runtime verification on a real FreeBSD system is a manual step.
 
 ## Status / known gaps
 
-Version 0.2.0. Current known gaps:
+Version 0.3.0. Current known gaps:
 
-- Errors (unreadable file, invalid UTF-8) are written to STDERR and the
-  program exits with status 1; a popup would be better.
+- A `FILE` on the command line that cannot be opened (unreadable, invalid
+  UTF-8) is reported on STDERR with exit status 1; a popup would be better.
+  Files picked in the GUI already get a dialog.
 - Links are styled but not clickable; images are placeholders only.
-- No way to open another file from the GUI, and no reload when the file
-  changes on disk.
+- No reload when the file changes on disk.
 - Formulas are rendered once with the theme's text colour at load time;
   switching between light and dark while a document is open leaves them in
   the old colour.
@@ -209,13 +241,16 @@ Version 0.2.0. Current known gaps:
   date axes crowd. Rendering bugs there are upstream issues.
 - merman's diagram engines make the binary much larger (about 25 MB
   stripped, against about 1.3 MB for 0.1.0).
-- The `.deb`/`.pkg` install only the binary and docs; there is no `.desktop`
-  file or icon yet.
+- The `.desktop` file and icons are only installed by the packages; a binary
+  built from source shows a generic icon under GNOME unless they are copied
+  into `~/.local/share` (see the README).
+- The file chooser's response and the error dialog need user interaction,
+  so the tests do not reach them; check them by hand after changing them.
 
 ## Commands
 
 - Build/check: `cargo build`
-- Run: `cargo run -- <FILE>` (requires a GTK4/libadwaita desktop session)
+- Run: `cargo run -- [FILE]` (requires a GTK4/libadwaita desktop session)
 - Test: `cargo test`
 - Format check: `cargo fmt --check`
 - Version check: `bash scripts/check-version.sh [vX.Y.Z]` (run before
@@ -224,8 +259,10 @@ Version 0.2.0. Current known gaps:
   the `cargo-llvm-cov` subcommand). Run it with a display so the GUI is
   covered too; headless, e.g. `Xvfb :77 & DISPLAY=:77 GDK_BACKEND=x11
   GSK_RENDERER=cairo cargo llvm-cov --tests`. With a display line coverage
-  is about 98%; the remaining lines are defensive branches that cannot be
-  reached with the enabled parser options
+  is about 94% (the library about 99%); the remaining lines are the file
+  chooser and error dialog paths in `main.rs`, which need user interaction,
+  and defensive branches that cannot be reached with the enabled parser
+  options
 - Debian package: `cargo deb` (requires the `cargo-deb` subcommand)
 - FreeBSD package: cross-build with `cargo build --release --target
   x86_64-unknown-freebsd` against a FreeBSD sysroot, then

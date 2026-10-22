@@ -18,6 +18,67 @@ use std::path::Path;
 /// The application name shown in the window title.
 pub const APP_NAME: &str = "MD Viewer";
 
+/// The application ID registered with GTK. Desktops match a window to its
+/// `<APP_ID>.desktop` file (and through that to its icon, also named
+/// `APP_ID`) by this ID, so it must agree with the files in `data/`.
+pub const APP_ID: &str = "io.github.TheHolm.md_viewer";
+
+/// The MIME types of Markdown documents, as offered by the file chooser and
+/// listed in the `.desktop` file's `MimeType=` key.
+pub const MARKDOWN_MIME_TYPES: [&str; 2] = ["text/markdown", "text/x-markdown"];
+
+/// File name patterns of Markdown documents, for the file chooser's filter
+/// on systems whose MIME database does not know the types above.
+pub const MARKDOWN_PATTERNS: [&str; 2] = ["*.md", "*.markdown"];
+
+/// Where a document being opened came from, which decides how a failure to
+/// open it is reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// The `FILE` argument on the command line.
+    CommandLine,
+    /// A file picked in the GUI's file chooser.
+    Chooser,
+}
+
+impl Origin {
+    /// True if failing to open the document should end the program (the
+    /// message goes to stderr and the exit status is 1), as for a bad
+    /// command line argument; false if it is shown in a dialog and the
+    /// application keeps running.
+    pub fn exits_on_error(self) -> bool {
+        self == Origin::CommandLine
+    }
+}
+
+/// Which window a document picked in the file chooser is shown in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    /// The window the chooser was opened from.
+    SameWindow,
+    /// A new window, leaving the current document where it is.
+    NewWindow,
+}
+
+/// Decides where a chosen document opens: every document gets its own
+/// window, except that an empty window (one started without a file) is
+/// reused, so no blank window is left behind.
+pub fn open_target(window_has_document: bool) -> Target {
+    if window_has_document {
+        Target::NewWindow
+    } else {
+        Target::SameWindow
+    }
+}
+
+/// The folder the file chooser starts in: the folder of the document shown
+/// in the window, made absolute (a bare file name means the current
+/// directory). `None` for an empty window, so the chooser picks its default.
+pub fn chooser_folder(document: Option<&Path>) -> Option<std::path::PathBuf> {
+    let document = std::path::absolute(document?).ok()?;
+    document.parent().map(Path::to_path_buf)
+}
+
 /// The raw contents of the repository's `VERSION` file, embedded at compile
 /// time (cargo rebuilds the crate whenever the file changes).
 const VERSION_FILE: &str = include_str!("../VERSION");

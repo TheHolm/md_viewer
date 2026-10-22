@@ -8,8 +8,13 @@ file, renders it read-only in a scrollable window, and never modifies it.
 # How to use
 
 ```
-md_viewer <FILE>
+md_viewer [FILE]
 ```
+
+Without a file the window offers an "Open…" button. The Open button in the
+header bar (or Ctrl+O) picks another document, which opens in a new window;
+Ctrl+W closes a window. Installed from a package, MD Viewer is also in the
+desktop's app grid and in "Open With" for Markdown files.
 
 The document is shown with headings, emphasis, strong text, strikethrough,
 inline code and code blocks, block quotes, ordered/unordered and task lists,
@@ -56,8 +61,9 @@ on Linux against FreeBSD 15 packages.
 
 # Compiling
 
-Needs Rust 1.98 or newer and the GTK4 and libadwaita development files. On
-Debian/Ubuntu:
+Needs Rust 1.98 or newer and the development files of GTK 4.18 and
+libadwaita 1.7 or newer (the versions in Debian trixie, the oldest supported
+platform). On Debian/Ubuntu:
 
 ```
 sudo apt-get install pkg-config libgtk-4-dev libadwaita-1-dev
@@ -67,6 +73,19 @@ cargo build --release
 ```
 
 The compiled executable will be in `target/release/md_viewer`.
+
+The packages also install a `.desktop` file and icons from `data/`; desktops
+use them for the app's name and icon (GNOME shows a generic icon without
+them). To get them for a binary built from source, install them for your
+user:
+
+```
+install -Dm644 data/io.github.TheHolm.md_viewer.desktop -t ~/.local/share/applications
+install -Dm644 data/icons/hicolor/scalable/apps/io.github.TheHolm.md_viewer.svg -t ~/.local/share/icons/hicolor/scalable/apps
+install -Dm644 data/icons/hicolor/symbolic/apps/io.github.TheHolm.md_viewer-symbolic.svg -t ~/.local/share/icons/hicolor/symbolic/apps
+```
+
+The `.desktop` file runs `md_viewer`, so it must be on your `PATH`.
 
 # Versioning
 
@@ -111,5 +130,5 @@ DISPLAY=:77 GDK_BACKEND=x11 GSK_RENDERER=cairo cargo llvm-cov --tests
 * Clickable links.
 * Re-render formulas when switching between light and dark themes.
 * Inline images.
-* Open a file from the GUI and reload it when it changes on disk.
-* Error popups instead of messages on STDERR.
+* Reload a document when it changes on disk.
+* An error popup instead of a message on STDERR for a bad `FILE` argument.

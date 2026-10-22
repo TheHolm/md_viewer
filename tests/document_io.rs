@@ -1,8 +1,10 @@
-//! Integration tests for reading documents from disk, the error message and
-//! the window title.
+//! Integration tests for reading documents from disk, the error message,
+//! the window title, and the decisions made when opening a document (where
+//! it opens, where the file chooser starts, how failures are reported).
 
 use md_viewer::{
-    error_message, open_document, read_document, window_title, Block, Inline, Span, Style,
+    chooser_folder, error_message, open_document, open_target, read_document, window_title, Block,
+    Inline, Origin, Span, Style, Target,
 };
 use std::fs;
 use std::io::{ErrorKind, Write};
@@ -112,4 +114,53 @@ fn window_title_uses_file_name() {
 fn window_title_without_file_name() {
     assert_eq!(window_title(Path::new("/")), "MD Viewer");
     assert_eq!(window_title(Path::new("")), "MD Viewer");
+}
+
+/// A failure to open the command line's file ends the program; one picked
+/// in the file chooser is shown in a dialog instead.
+#[test]
+fn only_command_line_errors_exit() {
+    assert!(Origin::CommandLine.exits_on_error());
+    assert!(!Origin::Chooser.exits_on_error());
+}
+
+/// An empty window is reused for the chosen document; a window already
+/// showing one keeps it, and the new document gets a new window.
+#[test]
+fn open_target_reuses_only_empty_windows() {
+    assert_eq!(open_target(false), Target::SameWindow);
+    assert_eq!(open_target(true), Target::NewWindow);
+}
+
+/// The chooser starts in the shown document's folder.
+#[test]
+fn chooser_folder_is_document_folder() {
+    assert_eq!(
+        chooser_folder(Some(Path::new("/some/dir/notes.md"))),
+        Some(Path::new("/some/dir").to_path_buf())
+    );
+}
+
+/// A relative document path is resolved against the current directory, so
+/// a bare file name starts the chooser there.
+#[test]
+fn chooser_folder_resolves_relative_paths() {
+    let cwd = std::env::current_dir().unwrap();
+    assert_eq!(
+        chooser_folder(Some(Path::new("notes.md"))),
+        Some(cwd.clone())
+    );
+    assert_eq!(
+        chooser_folder(Some(Path::new("docs/notes.md"))),
+        Some(cwd.join("docs"))
+    );
+}
+
+/// An empty window (or a path with no parent) leaves the chooser's folder
+/// to GTK.
+#[test]
+fn chooser_folder_without_document() {
+    assert_eq!(chooser_folder(None), None);
+    assert_eq!(chooser_folder(Some(Path::new("/"))), None);
+    assert_eq!(chooser_folder(Some(Path::new(""))), None);
 }

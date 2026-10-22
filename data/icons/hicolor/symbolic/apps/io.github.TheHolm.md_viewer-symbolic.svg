@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- MD Viewer symbolic icon: a page outline with the Markdown "M↓" mark.
+     Fills only, so GTK can recolour it. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <g fill="#222222">
+    <path fill-rule="evenodd" d="M3 1H10L14 5V14a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1ZM3.5 2.5V13.5H12.5V6H9V2.5Z"/>
+    <path d="M4.5 12.5V7.5H5.75L6.5 9L7.25 7.5H8.5V12.5H7.25V10L6.5 11.5L5.75 10V12.5Z"/>
+    <path d="M10 7.5H11V10.5H12L10.5 12.5L9 10.5H10Z"/>
+  </g>
+</svg>

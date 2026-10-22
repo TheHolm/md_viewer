@@ -16,6 +16,10 @@
 # of RELEASE_NOTES.md by scripts/extract-release-notes.sh. A tag whose version
 # has no entry there fails the pipeline instead of publishing an empty release.
 #
+# GTK/libadwaita: Cargo.toml pins the binding feature levels (v4_18, v1_7)
+# to the oldest target, Debian trixie (GTK 4.18, libadwaita 1.7); Ubuntu 26.04
+# and FreeBSD 15 `latest` ship newer. Raise them only when every target does.
+#
 # Requirements for this to work:
 #   - A `github_token` secret is set on this repo in Woodpecker (Project
 #     Settings -> Secrets), holding a GitHub PAT scoped to Contents:
@@ -83,18 +87,30 @@ steps:
       - >-
         mkdir -p dist stage-root/usr/local/bin
         stage-root/usr/local/share/doc/md_viewer
+        stage-root/usr/local/share/applications
+        stage-root/usr/local/share/icons/hicolor/scalable/apps
+        stage-root/usr/local/share/icons/hicolor/symbolic/apps
       - cp target/freebsd/x86_64-unknown-freebsd/release/md_viewer stage-root/usr/local/bin/md_viewer
       - chmod 555 stage-root/usr/local/bin/md_viewer
       - cp README.md LICENSE stage-root/usr/local/share/doc/md_viewer/
-      - chmod 644 stage-root/usr/local/share/doc/md_viewer/README.md stage-root/usr/local/share/doc/md_viewer/LICENSE
+      # The .desktop file and icons (the same files the .deb installs; see
+      # [package.metadata.deb] assets in Cargo.toml). tests/desktop.rs checks
+      # that every file under data/ is staged here.
+      - cp data/io.github.TheHolm.md_viewer.desktop stage-root/usr/local/share/applications/
+      - cp data/icons/hicolor/scalable/apps/io.github.TheHolm.md_viewer.svg stage-root/usr/local/share/icons/hicolor/scalable/apps/
+      - cp data/icons/hicolor/symbolic/apps/io.github.TheHolm.md_viewer-symbolic.svg stage-root/usr/local/share/icons/hicolor/symbolic/apps/
+      - find stage-root/usr/local/share -type f -exec chmod 644 {} +
       - >-
         python3 scripts/build-freebsd-pkg.py
         --version "$(cat VERSION)"
         --stage-root stage-root
         --deps-file /opt/freebsd-deps.json
         --output "dist/md_viewer-$(cat VERSION)-freebsd-amd64.pkg"
-      # Fail if the binary did not make it into the built .pkg.
-      - zstd -dc dist/md_viewer-*.pkg | tar -tf - | grep -qF 'usr/local/bin/md_viewer'
+      # Fail if the binary, .desktop file or icon did not make it into the .pkg.
+      - zstd -dc dist/md_viewer-*.pkg | tar -tf - > /tmp/pkg-contents.txt
+      - grep -qF 'usr/local/bin/md_viewer' /tmp/pkg-contents.txt
+      - grep -qF 'usr/local/share/applications/io.github.TheHolm.md_viewer.desktop' /tmp/pkg-contents.txt
+      - grep -qF 'usr/local/share/icons/hicolor/scalable/apps/io.github.TheHolm.md_viewer.svg' /tmp/pkg-contents.txt
 
   - name: deb-ubuntu2604
     image: ubuntu:26.04
@@ -114,8 +130,11 @@ steps:
       # an identically named file into the shared dist/ and one would be lost.
       - cargo deb --deb-revision "1~ubuntu2604"
       - cp target/deb-ubuntu2604/debian/*.deb dist/
-      # Fail the release if the binary did not make it into the .deb.
-      - dpkg-deb -c target/deb-ubuntu2604/debian/*.deb | grep -qF 'usr/bin/md_viewer'
+      # Fail the release if the binary, .desktop file or icon is missing.
+      - dpkg-deb -c target/deb-ubuntu2604/debian/*.deb > /tmp/deb-contents.txt
+      - grep -qF 'usr/bin/md_viewer' /tmp/deb-contents.txt
+      - grep -qF 'usr/share/applications/io.github.TheHolm.md_viewer.desktop' /tmp/deb-contents.txt
+      - grep -qF 'usr/share/icons/hicolor/scalable/apps/io.github.TheHolm.md_viewer.svg' /tmp/deb-contents.txt
 
   - name: deb-trixie
     image: rust:1.98-trixie
@@ -128,7 +147,10 @@ steps:
       - mkdir -p dist
       - cargo deb --deb-revision "1~trixie"
       - cp target/deb-trixie/debian/*.deb dist/
-      - dpkg-deb -c target/deb-trixie/debian/*.deb | grep -qF 'usr/bin/md_viewer'
+      - dpkg-deb -c target/deb-trixie/debian/*.deb > /tmp/deb-contents.txt
+      - grep -qF 'usr/bin/md_viewer' /tmp/deb-contents.txt
+      - grep -qF 'usr/share/applications/io.github.TheHolm.md_viewer.desktop' /tmp/deb-contents.txt
+      - grep -qF 'usr/share/icons/hicolor/scalable/apps/io.github.TheHolm.md_viewer.svg' /tmp/deb-contents.txt
 
   - name: publish-github-release
     image: rust:1.98-trixie

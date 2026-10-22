@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=MD Viewer
+GenericName=Markdown Viewer
+Comment=View Markdown documents
+Exec=md_viewer %f
+Icon=io.github.TheHolm.md_viewer
+Terminal=false
+StartupNotify=true
+Categories=Office;Viewer;GTK;
+MimeType=text/markdown;text/x-markdown;
+Keywords=markdown;md;document;viewer;

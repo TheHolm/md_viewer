@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- MD Viewer application icon: a page carrying the Markdown "M↓" mark. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- page edge, seen below the page -->
+  <path d="M30 16H84L104 36V114a6 6 0 0 1-6 6H30a6 6 0 0 1-6-6V22a6 6 0 0 1 6-6Z" fill="#c0bfbc"/>
+  <!-- page -->
+  <path d="M30 12H84L104 32V110a6 6 0 0 1-6 6H30a6 6 0 0 1-6-6V18a6 6 0 0 1 6-6Z" fill="#ffffff"/>
+  <!-- folded corner -->
+  <path d="M84 12V26a6 6 0 0 0 6 6H104Z" fill="#deddda"/>
+  <!-- lines of text -->
+  <rect x="34" y="28" width="38" height="4" rx="2" fill="#c0bfbc"/>
+  <rect x="34" y="38" width="56" height="4" rx="2" fill="#c0bfbc"/>
+  <rect x="34" y="104" width="44" height="4" rx="2" fill="#c0bfbc"/>
+  <!-- the Markdown mark -->
+  <rect x="32" y="52" width="64" height="44" rx="8" fill="#3584e4"/>
+  <g fill="none" stroke="#ffffff" stroke-width="6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M42 86V64L52 76L62 64V86"/>
+    <path d="M80 64V84M72 77L80 85L88 77"/>
+  </g>
+</svg>

@@ -3,15 +3,19 @@ name = "md_viewer"
 # Copy of the VERSION file, which is the single source of the version. Cargo
 # needs a literal value here; `cargo test` (tests/version.rs) and the release
 # pipeline (scripts/check-version.sh) fail if the two ever differ.
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.98"
 description = "Simple GTK4/libadwaita Markdown viewer"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
-adw = { version = "0.7", package = "libadwaita", features = ["v1_2"] }
-gtk4 = { version = "0.9", package = "gtk4", features = ["v4_8"] }
+# GTK/libadwaita feature levels are pinned to the oldest target, Debian trixie
+# (GTK 4.18, libadwaita 1.7). Raise them only when every target ships newer.
+adw = { version = "0.9", package = "libadwaita", features = ["v1_7"] }
+gtk4 = { version = "0.11", package = "gtk4", features = ["v4_18"] }
+# GLib's Unix-specific API (SIGINT/SIGTERM handling); same glib as gtk4.
+glib-unix = "0.22"
 clap = { version = "4", features = ["derive"] }
 pulldown-cmark = { version = "0.13", default-features = false }
 # LaTeX math (with mhchem) to SVG, pure Rust, bundles its own math font.
@@ -28,3 +32,16 @@ tempfile = "3"
 maintainer = "TheHolm <theholm@github.com>"
 section = "utils"
 priority = "optional"
+# Everything the .deb installs. The binary path is remapped by cargo-deb to
+# the real target directory (CI sets CARGO_TARGET_DIR). The .desktop file and
+# icons are what make desktops (GNOME in particular) show the app's name and
+# icon: they match the window to the .desktop file by the application ID.
+# tests/desktop.rs checks that every file under data/ is listed here.
+assets = [
+    ["target/release/md_viewer", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/md_viewer/", "644"],
+    ["LICENSE", "usr/share/doc/md_viewer/", "644"],
+    ["data/io.github.TheHolm.md_viewer.desktop", "usr/share/applications/", "644"],
+    ["data/icons/hicolor/scalable/apps/io.github.TheHolm.md_viewer.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["data/icons/hicolor/symbolic/apps/io.github.TheHolm.md_viewer-symbolic.svg", "usr/share/icons/hicolor/symbolic/apps/", "644"],
+]
