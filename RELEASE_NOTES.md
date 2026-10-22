@@ -6,6 +6,16 @@ changes** summary (what also appears in the GitHub Release body) and a
 added at the top. `scripts/extract-release-notes.sh` prints just one release's
 section for the GitHub Release body.
 
+## v0.2.0 — Tables, math, chemistry and Mermaid diagrams
+
+### User-facing changes
+
+- Work in progress.
+
+### Details
+
+- Work in progress.
+
 ## v0.1.0 — Initial release
 
 ### User-facing changes

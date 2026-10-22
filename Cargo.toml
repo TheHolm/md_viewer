@@ -3,7 +3,7 @@ name = "md_viewer"
 # Copy of the VERSION file, which is the single source of the version. Cargo
 # needs a literal value here; `cargo test` (tests/version.rs) and the release
 # pipeline (scripts/check-version.sh) fail if the two ever differ.
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.98"
 description = "Simple GTK4/libadwaita Markdown viewer"
