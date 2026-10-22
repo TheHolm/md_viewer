@@ -56,10 +56,15 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   buffer is filled back on the main thread.
 - `src/lib.rs` - all non-GUI logic, exposed publicly so the GUI and the
   integration tests share exactly one implementation: reading the document
-  (`read_document`), the window title (`window_title`) and the Markdown
-  renderer (`render`), which turns Markdown into a flat list of `Span`s, each
-  a piece of text plus the `Style`s that apply to it. The GUI only needs to
-  insert spans in order and apply one text tag per style (`Style::tag_name`).
+  (`read_document`, and `open_document` = read + render, which is what the
+  GUI calls), the error text for an unreadable file (`error_message`), the
+  window title (`window_title`) and the Markdown renderer (`render`), which
+  turns Markdown into a flat list of `Span`s, each a piece of text plus the
+  `Style`s that apply to it. The GUI only needs to insert spans in order and
+  apply one text tag per style (`Style::tag_name`; `Style::ALL` lists every
+  style so all tags can be created up front). Private helpers (`Renderer`,
+  `layout_table`, `pad_cell`, `trailing_newlines`, `normalize`) have unit
+  tests in the same file.
 - `tests/` - integration tests split by topic:
   - `render.rs` - the renderer: one group of tests per block type
     (paragraphs, headings, lists, block quotes, code blocks, rules, tables)
@@ -98,8 +103,17 @@ run there; runtime verification on a real FreeBSD system is a manual step.
 
 ## Status / known gaps
 
-Initial scaffolding: only documentation is committed so far; the CI workflow
-and the code are being added.
+First version (v0.1.0). Current known gaps:
+
+- Errors (unreadable file, invalid UTF-8) are written to STDERR and the
+  program exits with status 1; a popup would be better.
+- Links are styled but not clickable; images are placeholders only.
+- No way to open another file from the GUI, and no reload when the file
+  changes on disk.
+- Table column widths count characters, not display width, so wide (e.g.
+  CJK) characters can misalign columns.
+- The `.deb`/`.pkg` install only the binary and docs; there is no `.desktop`
+  file or icon yet.
 
 ## Commands
 

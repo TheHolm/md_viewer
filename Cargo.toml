@@ -1,0 +1,21 @@
+[package]
+name = "md_viewer"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.98"
+description = "Simple GTK4/libadwaita Markdown viewer"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+adw = { version = "0.7", package = "libadwaita", features = ["v1_2"] }
+gtk4 = { version = "0.9", package = "gtk4", features = ["v4_8"] }
+clap = { version = "4", features = ["derive"] }
+pulldown-cmark = { version = "0.13", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"
+
+[package.metadata.deb]
+maintainer = "TheHolm <theholm@github.com>"
+section = "utils"
+priority = "optional"
