@@ -1,7 +1,10 @@
 //! Integration tests for the Markdown renderer (`md_viewer::render`), grouped
 //! by block type and by inline style.
 
-use md_viewer::{render, Align, Block, Cell, Inline, Math, Span, Style, Table, RULE_TEXT};
+use md_viewer::{
+    is_mermaid_info, render, Align, Block, Cell, Diagram, Inline, Math, Span, Style, Table,
+    RULE_TEXT,
+};
 
 /// Renders `source` and flattens every text block into one list of spans,
 /// skipping non-text blocks and formulas; most tests only care about
@@ -26,14 +29,16 @@ fn plain_text(spans: &[Span]) -> String {
     spans.iter().map(|span| span.text.as_str()).collect()
 }
 
-/// Describes a whole rendered document as text: text blocks verbatim and
-/// each table as `<table>`, to check how tables sit between other blocks.
+/// Describes a whole rendered document as text: text blocks verbatim, each
+/// table as `<table>` and each diagram as `<mermaid>`, to check how they sit
+/// between other blocks.
 fn outline(source: &str) -> String {
     render(source)
         .iter()
         .map(|block| match block {
             Block::Text(inlines) => inlines.iter().map(Inline::text).collect(),
             Block::Table(_) => "<table>".to_string(),
+            Block::Mermaid(_) => "<mermaid>".to_string(),
         })
         .collect()
 }
@@ -727,6 +732,94 @@ fn pango_markup_math_source() {
     let markup = md_viewer::pango_markup(&[Inline::Math(Math::new("a<b", false))]);
     assert!(markup.contains(">$a&lt;b$</span>"), "{markup}");
     assert!(markup.contains("monospace"));
+}
+
+// --- Mermaid --------------------------------------------------------------
+
+/// Every diagram in the rendered `source`, in order.
+fn diagrams(source: &str) -> Vec<Diagram> {
+    render(source)
+        .into_iter()
+        .filter_map(|block| match block {
+            Block::Mermaid(diagram) => Some(diagram),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A ` ```mermaid ` block becomes a diagram holding its source, without the
+/// final newline.
+#[test]
+fn mermaid_block() {
+    assert_eq!(
+        diagrams("```mermaid\ngraph TD;\n    A-->B;\n```"),
+        vec![Diagram::new("graph TD;\n    A-->B;")]
+    );
+}
+
+/// A diagram is a block of its own, separated from surrounding paragraphs
+/// by blank lines.
+#[test]
+fn mermaid_between_paragraphs() {
+    assert_eq!(
+        outline("before\n\n```mermaid\ngantt\n```\n\nafter"),
+        "before\n\n<mermaid>\n\nafter"
+    );
+}
+
+/// Other languages, unlabelled fences and indented code stay code blocks.
+#[test]
+fn other_code_blocks_are_not_diagrams() {
+    for source in [
+        "```rust\nfn main() {}\n```",
+        "```\ngraph TD;\n```",
+        "    graph TD;",
+        "```mermaid-like\nx\n```",
+    ] {
+        assert!(diagrams(source).is_empty(), "{source}");
+        assert!(plain_text(&r(source)).contains(match source {
+            s if s.contains("fn main") => "fn main",
+            s if s.contains("graph") => "graph TD;",
+            _ => "x",
+        }));
+    }
+}
+
+/// The `mermaid` info string is case-insensitive and may carry attributes.
+#[test]
+fn mermaid_info_strings() {
+    for info in [
+        "mermaid",
+        "Mermaid",
+        "MERMAID",
+        "mermaid {theme=dark}",
+        "mermaid,x",
+    ] {
+        assert!(is_mermaid_info(info), "{info}");
+    }
+    for info in ["", "rust", "mermaidx", "graph mermaid"] {
+        assert!(!is_mermaid_info(info), "{info}");
+    }
+}
+
+/// A diagram's source is not interpreted as Markdown or math.
+#[test]
+fn mermaid_source_is_verbatim() {
+    let source = "```mermaid\nA[**not bold** $x$] --> B\n```";
+    assert_eq!(
+        diagrams(source),
+        vec![Diagram::new("A[**not bold** $x$] --> B")]
+    );
+}
+
+/// A diagram inside a block quote or list item is still a diagram.
+#[test]
+fn mermaid_nested() {
+    assert_eq!(diagrams("> ```mermaid\n> pie\n> ```").len(), 1);
+    assert_eq!(
+        outline("- item\n\n  ```mermaid\n  pie\n  ```"),
+        "• item\n    <mermaid>"
+    );
 }
 
 // --- Pango markup (table cells) ------------------------------------------

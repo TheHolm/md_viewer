@@ -2,8 +2,8 @@
 //! mhchem typesetting, rasterization, and filling a rendered document in.
 
 use md_viewer::graphics::{
-    hex_color, math_depth_em, math_svg, rasterize, render_document, render_math, RasterSettings,
-    MATH_SCALE,
+    hex_color, math_depth_em, math_svg, mermaid_svg, rasterize, render_document, render_math,
+    render_mermaid, RasterSettings, MATH_SCALE,
 };
 use md_viewer::{render, Block, Inline, Math};
 
@@ -33,6 +33,7 @@ fn formulas(blocks: &[Block]) -> Vec<&Math> {
                 .iter()
                 .chain(table.rows.iter().flatten())
                 .collect(),
+            Block::Mermaid(_) => Vec::new(),
         };
         for inline in cells.into_iter().flatten() {
             if let Inline::Math(math) = inline {
@@ -153,13 +154,16 @@ fn display_math_is_larger() {
 /// x-height.
 #[test]
 fn math_is_scaled_up() {
-    assert!(MATH_SCALE > 1.0);
     let settings = RasterSettings {
         font_px: 20.0,
         ..RasterSettings::default()
     };
     let image = render_math("M", false, &settings).unwrap();
-    assert!(image.height as f32 >= 20.0 * 0.6, "height {}", image.height);
+    assert!(
+        image.height as f32 >= 20.0 * MATH_SCALE * 0.6,
+        "height {}",
+        image.height
+    );
 }
 
 /// Math is drawn in the requested text colour.
@@ -216,6 +220,85 @@ fn broken_math_does_not_panic() {
     }
 }
 
+// --- Mermaid --------------------------------------------------------------
+
+/// A flowchart lays out to SVG and rasterizes to a visible image whose
+/// labels are drawn (text, not HTML, so resvg can draw it).
+#[test]
+fn mermaid_flowchart() {
+    let source = "graph TD;\n A-->B;\n A-->C;\n B-->D;\n C-->D;";
+    let svg = mermaid_svg(source).unwrap();
+    assert!(svg.contains("<svg"));
+    assert!(!svg.contains("<foreignObject"), "labels must be SVG text");
+    let image = render_mermaid(source, &RasterSettings::default()).unwrap();
+    assert!(image.width > 50 && image.height > 50);
+    assert!(has_ink(&image));
+}
+
+/// Sequence diagrams and Gantt charts render too.
+#[test]
+fn mermaid_sequence_and_gantt() {
+    let settings = RasterSettings::default();
+    for source in [
+        "sequenceDiagram\n Alice->>Bob: Hello Bob\n Bob-->>Alice: Hi Alice",
+        "gantt\n title Plan\n dateFormat YYYY-MM-DD\n section Build\n \
+         Tables :a1, 2026-11-01, 5d\n Math :after a1, 4d",
+        "pie title Pets\n \"Dogs\" : 386\n \"Cats\" : 85",
+        "classDiagram\n Animal <|-- Duck",
+        "stateDiagram-v2\n [*] --> Still\n Still --> [*]",
+    ] {
+        let image = render_mermaid(source, &settings).unwrap_or_else(|e| panic!("{source}: {e}"));
+        assert!(has_ink(&image), "{source} drew nothing");
+    }
+}
+
+/// A diagram's text is actually drawn: the same flowchart with long labels
+/// has more dark pixels than with one-letter labels (the node boxes are the
+/// same size and filled white, so only the text differs).
+#[test]
+fn mermaid_labels_are_drawn() {
+    let settings = RasterSettings::default();
+    let ink = |source: &str| {
+        let image = render_mermaid(source, &settings).unwrap();
+        image
+            .pixels
+            .chunks(4)
+            .filter(|p| p[3] > 200 && p[0] < 100 && p[1] < 100)
+            .count()
+    };
+    let short = ink("graph LR; A[x] --> B[y]");
+    let long = ink("graph LR; A[xxxxxxxxxxxx] --> B[yyyyyyyyyyyy]");
+    assert!(long > short, "{long} <= {short}");
+}
+
+/// A device-pixel scale doubles the diagram's pixels, not its logical size.
+#[test]
+fn mermaid_scale() {
+    let source = "graph LR; A-->B";
+    let one = render_mermaid(source, &RasterSettings::default()).unwrap();
+    let two = render_mermaid(
+        source,
+        &RasterSettings {
+            scale: 2.0,
+            ..RasterSettings::default()
+        },
+    )
+    .unwrap();
+    assert!((two.logical_width() - one.logical_width()).abs() <= 1.0);
+    assert!(two.width >= one.width * 2 - 1);
+}
+
+/// Invalid, unknown and empty diagrams are errors with a message, never
+/// panics.
+#[test]
+fn mermaid_errors() {
+    let settings = RasterSettings::default();
+    for source in ["graph TD; A-->", "notADiagramType\n x", "", "   "] {
+        let error = render_mermaid(source, &settings).unwrap_err();
+        assert!(!error.is_empty(), "{source:?}");
+    }
+}
+
 // --- Whole documents ------------------------------------------------------
 
 /// `render_document` renders every formula, in text and in table cells.
@@ -235,9 +318,24 @@ fn render_document_fills_in_formulas() {
     }
 }
 
-/// A document without math is left unchanged.
+/// `render_document` renders Mermaid diagrams, including failing ones.
 #[test]
-fn render_document_without_math() {
+fn render_document_fills_in_diagrams() {
+    let mut blocks = render("```mermaid\ngraph LR; A-->B\n```\n\n```mermaid\ngraph TD; A-->\n```");
+    render_document(&mut blocks, &RasterSettings::default());
+    let results: Vec<bool> = blocks
+        .iter()
+        .filter_map(|block| match block {
+            Block::Mermaid(diagram) => diagram.image.as_ref().map(Result::is_ok),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results, vec![true, false]);
+}
+
+/// A document without graphics is left unchanged.
+#[test]
+fn render_document_without_graphics() {
     let original = render("# T\n\ntext\n\n| a |\n|---|");
     let mut blocks = original.clone();
     render_document(&mut blocks, &RasterSettings::default());

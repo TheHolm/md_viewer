@@ -10,7 +10,7 @@ use clap::Parser;
 use gtk4::glib::translate::IntoGlib;
 use gtk4::{gdk, gio, glib, pango};
 use md_viewer::graphics::{Image, RasterSettings};
-use md_viewer::{Align, Block, Inline, Math, Style, Table};
+use md_viewer::{Align, Block, Diagram, Inline, Math, Style, Table};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -21,14 +21,20 @@ const APP_ID: &str = "io.github.TheHolm.md_viewer";
 /// The left and right margin of the document, in pixels.
 const MARGIN: i32 = 16;
 
+/// The padding around a diagram on its card (see `.md-diagram` in [`CSS`]),
+/// plus the card's border, on each side.
+const DIAGRAM_PADDING: i32 = 13;
+
 /// The name of the text tag that centres display math on its line.
 const DISPLAY_MATH_TAG: &str = "math-display";
 
 /// Roughly how many characters wide a table cell grows before its text wraps.
 const CELL_WRAP_CHARS: i32 = 40;
 
-/// Styling for the widgets the document is built from (tables). Colours use
-/// the theme's named colours so light and dark themes both work.
+/// Styling for the widgets the document is built from (tables, diagrams).
+/// Table colours derive from the theme's text colour, so light and dark
+/// themes both work; diagrams sit on a white card in either theme, because
+/// Mermaid's colours assume a light background.
 const CSS: &str = r#"
 .md-table {
   border: 1px solid alpha(currentColor, 0.25);
@@ -50,6 +56,12 @@ const CSS: &str = r#"
 }
 .md-cell.md-stripe {
   background-color: alpha(currentColor, 0.03);
+}
+.md-diagram {
+  background-color: #ffffff;
+  border: 1px solid alpha(currentColor, 0.2);
+  border-radius: 6px;
+  padding: 12px;
 }
 "#;
 
@@ -104,6 +116,9 @@ struct Resizable {
     /// The horizontal scrollers around tables, sized to the table's natural
     /// width but never wider than the view.
     tables: RefCell<Vec<gtk4::ScrolledWindow>>,
+    /// Diagram pictures with their natural logical size; scaled down
+    /// (keeping the aspect ratio) when the view is narrower.
+    diagrams: RefCell<Vec<(gtk4::Picture, f32, f32)>>,
 }
 
 impl Resizable {
@@ -123,6 +138,17 @@ impl Resizable {
             let size = (natural.min(available), height);
             if scroller.size_request() != size {
                 scroller.set_size_request(size.0, size.1);
+            }
+        }
+        let room = (available - 2 * DIAGRAM_PADDING).max(50) as f32;
+        for (picture, width, height) in self.diagrams.borrow().iter() {
+            let factor = (room / width).min(1.0);
+            let size = (
+                (width * factor).round() as i32,
+                (height * factor).round() as i32,
+            );
+            if picture.size_request() != size {
+                picture.set_size_request(size.0, size.1);
             }
         }
     }
@@ -225,8 +251,8 @@ fn raster_settings(view: &gtk4::TextView) -> RasterSettings {
     }
 }
 
-/// Appends every block to `view`'s buffer: text as tagged text, tables as
-/// anchored grid widgets.
+/// Appends every block to `view`'s buffer: text as tagged text, tables and
+/// diagrams as anchored widgets.
 fn fill_view(view: &gtk4::TextView, blocks: &[Block], resizable: &Rc<Resizable>) {
     let buffer = view.buffer();
     for block in blocks {
@@ -238,10 +264,49 @@ fn fill_view(view: &gtk4::TextView, blocks: &[Block], resizable: &Rc<Resizable>)
                 view.add_child_at_anchor(&widget, &anchor);
                 resizable.tables.borrow_mut().push(widget);
             }
+            Block::Mermaid(diagram) => insert_diagram(view, diagram, resizable),
         }
     }
     // Size the new widgets for the current width straight away.
     resizable.update(view.width());
+}
+
+/// Inserts a Mermaid diagram at the end of `view`'s buffer: the picture on a
+/// white card, scaled down to fit the view. A diagram that could not be
+/// rendered is shown as its source in a code block, with the reason.
+fn insert_diagram(view: &gtk4::TextView, diagram: &Diagram, resizable: &Rc<Resizable>) {
+    let buffer = view.buffer();
+    match &diagram.image {
+        Some(Ok(image)) => {
+            let picture = gtk4::Picture::for_paintable(&ScaledTexture::new(image));
+            picture.set_can_shrink(true);
+            picture.set_content_fit(gtk4::ContentFit::Contain);
+            let card = gtk4::Box::builder()
+                .css_classes(["md-diagram"])
+                .halign(gtk4::Align::Start)
+                .build();
+            card.append(&picture);
+            let anchor = buffer.create_child_anchor(&mut buffer.end_iter());
+            view.add_child_at_anchor(&card, &anchor);
+            resizable.diagrams.borrow_mut().push((
+                picture,
+                image.logical_width(),
+                image.logical_height(),
+            ));
+        }
+        failed => {
+            let reason = match failed {
+                Some(Err(reason)) => reason.as_str(),
+                _ => "not rendered",
+            };
+            insert_styled(&buffer, &diagram.source, &[Style::CodeBlock]);
+            insert_styled(
+                &buffer,
+                &format!("\n⚠ diagram could not be rendered: {reason}"),
+                &[Style::Image],
+            );
+        }
+    }
 }
 
 /// Inserts `inlines` at the end of `buffer`, tagging each with its styles.

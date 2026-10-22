@@ -16,6 +16,8 @@ clap = { version = "4", features = ["derive"] }
 pulldown-cmark = { version = "0.13", default-features = false }
 # LaTeX math (with mhchem) to SVG, pure Rust, bundles its own math font.
 mathra = "1.2"
+# Mermaid to SVG (pure Rust): every diagram type, SVG output only.
+merman = { version = "0.9", default-features = false, features = ["svg", "all-diagrams"] }
 # SVG rasterizer (pure Rust); system fonts for text, no raster image decoders.
 resvg = { version = "0.48", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
 

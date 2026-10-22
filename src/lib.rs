@@ -9,7 +9,7 @@
 pub mod graphics;
 
 use graphics::Rendered;
-use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -217,6 +217,34 @@ impl Table {
     }
 }
 
+/// A Mermaid diagram (a fenced code block tagged `mermaid`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Diagram {
+    /// The Mermaid source, without the fences.
+    pub source: String,
+    /// The rendered diagram, filled in by [`graphics::render_document`];
+    /// `None` straight after [`render`].
+    pub image: Option<Rendered>,
+}
+
+impl Diagram {
+    /// Creates a not-yet-rendered diagram.
+    pub fn new(source: &str) -> Self {
+        Diagram {
+            source: source.to_string(),
+            image: None,
+        }
+    }
+}
+
+/// True if a fenced code block's info string (` ```mermaid `, possibly
+/// followed by attributes) marks it as a Mermaid diagram. Case-insensitive.
+pub fn is_mermaid_info(info: &str) -> bool {
+    info.split(|c: char| c.is_whitespace() || c == '{' || c == ',')
+        .next()
+        .is_some_and(|language| language.eq_ignore_ascii_case("mermaid"))
+}
+
 /// One block of a rendered document.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
@@ -225,6 +253,8 @@ pub enum Block {
     Text(Vec<Inline>),
     /// A table, shown as a grid widget on a line of its own.
     Table(Table),
+    /// A Mermaid diagram, shown as a picture on a line of its own.
+    Mermaid(Diagram),
 }
 
 /// The colour of link text, as `#rrggbb`.
@@ -400,6 +430,8 @@ struct BufferedBlock {
     text: String,
     /// The styles applied to the whole block.
     styles: Vec<Style>,
+    /// True for a ` ```mermaid ` block, which becomes a diagram.
+    mermaid: bool,
 }
 
 /// The state of an in-progress rendering of one document.
@@ -467,14 +499,16 @@ impl Renderer {
                 self.block_break();
                 self.style_stack.push(Style::Quote);
             }
-            Tag::CodeBlock(_) => {
+            Tag::CodeBlock(kind) => {
                 self.block_break();
                 let mut styles = self.current_styles();
                 styles.push(Style::CodeBlock);
                 normalize(&mut styles);
+                let mermaid = matches!(&kind, CodeBlockKind::Fenced(info) if is_mermaid_info(info));
                 self.block = Some(BufferedBlock {
                     text: String::new(),
                     styles,
+                    mermaid,
                 });
             }
             Tag::HtmlBlock => {
@@ -482,6 +516,7 @@ impl Renderer {
                 self.block = Some(BufferedBlock {
                     text: String::new(),
                     styles: self.current_styles(),
+                    mermaid: false,
                 });
             }
             Tag::List(first) => {
@@ -539,7 +574,11 @@ impl Renderer {
             TagEnd::CodeBlock | TagEnd::HtmlBlock => {
                 if let Some(block) = self.block.take() {
                     let text = block.text.strip_suffix('\n').unwrap_or(&block.text);
-                    self.push(text, block.styles);
+                    if block.mermaid {
+                        self.blocks.push(Block::Mermaid(Diagram::new(text)));
+                    } else {
+                        self.push(text, block.styles);
+                    }
                 }
             }
             TagEnd::List(_) => {
@@ -744,7 +783,8 @@ fn normalize(styles: &mut Vec<Style>) {
 }
 
 /// Counts the newlines at the very end of the rendered output, looking back
-/// across span boundaries. A trailing non-text block (a table) or formula
+/// across span boundaries. A trailing non-text block (a table or diagram) or
+/// formula
 /// counts as content, i.e. ends the count.
 fn trailing_newlines(blocks: &[Block]) -> usize {
     let Some(Block::Text(inlines)) = blocks.last() else {

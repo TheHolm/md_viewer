@@ -1,7 +1,8 @@
-//! Turning formulas (and, later, diagrams) into pixels, independent of GTK.
+//! Turning formulas and diagrams into pixels, independent of GTK.
 //!
 //! Math is typeset to SVG by `mathra` (which also understands mhchem's
-//! `\ce{}`/`\pu{}`), then every SVG is rasterized by `resvg` into
+//! `\ce{}`/`\pu{}`), Mermaid diagrams are laid out to SVG by `merman`
+//! (using its resvg-compatible output), then every SVG is rasterized by `resvg` into
 //! premultiplied RGBA pixels the GUI wraps in a texture. Nothing here needs a
 //! display, so it all runs on a worker thread and is covered by tests.
 
@@ -195,11 +196,45 @@ pub fn render_math(tex: &str, display: bool, settings: &RasterSettings) -> Rende
     Ok(image)
 }
 
-/// Renders every graphic in `blocks` (math, in text and in table cells),
-/// storing each result next to its source. Meant to run on a worker thread.
+/// The font size Mermaid diagrams are rasterized with; diagrams set their
+/// own text sizes, so this only resolves stray `em` units.
+const DIAGRAM_FONT_PX: f32 = 16.0;
+
+/// Lays out a Mermaid diagram (flowchart, sequence, Gantt, class, state,
+/// pie, …) as SVG that resvg can draw: labels are plain SVG text rather than
+/// HTML. Fails with the parser's message on invalid source.
+pub fn mermaid_svg(source: &str) -> Result<String, String> {
+    use merman::svg::SvgPipeline;
+    use merman::{OperationControl, RenderOutput, RenderRequest, Renderer, SvgRequest};
+    let request = SvgRequest {
+        pipeline: Some(SvgPipeline::resvg_safe()),
+        ..SvgRequest::default()
+    };
+    match Renderer::new().render(RenderRequest::svg(source, OperationControl::new(), request)) {
+        Ok(RenderOutput::Svg(Some(svg))) => Ok(svg.svg().to_string()),
+        Ok(_) => Err("no Mermaid diagram found".to_string()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Renders a Mermaid diagram at its natural size (on a transparent
+/// background; the GUI puts it on a light card, as Mermaid's colours assume).
+pub fn render_mermaid(source: &str, settings: &RasterSettings) -> Rendered {
+    if source.trim().is_empty() {
+        return Err("empty diagram".to_string());
+    }
+    rasterize(&mermaid_svg(source)?, DIAGRAM_FONT_PX, settings.scale)
+}
+
+/// Renders every graphic in `blocks` (math, in text and in table cells, and
+/// Mermaid diagrams), storing each result next to its source. Meant to run
+/// on a worker thread.
 pub fn render_document(blocks: &mut [Block], settings: &RasterSettings) {
     for block in blocks.iter_mut() {
         match block {
+            Block::Mermaid(diagram) => {
+                diagram.image = Some(render_mermaid(&diagram.source, settings));
+            }
             Block::Text(inlines) => render_inlines(inlines, settings),
             Block::Table(table) => {
                 for cell in table
