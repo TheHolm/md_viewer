@@ -1,9 +1,10 @@
 //! Non-GUI logic for `md_viewer`: reading a document from disk and rendering
-//! Markdown into a flat list of styled text spans.
+//! Markdown into a list of blocks.
 //!
 //! Everything here is independent of GTK so it can be exercised by the
 //! integration tests in `tests/` without a display. The GUI in `main.rs` only
-//! inserts the spans in order and applies one text tag per [`Style`].
+//! walks the blocks in order: text blocks are inserted into a text buffer with
+//! one text tag per [`Style`], and tables become grid widgets.
 
 use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};
 use std::fs;
@@ -52,15 +53,13 @@ pub enum Style {
     Link,
     /// An image placeholder (`[image: <alt text>]`).
     Image,
-    /// A table laid out as aligned monospace text.
-    Table,
     /// A horizontal rule.
     Rule,
 }
 
 impl Style {
     /// Every style, so the GUI can create one text tag for each up front.
-    pub const ALL: [Style; 16] = [
+    pub const ALL: [Style; 15] = [
         Style::Heading(1),
         Style::Heading(2),
         Style::Heading(3),
@@ -75,7 +74,6 @@ impl Style {
         Style::Quote,
         Style::Link,
         Style::Image,
-        Style::Table,
         Style::Rule,
     ];
 
@@ -101,7 +99,6 @@ impl Style {
             Style::Quote => "quote",
             Style::Link => "link",
             Style::Image => "image",
-            Style::Table => "table",
             Style::Rule => "rule",
         }
     }
@@ -120,6 +117,148 @@ pub struct Span {
     pub styles: Vec<Style>,
 }
 
+/// One element of flowing text: a run of styled text.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Inline {
+    /// Styled text.
+    Text(Span),
+}
+
+impl Inline {
+    /// The text this inline element displays.
+    pub fn text(&self) -> &str {
+        match self {
+            Inline::Text(span) => &span.text,
+        }
+    }
+}
+
+/// The horizontal alignment of a table column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Align {
+    /// No alignment was given (shown left-aligned).
+    None,
+    /// `:---`
+    Left,
+    /// `:---:`
+    Center,
+    /// `---:`
+    Right,
+}
+
+impl From<Alignment> for Align {
+    /// Converts the parser's alignment into the library's own type, so the
+    /// parser crate does not leak into the public API.
+    fn from(alignment: Alignment) -> Self {
+        match alignment {
+            Alignment::None => Align::None,
+            Alignment::Left => Align::Left,
+            Alignment::Center => Align::Center,
+            Alignment::Right => Align::Right,
+        }
+    }
+}
+
+/// The content of one table cell: styled inline elements.
+pub type Cell = Vec<Inline>;
+
+/// A table, with every row padded to the same number of columns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Table {
+    /// The alignment of each column; as long as every row.
+    pub alignments: Vec<Align>,
+    /// The header row. Its cells additionally carry [`Style::Strong`].
+    pub header: Vec<Cell>,
+    /// The body rows.
+    pub rows: Vec<Vec<Cell>>,
+}
+
+impl Table {
+    /// The number of columns.
+    pub fn columns(&self) -> usize {
+        self.alignments.len()
+    }
+}
+
+/// One block of a rendered document.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Block {
+    /// Flowing text, including the newlines that separate it from the blocks
+    /// before and after it.
+    Text(Vec<Inline>),
+    /// A table, shown as a grid widget on a line of its own.
+    Table(Table),
+}
+
+/// The colour of link text, as `#rrggbb`.
+pub const LINK_COLOR: &str = "#3584e4";
+
+/// The colour of de-emphasised text (quotes, image placeholders, rules).
+pub const MUTED_COLOR: &str = "#808080";
+
+/// The background colour of inline code; drawn at [`CODE_BACKGROUND_ALPHA`]
+/// so it works on light and dark backgrounds.
+pub const CODE_BACKGROUND: &str = "#808080";
+
+/// The opacity of the inline code background, as a Pango percentage.
+pub const CODE_BACKGROUND_ALPHA: &str = "15%";
+
+/// Escapes `text` for use inside Pango markup.
+pub fn escape_markup(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '\'' => escaped.push_str("&#39;"),
+            '"' => escaped.push_str("&quot;"),
+            _ => escaped.push(c),
+        }
+    }
+    escaped
+}
+
+/// Converts inline elements into Pango markup, for widgets that show text
+/// with a label rather than a text buffer (table cells).
+///
+/// Each span becomes one `<span>` element carrying the attributes of all its
+/// styles; unstyled spans are emitted as escaped text. Styles that only make
+/// sense for whole blocks (headings, quotes, code blocks, rules) get the
+/// closest inline equivalent.
+pub fn pango_markup(inlines: &[Inline]) -> String {
+    let mut markup = String::new();
+    for inline in inlines {
+        let Inline::Text(span) = inline;
+        let text = escape_markup(&span.text);
+        let attributes: Vec<String> = span.styles.iter().map(|s| markup_attributes(*s)).collect();
+        if attributes.is_empty() {
+            markup.push_str(&text);
+        } else {
+            markup.push_str(&format!("<span {}>{text}</span>", attributes.join(" ")));
+        }
+    }
+    markup
+}
+
+/// The Pango markup attributes implementing `style`.
+fn markup_attributes(style: Style) -> String {
+    match style {
+        Style::Heading(_) | Style::Strong => "weight=\"bold\"".to_string(),
+        Style::Emphasis => "style=\"italic\"".to_string(),
+        Style::Strikethrough => "strikethrough=\"true\"".to_string(),
+        Style::Code | Style::CodeBlock => {
+            format!(
+                "font_family=\"monospace\" background=\"{CODE_BACKGROUND}\" \
+                 bgalpha=\"{CODE_BACKGROUND_ALPHA}\""
+            )
+        }
+        Style::Quote | Style::Image => format!("style=\"italic\" foreground=\"{MUTED_COLOR}\""),
+        Style::Link => format!("underline=\"single\" foreground=\"{LINK_COLOR}\""),
+        Style::Rule => format!("foreground=\"{MUTED_COLOR}\""),
+    }
+}
+
 /// Reads the document at `path` into a string.
 ///
 /// The file is only ever opened for reading. Fails if the file cannot be read
@@ -129,7 +268,7 @@ pub fn read_document(path: &Path) -> io::Result<String> {
 }
 
 /// Reads the document at `path` and renders it, ready for display.
-pub fn open_document(path: &Path) -> io::Result<Vec<Span>> {
+pub fn open_document(path: &Path) -> io::Result<Vec<Block>> {
     read_document(path).map(|text| render(&text))
 }
 
@@ -148,36 +287,63 @@ pub fn window_title(path: &Path) -> String {
     }
 }
 
-/// Renders Markdown `source` into a flat list of styled spans.
+/// Renders Markdown `source` into a list of blocks.
 ///
 /// Never fails: anything the renderer does not specifically understand (raw
 /// HTML, for instance) is shown as plain text rather than dropped. Blocks are
 /// separated by a blank line, list items by a single newline, and adjacent
 /// text with identical styles is merged into one span. See the "Rendering
 /// model" section of `AGENTS.md` for the full set of rules.
-pub fn render(source: &str) -> Vec<Span> {
+pub fn render(source: &str) -> Vec<Block> {
     let options =
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     let mut renderer = Renderer::default();
     for event in Parser::new_ext(source, options) {
         renderer.event(event);
     }
-    renderer.spans
+    renderer.blocks
 }
 
 /// A table being collected cell by cell until its end tag arrives.
 #[derive(Debug, Default)]
 struct TableBuilder {
-    /// The alignment of each column.
-    alignments: Vec<Alignment>,
+    /// The alignment of each column, as parsed.
+    alignments: Vec<Align>,
     /// The header row's cells.
-    header: Vec<String>,
+    header: Vec<Cell>,
     /// The body rows' cells.
-    rows: Vec<Vec<String>>,
+    rows: Vec<Vec<Cell>>,
     /// The cells of the row currently being collected.
-    current_row: Vec<String>,
-    /// The text of the cell currently being collected, if inside a cell.
-    current_cell: Option<String>,
+    current_row: Vec<Cell>,
+    /// The cell currently being collected, if inside a cell.
+    current_cell: Option<Cell>,
+    /// True while the header row is being collected.
+    in_head: bool,
+}
+
+impl TableBuilder {
+    /// Finishes the table, padding the alignments and every row to the
+    /// widest row's column count.
+    fn finish(self) -> Table {
+        let columns = self
+            .rows
+            .iter()
+            .map(Vec::len)
+            .chain([self.header.len(), self.alignments.len()])
+            .max()
+            .unwrap_or(0);
+        let pad = |mut row: Vec<Cell>| {
+            row.resize_with(columns, Vec::new);
+            row
+        };
+        let mut alignments = self.alignments;
+        alignments.resize(columns, Align::None);
+        Table {
+            alignments,
+            header: pad(self.header),
+            rows: self.rows.into_iter().map(pad).collect(),
+        }
+    }
 }
 
 /// A block whose text is buffered until its end tag, so the trailing newline
@@ -194,7 +360,7 @@ struct BufferedBlock {
 #[derive(Debug, Default)]
 struct Renderer {
     /// The output produced so far.
-    spans: Vec<Span>,
+    blocks: Vec<Block>,
     /// Styles currently in effect, innermost last.
     style_stack: Vec<Style>,
     /// One entry per open list: the next item number for ordered lists, or
@@ -278,14 +444,19 @@ impl Renderer {
             Tag::Table(alignments) => {
                 self.block_break();
                 self.table = Some(TableBuilder {
-                    alignments,
+                    alignments: alignments.into_iter().map(Align::from).collect(),
                     ..TableBuilder::default()
                 });
             }
-            Tag::TableHead | Tag::TableRow => {}
+            Tag::TableHead => {
+                if let Some(table) = self.table.as_mut() {
+                    table.in_head = true;
+                }
+            }
+            Tag::TableRow => {}
             Tag::TableCell => {
                 if let Some(table) = self.table.as_mut() {
-                    table.current_cell = Some(String::new());
+                    table.current_cell = Some(Vec::new());
                 }
             }
             Tag::Emphasis => self.style_stack.push(Style::Emphasis),
@@ -328,12 +499,13 @@ impl Renderer {
             TagEnd::TableCell => {
                 if let Some(table) = self.table.as_mut() {
                     let cell = table.current_cell.take().unwrap_or_default();
-                    table.current_row.push(cell.trim().to_string());
+                    table.current_row.push(cell);
                 }
             }
             TagEnd::TableHead => {
                 if let Some(table) = self.table.as_mut() {
                     table.header = std::mem::take(&mut table.current_row);
+                    table.in_head = false;
                 }
             }
             TagEnd::TableRow => {
@@ -344,7 +516,7 @@ impl Renderer {
             }
             TagEnd::Table => {
                 if let Some(table) = self.table.take() {
-                    self.emit_table(&table);
+                    self.blocks.push(Block::Table(table.finish()));
                 }
             }
             TagEnd::Link => {
@@ -380,8 +552,8 @@ impl Renderer {
         self.item_fresh = true;
     }
 
-    /// Routes text to the current table cell, the buffered block, or the
-    /// output, in that order of precedence.
+    /// Routes text to the buffered block or to the output (which may be the
+    /// current table cell), with the styles currently in effect.
     ///
     /// Any non-empty text written while inside a link (wherever it is routed)
     /// marks the link as having text, so its destination is not shown.
@@ -390,10 +562,6 @@ impl Renderer {
             if !text.is_empty() {
                 *has_text = true;
             }
-        }
-        if let Some(cell) = self.table.as_mut().and_then(|t| t.current_cell.as_mut()) {
-            cell.push_str(text);
-            return;
         }
         if let Some(block) = self.block.as_mut() {
             block.text.push_str(text);
@@ -424,60 +592,59 @@ impl Renderer {
     /// Makes the output end with at least `count` newlines, unless the output
     /// is still empty.
     fn ensure_newlines(&mut self, count: usize) {
-        if self.spans.is_empty() {
+        if self.blocks.is_empty() {
             return;
         }
-        let have = trailing_newlines(&self.spans);
+        let have = trailing_newlines(&self.blocks);
         if have < count {
             self.push(&"\n".repeat(count - have), Vec::new());
         }
     }
 
-    /// The styles currently in effect, sorted and deduplicated.
+    /// The styles currently in effect, sorted and deduplicated. Inside a
+    /// table's header row this includes [`Style::Strong`].
     fn current_styles(&self) -> Vec<Style> {
         let mut styles = self.style_stack.clone();
+        if self.table.as_ref().is_some_and(|table| table.in_head) {
+            styles.push(Style::Strong);
+        }
         normalize(&mut styles);
         styles
     }
 
-    /// Appends `text` with `styles`, merging it into the previous span when
-    /// the styles are identical. Empty text is ignored.
+    /// Appends `text` with `styles` to the current table cell if inside one,
+    /// otherwise to the trailing text block (starting a new one if the last
+    /// block is not text). Empty text is ignored.
     fn push(&mut self, text: &str, styles: Vec<Style>) {
         if text.is_empty() {
             return;
         }
-        if let Some(last) = self.spans.last_mut() {
-            if last.styles == styles {
-                last.text.push_str(text);
-                return;
-            }
+        if let Some(cell) = self.table.as_mut().and_then(|t| t.current_cell.as_mut()) {
+            push_inline(cell, text, styles);
+            return;
         }
-        self.spans.push(Span {
-            text: text.to_string(),
-            styles,
-        });
-    }
-
-    /// Writes a collected table: the header line in strong text, then the
-    /// separator line and the body rows.
-    fn emit_table(&mut self, table: &TableBuilder) {
-        let lines = layout_table(&table.alignments, &table.header, &table.rows);
-        let mut base = self.current_styles();
-        base.push(Style::Table);
-        normalize(&mut base);
-        let mut header_styles = base.clone();
-        header_styles.push(Style::Strong);
-        normalize(&mut header_styles);
-
-        let mut lines = lines.into_iter();
-        if let Some(header) = lines.next() {
-            self.push(&header, header_styles);
+        if !matches!(self.blocks.last(), Some(Block::Text(_))) {
+            self.blocks.push(Block::Text(Vec::new()));
         }
-        for line in lines {
-            self.push("\n", base.clone());
-            self.push(&line, base.clone());
+        if let Some(Block::Text(inlines)) = self.blocks.last_mut() {
+            push_inline(inlines, text, styles);
         }
     }
+}
+
+/// Appends `text` with `styles` to `inlines`, merging it into the last
+/// element when that is text with identical styles.
+fn push_inline(inlines: &mut Vec<Inline>, text: &str, styles: Vec<Style>) {
+    if let Some(Inline::Text(last)) = inlines.last_mut() {
+        if last.styles == styles {
+            last.text.push_str(text);
+            return;
+        }
+    }
+    inlines.push(Inline::Text(Span {
+        text: text.to_string(),
+        styles,
+    }));
 }
 
 /// Sorts and deduplicates a style list so equal sets compare equal.
@@ -487,11 +654,15 @@ fn normalize(styles: &mut Vec<Style>) {
 }
 
 /// Counts the newlines at the very end of the rendered output, looking back
-/// across span boundaries.
-fn trailing_newlines(spans: &[Span]) -> usize {
+/// across span boundaries. A trailing non-text block (a table) counts as
+/// content, i.e. zero newlines.
+fn trailing_newlines(blocks: &[Block]) -> usize {
+    let Some(Block::Text(inlines)) = blocks.last() else {
+        return 0;
+    };
     let mut count = 0;
-    for span in spans.iter().rev() {
-        for c in span.text.chars().rev() {
+    for inline in inlines.iter().rev() {
+        for c in inline.text().chars().rev() {
             if c == '\n' {
                 count += 1;
             } else {
@@ -502,82 +673,44 @@ fn trailing_newlines(spans: &[Span]) -> usize {
     count
 }
 
-/// Pads `text` to `width` characters according to `alignment`. Unaligned
-/// (`None`) columns are left-aligned; centred text that cannot be split evenly
-/// gets the extra space on the right.
-fn pad_cell(text: &str, width: usize, alignment: Alignment) -> String {
-    let gap = width.saturating_sub(text.chars().count());
-    let (left, right) = match alignment {
-        Alignment::Right => (gap, 0),
-        Alignment::Center => (gap / 2, gap - gap / 2),
-        Alignment::Left | Alignment::None => (0, gap),
-    };
-    format!("{}{}{}", " ".repeat(left), text, " ".repeat(right))
-}
-
-/// Lays a table out as aligned monospace lines: the header, a `-` separator
-/// line, then one line per body row.
-///
-/// Every column is padded to the width of its widest cell (at least one
-/// character), and cells are joined with ` | ` (`-+-` on the separator line).
-/// Rows with fewer cells than the header are padded with empty cells. Trailing
-/// spaces are trimmed from every line.
-fn layout_table(alignments: &[Alignment], header: &[String], rows: &[Vec<String>]) -> Vec<String> {
-    let columns = rows
-        .iter()
-        .map(Vec::len)
-        .chain([header.len(), alignments.len()])
-        .max()
-        .unwrap_or(0);
-    let cell = |row: &[String], index: usize| row.get(index).cloned().unwrap_or_default();
-    let widths: Vec<usize> = (0..columns)
-        .map(|index| {
-            std::iter::once(header)
-                .chain(rows.iter().map(Vec::as_slice))
-                .map(|row| cell(row, index).chars().count())
-                .max()
-                .unwrap_or(0)
-                .max(1)
-        })
-        .collect();
-    let format_row = |row: &[String]| {
-        let cells: Vec<String> = (0..columns)
-            .map(|index| {
-                let alignment = alignments.get(index).copied().unwrap_or(Alignment::None);
-                pad_cell(&cell(row, index), widths[index], alignment)
-            })
-            .collect();
-        cells.join(" | ").trim_end().to_string()
-    };
-
-    let mut lines = vec![format_row(header)];
-    let separator: Vec<String> = widths.iter().map(|width| "-".repeat(*width)).collect();
-    lines.push(separator.join("-+-"));
-    lines.extend(rows.iter().map(|row| format_row(row)));
-    lines
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Builds an unstyled span, for brevity.
-    fn plain(text: &str) -> Span {
-        Span {
-            text: text.to_string(),
-            styles: Vec::new(),
-        }
+    /// Builds a text block of unstyled spans, for brevity.
+    fn text_block(parts: &[&str]) -> Block {
+        Block::Text(
+            parts
+                .iter()
+                .map(|text| {
+                    Inline::Text(Span {
+                        text: text.to_string(),
+                        styles: Vec::new(),
+                    })
+                })
+                .collect(),
+        )
     }
 
-    /// `trailing_newlines` counts newlines across span boundaries and stops at
-    /// the first other character.
+    /// An empty table, for blocks that are not text.
+    fn empty_table() -> Block {
+        Block::Table(Table {
+            alignments: Vec::new(),
+            header: Vec::new(),
+            rows: Vec::new(),
+        })
+    }
+
+    /// `trailing_newlines` counts newlines across span boundaries, stops at
+    /// the first other character, and treats a trailing table as content.
     #[test]
     fn trailing_newlines_spans_boundaries() {
         assert_eq!(trailing_newlines(&[]), 0);
-        assert_eq!(trailing_newlines(&[plain("a")]), 0);
-        assert_eq!(trailing_newlines(&[plain("a\n"), plain("\n")]), 2);
-        assert_eq!(trailing_newlines(&[plain("\n"), plain("\n\n")]), 3);
-        assert_eq!(trailing_newlines(&[plain("a\nb")]), 0);
+        assert_eq!(trailing_newlines(&[text_block(&["a"])]), 0);
+        assert_eq!(trailing_newlines(&[text_block(&["a\n", "\n"])]), 2);
+        assert_eq!(trailing_newlines(&[text_block(&["\n", "\n\n"])]), 3);
+        assert_eq!(trailing_newlines(&[text_block(&["a\nb"])]), 0);
+        assert_eq!(trailing_newlines(&[text_block(&["\n"]), empty_table()]), 0);
     }
 
     /// `normalize` sorts and deduplicates so equal style sets compare equal.
@@ -588,36 +721,60 @@ mod tests {
         assert_eq!(styles, vec![Style::Emphasis, Style::Strong]);
     }
 
-    /// `pad_cell` honours each alignment, giving centred text's odd extra
-    /// space to the right, and never truncates text wider than the column.
+    /// `push_inline` merges text with identical styles and starts a new
+    /// element when the styles differ.
     #[test]
-    fn pad_cell_alignments() {
-        assert_eq!(pad_cell("ab", 5, Alignment::None), "ab   ");
-        assert_eq!(pad_cell("ab", 5, Alignment::Left), "ab   ");
-        assert_eq!(pad_cell("ab", 5, Alignment::Right), "   ab");
-        assert_eq!(pad_cell("ab", 5, Alignment::Center), " ab  ");
-        assert_eq!(pad_cell("abcdef", 3, Alignment::Left), "abcdef");
+    fn push_inline_merges_equal_styles() {
+        let mut inlines = Vec::new();
+        push_inline(&mut inlines, "a", Vec::new());
+        push_inline(&mut inlines, "b", Vec::new());
+        push_inline(&mut inlines, "c", vec![Style::Strong]);
+        assert_eq!(inlines.len(), 2);
+        assert_eq!(inlines[0].text(), "ab");
+        assert_eq!(inlines[1].text(), "c");
     }
 
-    /// `pad_cell` measures width in characters, not bytes.
+    /// `TableBuilder::finish` pads the alignments, the header and short rows
+    /// to the widest row.
     #[test]
-    fn pad_cell_counts_characters() {
-        assert_eq!(pad_cell("äö", 3, Alignment::Left), "äö ");
+    fn table_builder_pads_rows() {
+        let cell = |text: &str| {
+            vec![Inline::Text(Span {
+                text: text.to_string(),
+                styles: Vec::new(),
+            })]
+        };
+        let builder = TableBuilder {
+            alignments: vec![Align::Right],
+            header: vec![cell("h")],
+            rows: vec![vec![cell("a"), cell("b"), cell("c")], vec![]],
+            ..TableBuilder::default()
+        };
+        let table = builder.finish();
+        assert_eq!(table.columns(), 3);
+        assert_eq!(
+            table.alignments,
+            vec![Align::Right, Align::None, Align::None]
+        );
+        assert_eq!(table.header.len(), 3);
+        assert!(table.rows.iter().all(|row| row.len() == 3));
+        assert!(table.rows[1].iter().all(Vec::is_empty));
     }
 
-    /// `layout_table` pads short rows with empty cells and keeps empty
-    /// columns at least one character wide.
+    /// A table with no cells at all finishes as a zero-column table.
     #[test]
-    fn layout_table_short_rows_and_empty_columns() {
-        let header = vec!["a".to_string(), String::new()];
-        let rows = vec![vec!["long".to_string()]];
-        let lines = layout_table(&[Alignment::None, Alignment::None], &header, &rows);
-        assert_eq!(lines, vec!["a    |", "-----+--", "long |"]);
+    fn table_builder_empty() {
+        let table = TableBuilder::default().finish();
+        assert_eq!(table.columns(), 0);
+        assert!(table.header.is_empty());
     }
 
-    /// `layout_table` handles a table with no columns at all without panicking.
+    /// The parser's alignments map one-to-one onto [`Align`].
     #[test]
-    fn layout_table_empty() {
-        assert_eq!(layout_table(&[], &[], &[]), vec!["", ""]);
+    fn align_from_parser() {
+        assert_eq!(Align::from(Alignment::None), Align::None);
+        assert_eq!(Align::from(Alignment::Left), Align::Left);
+        assert_eq!(Align::from(Alignment::Center), Align::Center);
+        assert_eq!(Align::from(Alignment::Right), Align::Right);
     }
 }

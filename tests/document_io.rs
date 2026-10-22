@@ -1,7 +1,9 @@
 //! Integration tests for reading documents from disk, the error message and
 //! the window title.
 
-use md_viewer::{error_message, open_document, read_document, window_title, Span, Style};
+use md_viewer::{
+    error_message, open_document, read_document, window_title, Block, Inline, Span, Style,
+};
 use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::Path;
@@ -71,10 +73,10 @@ fn open_document_renders() {
     let file = temp_file(b"# Hi");
     assert_eq!(
         open_document(file.path()).unwrap(),
-        vec![Span {
+        vec![Block::Text(vec![Inline::Text(Span {
             text: "Hi".to_string(),
             styles: vec![Style::Heading(1)],
-        }]
+        })])]
     );
 }
 
