@@ -429,7 +429,7 @@ pub fn window_title(path: &Path) -> String {
 /// HTML, for instance) is shown as plain text rather than dropped. Blocks are
 /// separated by a blank line, list items by a single newline, and adjacent
 /// text with identical styles is merged into one span. See the "Rendering
-/// model" section of `AGENTS.md` for the full set of rules.
+/// model" section of `NOTES.md` for the full set of rules.
 pub fn render(source: &str) -> Vec<Block> {
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH

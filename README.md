@@ -34,11 +34,16 @@ A formula or diagram that cannot be rendered is shown as its source, with
 the reason. Images are shown as `[image: <alt text>]` placeholders, and raw
 HTML is shown as plain text.
 
-`tests/fixtures/showcase.md` shows every feature in one document:
+`showcase.md` at the top of the repository shows every feature in one
+(slightly silly) document - an incident report about a coffee machine, with
+tables, differential equations, chemistry, and flowchart, sequence, Gantt,
+pie, class and state diagrams:
 
 ```
-md_viewer tests/fixtures/showcase.md
+md_viewer showcase.md
 ```
+
+(`tests/fixtures/showcase.md` is a terser fixture used by the test suite.)
 
 Everything is rendered natively in Rust (math with
 [mathra](https://crates.io/crates/mathra), diagrams with

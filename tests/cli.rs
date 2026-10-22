@@ -127,6 +127,16 @@ fn showcase_opens() {
     }
 }
 
+/// With a display, the human-facing showcase at the repository root
+/// (`showcase.md`, the demo for people trying the viewer) opens, keeps
+/// running, prints no GTK criticals and exits cleanly on SIGTERM.
+#[test]
+fn root_showcase_opens() {
+    if have_display() {
+        run_and_close(&[concat!(env!("CARGO_MANIFEST_DIR"), "/showcase.md")]);
+    }
+}
+
 /// With a display, the fallbacks fixture (formulas and diagrams that cannot
 /// be rendered, math in centred and right-aligned cells) opens and exits
 /// cleanly.

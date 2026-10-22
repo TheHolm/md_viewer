@@ -374,6 +374,55 @@ fn showcase_renders() {
     assert_eq!(tables, 2);
 }
 
+/// The human-facing showcase at the repository root (`showcase.md`, the demo
+/// for people trying the viewer) renders completely: every formula and every
+/// diagram renders, with no fallbacks, and it has at least the tables,
+/// formulas and diagrams it is meant to show off. A failure names the
+/// offending source so the document can be fixed.
+#[test]
+fn root_showcase_renders() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("showcase.md");
+    let mut blocks = md_viewer::open_document(&path).unwrap();
+    render_document(&mut blocks, &RasterSettings::default());
+
+    let math = formulas(&blocks);
+    let failed: Vec<String> = math
+        .iter()
+        .filter_map(|math| match &math.image {
+            Some(Ok(_)) => None,
+            Some(Err(e)) => Some(format!("{}: {e}", math.tex)),
+            None => Some(format!("{}: not rendered", math.tex)),
+        })
+        .collect();
+    assert!(failed.is_empty(), "formulas failed: {failed:#?}");
+    assert!(math.len() >= 25, "only {} formulas", math.len());
+    assert!(math.iter().filter(|math| math.display).count() >= 10);
+
+    let diagrams: Vec<&md_viewer::Diagram> = blocks
+        .iter()
+        .filter_map(|block| match block {
+            Block::Mermaid(diagram) => Some(diagram),
+            _ => None,
+        })
+        .collect();
+    let failed: Vec<String> = diagrams
+        .iter()
+        .filter_map(|diagram| match &diagram.image {
+            Some(Ok(_)) => None,
+            Some(Err(e)) => Some(format!("{}: {e}", diagram.source)),
+            None => Some(format!("{}: not rendered", diagram.source)),
+        })
+        .collect();
+    assert!(failed.is_empty(), "diagrams failed: {failed:#?}");
+    assert_eq!(diagrams.len(), 6);
+
+    let tables = blocks
+        .iter()
+        .filter(|block| matches!(block, Block::Table(_)))
+        .count();
+    assert_eq!(tables, 3);
+}
+
 /// The fallbacks fixture (`tests/fixtures/fallbacks.md`, opened by the GUI
 /// test in `tests/cli.rs`) really contains what it is meant to exercise: an
 /// inline and a display formula that fail, a working and a failing formula
