@@ -2,8 +2,10 @@
 # tag pushes matching v* (this repo's tag convention). Never runs on ordinary
 # branch pushes or pull requests.
 #
-# The three package steps are independent of each other (`depends_on: []` puts
-# the workflow into DAG mode, so they run concurrently); only
+# check-version runs first and checks that the tag is exactly v<VERSION> and
+# that Cargo.toml agrees with the VERSION file (the single source of the
+# version). The three package steps wait only for it (`depends_on` puts the
+# workflow into DAG mode, so they then run concurrently); only
 # publish-github-release waits for all of them. All three are required: if any
 # of them fails, nothing is published. freebsd-pkg is listed first
 # because it is the slowest (it downloads a FreeBSD base set and the GTK
@@ -27,9 +29,15 @@ when:
     ref: refs/tags/v*
 
 steps:
-  - name: freebsd-pkg
+  - name: check-version
     image: rust:1.98-trixie
     depends_on: []
+    commands:
+      - bash scripts/check-version.sh "$CI_COMMIT_TAG"
+
+  - name: freebsd-pkg
+    image: rust:1.98-trixie
+    depends_on: [check-version]
     # Required: FreeBSD is a supported target, so a failure here fails the
     # whole release (publish-github-release depends on this step). The sysroot
     # is assembled from a package repository whose layout is not a stable
@@ -81,16 +89,16 @@ steps:
       - chmod 644 stage-root/usr/local/share/doc/md_viewer/README.md stage-root/usr/local/share/doc/md_viewer/LICENSE
       - >-
         python3 scripts/build-freebsd-pkg.py
-        --version "${CI_COMMIT_TAG#v}"
+        --version "$(cat VERSION)"
         --stage-root stage-root
         --deps-file /opt/freebsd-deps.json
-        --output "dist/md_viewer-${CI_COMMIT_TAG#v}-freebsd-amd64.pkg"
+        --output "dist/md_viewer-$(cat VERSION)-freebsd-amd64.pkg"
       # Fail if the binary did not make it into the built .pkg.
       - zstd -dc dist/md_viewer-*.pkg | tar -tf - | grep -qF 'usr/local/bin/md_viewer'
 
   - name: deb-ubuntu2604
     image: ubuntu:26.04
-    depends_on: []
+    depends_on: [check-version]
     environment:
       CARGO_TARGET_DIR: target/deb-ubuntu2604
     commands:
@@ -99,6 +107,8 @@ steps:
       - . "$HOME/.cargo/env"
       - cargo install cargo-deb --locked
       - mkdir -p dist
+      # The .deb version comes from Cargo.toml, which check-version has
+      # already confirmed matches VERSION.
       # --deb-revision disambiguates the two .deb outputs; cargo-deb's default
       # naming does not encode the distro, so both steps would otherwise write
       # an identically named file into the shared dist/ and one would be lost.
@@ -109,7 +119,7 @@ steps:
 
   - name: deb-trixie
     image: rust:1.98-trixie
-    depends_on: []
+    depends_on: [check-version]
     environment:
       CARGO_TARGET_DIR: target/deb-trixie
     commands:

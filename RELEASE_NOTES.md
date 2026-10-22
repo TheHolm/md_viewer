@@ -42,3 +42,8 @@ section for the GitHub Release body.
 - `.woodpecker/release.yaml` builds all three packages on `v*` tags and
   publishes them to GitHub Releases; every package step is required, so a
   failing FreeBSD build fails the release.
+- The `VERSION` file is the single source of the version: `md_viewer
+  --version` (`md_viewer::version()`) and the FreeBSD `.pkg` read it, and
+  `Cargo.toml` keeps a copy that `tests/version.rs` and
+  `scripts/check-version.sh` require to match. The release pipeline runs
+  `check-version.sh` first and refuses a tag that is not `v<VERSION>`.

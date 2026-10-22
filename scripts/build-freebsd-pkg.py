@@ -7,8 +7,11 @@ The format and the tar/leading-slash gotchas are documented in TheHolm/dak's
 NOTES.md section 2; this is a cross-build intended for a Linux CI runner.
 
 Usage:
-    build-freebsd-pkg.py --version 0.1.0 --stage-root ./stage-root \
-        --output dist/md_viewer-0.1.0-freebsd-amd64.pkg
+    build-freebsd-pkg.py --stage-root ./stage-root \
+        --output dist/md_viewer-$(cat VERSION)-freebsd-amd64.pkg
+
+`--version` defaults to the contents of the repository's `VERSION` file (the
+single source of the app version); pass it only to override that.
 
 `--stage-root` must contain the package's files laid out at their final
 absolute install paths (e.g. `<stage-root>/usr/local/bin/md_viewer`). Every
@@ -26,6 +29,9 @@ import json
 import os
 import subprocess
 import sys
+
+# The repository's VERSION file, the single source of the app version.
+VERSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "VERSION")
 
 
 def sha256_of(path: str) -> str:
@@ -143,7 +149,11 @@ def parse_args(argv: list) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--name", default="md_viewer")
     parser.add_argument("--origin", default="deskutils/md_viewer")
-    parser.add_argument("--version", required=True, help="e.g. 0.1.0 (no leading v)")
+    parser.add_argument(
+        "--version",
+        default=None,
+        help="package version, e.g. 0.1.0 (no leading v); default: the VERSION file",
+    )
     parser.add_argument("--stage-root", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--deps-file", help="JSON {name: {origin, version}} for deps")
@@ -168,9 +178,17 @@ def parse_args(argv: list) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def read_version_file(path: str = VERSION_FILE) -> str:
+    """Return the version from the repository's `VERSION` file, stripped."""
+    with open(path, encoding="utf-8") as f:
+        return f.read().strip()
+
+
 def main(argv: list) -> int:
     """Entry point: build the manifest from --stage-root and write the .pkg."""
     args = parse_args(argv)
+    if args.version is None:
+        args.version = read_version_file()
     deps = {}
     if args.deps_file:
         with open(args.deps_file) as f:

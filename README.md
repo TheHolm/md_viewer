@@ -43,6 +43,17 @@ cargo build --release
 
 The compiled executable will be in `target/release/md_viewer`.
 
+# Versioning
+
+The app version lives in the `VERSION` file and nowhere else; `md_viewer
+--version` prints it. `Cargo.toml` carries a copy because cargo needs one, and
+`cargo test` fails if the two differ. Before tagging a release, check that
+everything agrees:
+
+```
+bash scripts/check-version.sh v$(cat VERSION)
+```
+
 # Testing
 
 The non-GUI logic (file reading and Markdown rendering) lives in a library

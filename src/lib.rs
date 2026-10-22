@@ -13,6 +13,17 @@ use std::path::Path;
 /// The application name shown in the window title.
 pub const APP_NAME: &str = "MD Viewer";
 
+/// The raw contents of the repository's `VERSION` file, embedded at compile
+/// time (cargo rebuilds the crate whenever the file changes).
+const VERSION_FILE: &str = include_str!("../VERSION");
+
+/// Returns the application version, read from the `VERSION` file at the
+/// repository root - the single source of the version. Surrounding
+/// whitespace (the trailing newline) is stripped.
+pub fn version() -> &'static str {
+    VERSION_FILE.trim()
+}
+
 /// The text a horizontal rule is rendered as.
 pub const RULE_TEXT: &str = "────────────────────────────────────────";
 

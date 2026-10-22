@@ -14,9 +14,10 @@ use std::path::PathBuf;
 /// The application ID registered with GTK.
 const APP_ID: &str = "io.github.TheHolm.md_viewer";
 
-/// Command line arguments.
+/// Command line arguments. `--version` prints the contents of the `VERSION`
+/// file (via `md_viewer::version`), not the copy in `Cargo.toml`.
 #[derive(Parser, Debug)]
-#[command(version, about = "View a Markdown document")]
+#[command(version = md_viewer::version(), about = "View a Markdown document")]
 struct Args {
     /// The Markdown file to view.
     file: PathBuf,

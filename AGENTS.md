@@ -19,8 +19,9 @@ Markdown documents. It is a viewer only: it opens the file given on the
 command line, renders it read-only in a scrollable window, and never writes
 to it. The window title is "MD Viewer" (prefixed with the open file's name)
 and the application ID is `io.github.TheHolm.md_viewer`. The package,
-library and binary are all named `md_viewer`. Version: declared as `version`
-in `Cargo.toml`.
+library and binary are all named `md_viewer`. Version: declared in the
+`VERSION` file at the repository root, the single source of the version (see
+"Versioning" below).
 
 ## Stack
 
@@ -55,7 +56,8 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   result is awaited from a `glib::spawn_future_local` block so the text
   buffer is filled back on the main thread.
 - `src/lib.rs` - all non-GUI logic, exposed publicly so the GUI and the
-  integration tests share exactly one implementation: reading the document
+  integration tests share exactly one implementation: the app version
+  (`version`, the `VERSION` file embedded at compile time), reading the document
   (`read_document`, and `open_document` = read + render, which is what the
   GUI calls), the error text for an unreadable file (`error_message`), the
   window title (`window_title`) and the Markdown renderer (`render`), which
@@ -72,14 +74,20 @@ run there; runtime verification on a real FreeBSD system is a manual step.
     links, images)
   - `document_io.rs` - reading a document from disk, including failure paths,
     and the window title
-- `Cargo.toml` - package metadata, dependencies, the `tempfile`
-  dev-dependency and the `cargo-deb` metadata
+  - `version.rs` - that `VERSION` is one `X.Y.Z` line, that `version()`
+    reports it, and that the copy in `Cargo.toml` matches it
+- `VERSION` - the app version, one `X.Y.Z` line; the single source of the
+  version
+- `Cargo.toml` - package metadata (its `version` is a copy of `VERSION`),
+  dependencies, the `tempfile` dev-dependency and the `cargo-deb` metadata
 - `.woodpecker/release.yaml` - the Woodpecker CI workflow: on `v*` tags it
-  builds a Debian trixie `.deb`, an Ubuntu 26.04 `.deb` and a FreeBSD `.pkg`,
+  first checks the tag and `Cargo.toml` against `VERSION`, then builds a Debian trixie `.deb`, an Ubuntu 26.04 `.deb` and a FreeBSD `.pkg`,
   then publishes them to the GitHub mirror's Releases (needs a
   `github_token` secret in Woodpecker). Every package step is required.
-- `scripts/` - CI helpers: `build-freebsd-pkg.py` (writes a `.pkg` from a
-  staged install tree), `fetch-freebsd-gtk.py` (downloads the GTK4/libadwaita
+- `scripts/` - CI helpers: `check-version.sh` (checks `VERSION` is `X.Y.Z`,
+  that `Cargo.toml` matches it and, given a tag, that the tag is
+  `v<VERSION>`), `build-freebsd-pkg.py` (writes a `.pkg` from a staged
+  install tree; its version defaults to `VERSION`), `fetch-freebsd-gtk.py` (downloads the GTK4/libadwaita
   FreeBSD cross sysroot from `pkg.freebsd.org`) and `extract-release-notes.sh`
   (renders one release's section as a GitHub Release body)
 - `RELEASE_NOTES.md` - per-version release notes; the matching `## vX.Y.Z`
@@ -101,6 +109,20 @@ run there; runtime verification on a real FreeBSD system is a manual step.
 - Images show as `[image: <alt text>]`; the image itself is not loaded.
 - Adjacent text with identical styles is merged into one span.
 
+## Versioning
+
+- `VERSION` is the single source of the app version. The library embeds it
+  (`md_viewer::version()`, used for `--version`), and the FreeBSD `.pkg`
+  version and file name are read from it.
+- `Cargo.toml`'s `version` is a copy, only because cargo requires a literal
+  value there; the `.deb` packages take their version from it. Never let the
+  two differ: `cargo test` (`tests/version.rs`) and the release pipeline
+  (`scripts/check-version.sh`) both fail if they do.
+- To change the version: edit `VERSION`, set `Cargo.toml`'s `version` to the
+  same value, run `cargo build` so `Cargo.lock` picks it up, and add the
+  matching `## vX.Y.Z` entry to `RELEASE_NOTES.md`. Release tags are
+  `v<VERSION>`; the pipeline refuses any other tag.
+
 ## Status / known gaps
 
 First version (v0.1.0). Current known gaps:
@@ -121,6 +143,8 @@ First version (v0.1.0). Current known gaps:
 - Run: `cargo run -- <FILE>` (requires a GTK4/libadwaita desktop session)
 - Test: `cargo test`
 - Format check: `cargo fmt --check`
+- Version check: `bash scripts/check-version.sh [vX.Y.Z]` (run before
+  tagging; pass the tag you are about to create)
 - Coverage: `cargo llvm-cov --tests` (requires the `llvm-tools` component and
   the `cargo-llvm-cov` subcommand)
 - Debian package: `cargo deb` (requires the `cargo-deb` subcommand)
@@ -156,6 +180,8 @@ cargo install cargo-llvm-cov --locked
   in the library
 - The viewer never modifies the documents it opens
 - Commits include a detailed description of what changed and why
+- Change the version only as described under "Versioning" (`VERSION` first,
+  then the copy in `Cargo.toml`)
 - Add a `## vX.Y.Z` entry to `RELEASE_NOTES.md` for each release (the release
   pipeline fails a tag with no matching entry rather than publish an empty one)
 - When starting work on each new branch, ask the user whether to bump the
