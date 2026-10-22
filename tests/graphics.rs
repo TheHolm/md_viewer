@@ -341,3 +341,35 @@ fn render_document_without_graphics() {
     render_document(&mut blocks, &RasterSettings::default());
     assert_eq!(blocks, original);
 }
+
+/// The showcase document (`tests/fixtures/showcase.md`, used for manual
+/// visual checks) renders end to end: every formula and diagram renders
+/// except the one diagram that is deliberately broken.
+#[test]
+fn showcase_renders() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/showcase.md");
+    let mut blocks = md_viewer::open_document(&path).unwrap();
+    render_document(&mut blocks, &RasterSettings::default());
+
+    let math_ok = formulas(&blocks)
+        .iter()
+        .filter(|math| matches!(math.image, Some(Ok(_))))
+        .count();
+    assert_eq!(math_ok, formulas(&blocks).len());
+    assert!(math_ok >= 9, "only {math_ok} formulas");
+
+    let diagrams: Vec<bool> = blocks
+        .iter()
+        .filter_map(|block| match block {
+            Block::Mermaid(diagram) => diagram.image.as_ref().map(Result::is_ok),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(diagrams, vec![true, true, true, true, false]);
+
+    let tables = blocks
+        .iter()
+        .filter(|block| matches!(block, Block::Table(_)))
+        .count();
+    assert_eq!(tables, 2);
+}

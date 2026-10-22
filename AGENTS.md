@@ -28,10 +28,20 @@ library and binary are all named `md_viewer`. Version: declared in the
 - Rust 2021 edition, toolchain 1.98 (the version CI builds with)
 - `gtk4` (feature `v4_8`) - GUI toolkit
 - `adw` / libadwaita (feature `v1_2`) - GNOME application shell
-- `pulldown-cmark` - CommonMark parser (with the tables, strikethrough and
-  task list extensions enabled)
+- `pulldown-cmark` - CommonMark parser (with the tables, strikethrough,
+  task list and math extensions enabled)
+- `mathra` - LaTeX math (including mhchem `\ce{}`/`\pu{}`) to SVG, pure Rust,
+  with its own bundled math font
+- `merman` (features `svg`, `all-diagrams`) - Mermaid diagrams to SVG, pure
+  Rust; used through its resvg-safe pipeline (labels as SVG text)
+- `resvg` (features `text`, `system-fonts`, `memmap-fonts`) - rasterizes
+  every SVG; SVG text uses the system fonts
 - `clap` - command line argument parsing (the `FILE` argument)
 - `tempfile` (dev-dependency) - temporary files for integration tests
+
+Everything that renders formulas and diagrams is pure Rust: no JavaScript,
+web view or extra system library. Keep it that way unless the user decides
+otherwise - it is what keeps the FreeBSD cross-build simple.
 
 ## Target platforms
 
@@ -50,28 +60,57 @@ run there; runtime verification on a real FreeBSD system is a manual step.
 
 - `src/main.rs` - the GTK4/libadwaita GUI: the application, a window with a
   header bar and a read-only `GtkTextView` inside a `GtkScrolledWindow`.
-  Deliberately thin: it maps the library's styled spans onto `GtkTextTag`s
-  and handles errors and exit codes. File reading and Markdown rendering run
-  on `gio::spawn_blocking` (the I/O thread pool), not the GTK main loop; the
-  result is awaited from a `glib::spawn_future_local` block so the text
-  buffer is filled back on the main thread.
+  Deliberately thin: it walks the library's blocks and handles errors and
+  exit codes. Text goes into the buffer with one `GtkTextTag` per `Style`;
+  formulas are inserted as paintables (`ScaledTexture`, which draws a
+  device-pixel texture at its logical size for HiDPI), lowered by a `rise`
+  tag to line up baselines, display math centred; tables become a `GtkGrid`
+  of wrapping labels (Pango markup from the library) in a horizontal
+  `GtkScrolledWindow`; diagrams become a `GtkPicture` on a white card. Tables
+  and diagrams are anchored in the text view, which only gives anchored
+  widgets their minimum size, so `Resizable` (run from a tick callback)
+  sizes them from their content and the view width: tables at their natural
+  width capped to the view (wider ones scroll), diagrams scaled down to fit.
+  Widget styling is the `CSS` constant. Reading, rendering and rasterizing
+  run on `gio::spawn_blocking` (the I/O thread pool), not the GTK main loop,
+  with `RasterSettings` (font size, scale factor, text colour) taken from the
+  view first; the result is awaited from a `glib::spawn_future_local` block
+  so the widgets are built back on the main thread.
 - `src/lib.rs` - all non-GUI logic, exposed publicly so the GUI and the
   integration tests share exactly one implementation: the app version
   (`version`, the `VERSION` file embedded at compile time), reading the document
   (`read_document`, and `open_document` = read + render, which is what the
   GUI calls), the error text for an unreadable file (`error_message`), the
-  window title (`window_title`) and the Markdown renderer (`render`), which
-  turns Markdown into a flat list of `Span`s, each a piece of text plus the
-  `Style`s that apply to it. The GUI only needs to insert spans in order and
-  apply one text tag per style (`Style::tag_name`; `Style::ALL` lists every
-  style so all tags can be created up front). Private helpers (`Renderer`,
-  `layout_table`, `pad_cell`, `trailing_newlines`, `normalize`) have unit
+  window title (`window_title`), the Markdown renderer (`render`) and Pango
+  markup for table cells (`pango_markup`, `escape_markup`, and the shared
+  colour constants). `render` turns Markdown into a `Vec<Block>`:
+  `Block::Text` (flowing `Inline`s: `Inline::Text(Span)` - text plus its
+  `Style`s - and `Inline::Math(Math)`), `Block::Table(Table)` (per-column
+  `Align`, header and rows of `Cell`s, i.e. `Vec<Inline>`) and
+  `Block::Mermaid(Diagram)`. `Math` and `Diagram` carry an `image` that is
+  `None` after `render` and filled in by `graphics::render_document`.
+  `Style::tag_name` names each style's text tag; `Style::ALL` lists every
+  style so all tags can be created up front. Private helpers (`Renderer`,
+  `TableBuilder`, `push_inline`, `trailing_newlines`, `normalize`) have unit
   tests in the same file.
+- `src/graphics.rs` (`md_viewer::graphics`) - turning formulas and diagrams
+  into pixels: `math_svg`/`render_math` (mathra; math at `MATH_SCALE` =
+  1.21x the text size like KaTeX, in the text colour, with its depth below
+  the baseline), `mermaid_svg`/`render_mermaid` (merman), `rasterize` (resvg
+  into premultiplied RGBA `Image`s at a device scale; the system font
+  database is loaded once and generic `sans-serif` is pointed at an
+  installed family) and `render_document`, which fills in every graphic of a
+  rendered document.
 - `tests/` - integration tests split by topic:
   - `render.rs` - the renderer: one group of tests per block type
-    (paragraphs, headings, lists, block quotes, code blocks, rules, tables)
-    and per inline style (emphasis, strong, strikethrough, inline code,
-    links, images)
+    (paragraphs, headings, lists, block quotes, code blocks, rules, tables,
+    math, Mermaid) and per inline style (emphasis, strong, strikethrough,
+    inline code, links, images), plus the Pango markup for table cells
+  - `graphics.rs` - rasterizing, math and mhchem, Mermaid diagrams (several
+    types, labels, scale, errors), filling in whole documents, and that the
+    showcase fixture renders
+  - `fixtures/showcase.md` - a document using every supported feature, for
+    manual visual checks (`cargo run -- tests/fixtures/showcase.md`)
   - `document_io.rs` - reading a document from disk, including failure paths,
     and the window title
   - `version.rs` - that `VERSION` is one `X.Y.Z` line, that `version()`
@@ -103,9 +142,20 @@ run there; runtime verification on a real FreeBSD system is a manual step.
 - List items are prefixed with `• ` (unordered) or `N. ` (ordered), indented
   four spaces per nesting level; task list items additionally get `[x] ` or
   `[ ] `.
-- Tables are laid out as aligned monospace text (cells padded to a common
-  column width, honouring the column alignment) with a `-` separator line
-  under the header.
+- Tables are `Block::Table`s shown as grid widgets: bold, shaded header row,
+  striped body rows, per-column alignment, inline styles kept in cells, long
+  cells word-wrapped at about 40 characters, rows padded to the same column
+  count. A table wider than the window scrolls horizontally.
+- Math: `$…$` is inline, `$$…$$` is display math on its own centred line
+  (inline inside a table cell). Only the dollar syntax is supported, not
+  `\(…\)` or `\[…\]`. A lone `$`, `\$` and dollars in code are text.
+  mhchem's `\ce{}` and `\pu{}` work inside math.
+- A fenced code block whose info string starts with `mermaid`
+  (case-insensitive) is a `Block::Mermaid` diagram, drawn on a white card
+  in both themes (Mermaid's colours assume a light background).
+- A formula or diagram that cannot be rendered is shown as its source in
+  code style; display math and diagrams add a line with the reason. Nothing
+  is ever dropped.
 - Images show as `[image: <alt text>]`; the image itself is not loaded.
 - Adjacent text with identical styles is merged into one span.
 
@@ -125,15 +175,25 @@ run there; runtime verification on a real FreeBSD system is a manual step.
 
 ## Status / known gaps
 
-First version (v0.1.0). Current known gaps:
+Version 0.2.0. Current known gaps:
 
 - Errors (unreadable file, invalid UTF-8) are written to STDERR and the
   program exits with status 1; a popup would be better.
 - Links are styled but not clickable; images are placeholders only.
 - No way to open another file from the GUI, and no reload when the file
   changes on disk.
-- Table column widths count characters, not display width, so wide (e.g.
-  CJK) characters can misalign columns.
+- Formulas are rendered once with the theme's text colour at load time;
+  switching between light and dark while a document is open leaves them in
+  the old colour.
+- Table cells containing math do not wrap (they are a row of labels and
+  pictures, not one wrapping label).
+- mathra and merman are young crates: output is close to, but not identical
+  with, KaTeX and mermaid.js. Known differences: mathra has no automatic
+  line breaking and no mhchem text mode; merman sizes text with its own
+  metrics, so e.g. edge label backgrounds can be slightly off and long Gantt
+  date axes crowd. Rendering bugs there are upstream issues.
+- merman's diagram engines make the binary much larger (about 25 MB
+  stripped, against about 1.3 MB for 0.1.0).
 - The `.deb`/`.pkg` install only the binary and docs; there is no `.desktop`
   file or icon yet.
 

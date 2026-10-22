@@ -13,9 +13,34 @@ md_viewer <FILE>
 
 The document is shown with headings, emphasis, strong text, strikethrough,
 inline code and code blocks, block quotes, ordered/unordered and task lists,
-horizontal rules and tables (laid out as aligned monospace text). Images are
-shown as `[image: <alt text>]` placeholders, and raw HTML is shown as plain
-text.
+horizontal rules, and:
+
+* **Tables** as real grids: shaded header, striped rows, column alignment,
+  formatting inside cells, and long cells wrapped. Tables wider than the
+  window scroll sideways.
+* **Math** in LaTeX: `$…$` inline and `$$…$$` on its own line, as in KaTeX.
+* **Chemistry** with mhchem inside math: `$\ce{2H2 + O2 -> 2H2O}$`,
+  `$\pu{123 kJ/mol}$`.
+* **Mermaid diagrams** in ` ```mermaid ` code blocks: flowcharts, sequence
+  diagrams, Gantt charts, pie charts, class and state diagrams and the other
+  Mermaid diagram types.
+
+A formula or diagram that cannot be rendered is shown as its source, with
+the reason. Images are shown as `[image: <alt text>]` placeholders, and raw
+HTML is shown as plain text.
+
+`tests/fixtures/showcase.md` shows every feature in one document:
+
+```
+md_viewer tests/fixtures/showcase.md
+```
+
+Everything is rendered natively in Rust (math with
+[mathra](https://crates.io/crates/mathra), diagrams with
+[merman](https://crates.io/crates/merman), drawn with
+[resvg](https://crates.io/crates/resvg)): no browser engine or JavaScript is
+involved. The output is close to KaTeX and mermaid.js but not pixel
+identical.
 
 # Target platforms
 
@@ -77,6 +102,7 @@ The GUI in `src/main.rs` is a thin wrapper and is not covered by the tests.
 # TODO
 
 * Clickable links.
+* Re-render formulas when switching between light and dark themes.
 * Inline images.
 * Open a file from the GUI and reload it when it changes on disk.
 * Error popups instead of messages on STDERR.

@@ -10,11 +10,44 @@ section for the GitHub Release body.
 
 ### User-facing changes
 
-- Work in progress.
+- Tables are real grids instead of monospace text: bold shaded header,
+  striped rows, column alignment, bold/italic/code/links kept inside cells,
+  long cells wrapped. Tables wider than the window scroll sideways.
+- LaTeX math: `$…$` inline and `$$…$$` centred on its own line, sized like
+  KaTeX and drawn in the theme's text colour (dark mode included).
+- Chemistry with mhchem inside math: `\ce{…}` equations and `\pu{…}` units.
+- Mermaid diagrams in ` ```mermaid ` blocks: flowcharts, sequence diagrams,
+  Gantt charts, pie charts, class/state diagrams and the other Mermaid
+  types, on a white card, scaled down to fit the window.
+- A formula or diagram that cannot be rendered is shown as its source with
+  the reason, never dropped.
+- Everything renders natively (no browser engine or JavaScript); output is
+  close to KaTeX and mermaid.js but not identical. The binary is larger
+  (about 25 MB) because of the diagram engines.
 
 ### Details
 
-- Work in progress.
+- `src/lib.rs`: `render` now returns `Vec<Block>` (`Text`, `Table`,
+  `Mermaid`) instead of a flat span list. Text blocks hold `Inline`s
+  (styled `Span`s and `Math`); tables hold per-column `Align` and rows of
+  styled cells. pulldown-cmark's math extension is enabled. Table cells are
+  turned into Pango markup by `pango_markup`.
+- `src/graphics.rs` (new): mathra typesets math (with mhchem) to SVG,
+  merman lays out Mermaid through its resvg-safe pipeline, and resvg
+  rasterizes both into premultiplied RGBA at the display scale, using the
+  system fonts (generic sans-serif is mapped to an installed family).
+  `render_document` fills in every graphic on the I/O thread pool.
+- `src/main.rs`: tables are `GtkGrid`s of wrapping labels and diagrams are
+  `GtkPicture`s, both anchored in the text view and sized by a tick-driven
+  helper (anchored widgets otherwise only get their minimum size); formulas
+  are scale-aware paintables lowered to the text baseline. Styling is a
+  small CSS provider.
+- New dependencies: `mathra` 1.2, `merman` 0.9 (SVG output and all diagram
+  families only), `resvg` 0.48 (text and system fonts only). All pure Rust;
+  no new system libraries, so CI and the FreeBSD cross-build are unchanged.
+- Tests: `tests/render.rs` rewritten for the block model with table, math
+  and Mermaid groups; new `tests/graphics.rs`; `tests/fixtures/showcase.md`
+  covers every feature and is checked end to end.
 
 ## v0.1.0 — Initial release
 
