@@ -585,6 +585,15 @@ fn html_block_is_plain_text() {
     );
 }
 
+/// Without the footnote extension, `[^1]: …` is a CommonMark link reference
+/// definition: invisible itself, but it makes `[text][^1]` a link.
+#[test]
+fn footnote_definition_is_link_reference() {
+    let spans = r("see [docs][^1]\n\n[^1]: https://example.com");
+    assert_eq!(plain_text(&spans), "see docs");
+    assert_eq!(styles_of(&spans, "docs"), vec![Style::Link]);
+}
+
 /// Footnote syntax (the extension is not enabled) is shown as plain text.
 #[test]
 fn footnote_reference_is_plain_text() {
@@ -718,6 +727,22 @@ fn math_as_link_text() {
     assert_eq!(outline("[$x$](http://u)"), "$x$");
 }
 
+/// A formula right after a table or diagram starts a new text block.
+#[test]
+fn math_after_table_starts_text_block() {
+    let blocks = render("| a |\n|---|\n\n$$x$$");
+    assert!(matches!(blocks.last(), Some(Block::Text(inlines))
+        if inlines.iter().any(|i| matches!(i, Inline::Math(_)))));
+    assert_eq!(formulas("```mermaid\npie\n```\n$$y$$").len(), 1);
+}
+
+/// `Inline::text` gives a span's text or a formula's source.
+#[test]
+fn inline_text() {
+    assert_eq!(Inline::Text(span("a", &[])).text(), "a");
+    assert_eq!(Inline::Math(Math::new("x", false)).text(), "$x$");
+}
+
 /// `Math::source` restores the dollar signs for display as a fallback.
 #[test]
 fn math_source() {
@@ -812,6 +837,15 @@ fn mermaid_source_is_verbatim() {
     );
 }
 
+/// An empty mermaid block is still a diagram (rendering then reports it as
+/// empty), and an empty ordinary code block adds no text, only the usual
+/// single blank line between its neighbours.
+#[test]
+fn empty_code_blocks() {
+    assert_eq!(diagrams("```mermaid\n```"), vec![Diagram::new("")]);
+    assert_eq!(outline("a\n\n```\n```\n\nb"), "a\n\nb");
+}
+
 /// A diagram inside a block quote or list item is still a diagram.
 #[test]
 fn mermaid_nested() {
@@ -859,6 +893,16 @@ fn pango_markup_code_and_link() {
     let link = md_viewer::pango_markup(&[Inline::Text(span("l", &[Style::Link]))]);
     assert!(link.contains(&format!("foreground=\"{}\"", md_viewer::LINK_COLOR)));
     assert!(link.contains("underline=\"single\""));
+}
+
+/// A formula that has already been rendered is still shown as its source
+/// in markup (labels cannot hold images).
+#[test]
+fn pango_markup_rendered_math() {
+    let mut math = Math::new("x", true);
+    math.image = Some(Err("unused".to_string()));
+    let markup = md_viewer::pango_markup(&[Inline::Math(math)]);
+    assert!(markup.contains(">$$x$$</span>"), "{markup}");
 }
 
 /// An empty cell produces empty markup.

@@ -71,7 +71,8 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   widgets their minimum size, so `Resizable` (run from a tick callback)
   sizes them from their content and the view width: tables at their natural
   width capped to the view (wider ones scroll), diagrams scaled down to fit.
-  Widget styling is the `CSS` constant. Reading, rendering and rasterizing
+  Widget styling is the `CSS` constant; sizes and classes come from
+  `md_viewer::layout`. SIGINT/SIGTERM quit cleanly through the main loop. Reading, rendering and rasterizing
   run on `gio::spawn_blocking` (the I/O thread pool), not the GTK main loop,
   with `RasterSettings` (font size, scale factor, text colour) taken from the
   view first; the result is awaited from a `glib::spawn_future_local` block
@@ -101,6 +102,12 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   database is loaded once and generic `sans-serif` is pointed at an
   installed family) and `render_document`, which fills in every graphic of a
   rendered document.
+- `src/layout.rs` (`md_viewer::layout`) - the GUI's sizing and styling
+  arithmetic as plain functions, so it is tested without a display: the
+  width available to anchored widgets, table and diagram sizes, Pango font
+  size to pixels, colour channels, heading scales, the baseline `rise` of
+  inline math, column alignment and table cell CSS classes. `main.rs` only
+  applies the results to widgets.
 - `tests/` - integration tests split by topic:
   - `render.rs` - the renderer: one group of tests per block type
     (paragraphs, headings, lists, block quotes, code blocks, rules, tables,
@@ -109,8 +116,16 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   - `graphics.rs` - rasterizing, math and mhchem, Mermaid diagrams (several
     types, labels, scale, errors), filling in whole documents, and that the
     showcase fixture renders
+  - `layout.rs` - the `md_viewer::layout` functions
+  - `cli.rs` - the binary end to end: `--version`, `--help` and argument
+    errors always; with a display (`DISPLAY`/`WAYLAND_DISPLAY` set) also an
+    unreadable file (status 1) and opening both fixtures, checking that the
+    viewer stays up, prints no GTK criticals and exits 0 on SIGTERM. Without
+    a display those tests print "skipped" and pass
   - `fixtures/showcase.md` - a document using every supported feature, for
     manual visual checks (`cargo run -- tests/fixtures/showcase.md`)
+  - `fixtures/fallbacks.md` - formulas and diagrams that fail to render and
+    math in aligned table cells, for the GUI's fallback paths
   - `document_io.rs` - reading a document from disk, including failure paths,
     and the window title
   - `version.rs` - that `VERSION` is one `X.Y.Z` line, that `version()`
@@ -206,7 +221,11 @@ Version 0.2.0. Current known gaps:
 - Version check: `bash scripts/check-version.sh [vX.Y.Z]` (run before
   tagging; pass the tag you are about to create)
 - Coverage: `cargo llvm-cov --tests` (requires the `llvm-tools` component and
-  the `cargo-llvm-cov` subcommand)
+  the `cargo-llvm-cov` subcommand). Run it with a display so the GUI is
+  covered too; headless, e.g. `Xvfb :77 & DISPLAY=:77 GDK_BACKEND=x11
+  GSK_RENDERER=cairo cargo llvm-cov --tests`. With a display line coverage
+  is about 98%; the remaining lines are defensive branches that cannot be
+  reached with the enabled parser options
 - Debian package: `cargo deb` (requires the `cargo-deb` subcommand)
 - FreeBSD package: cross-build with `cargo build --release --target
   x86_64-unknown-freebsd` against a FreeBSD sysroot, then

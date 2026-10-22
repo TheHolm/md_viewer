@@ -373,3 +373,34 @@ fn showcase_renders() {
         .count();
     assert_eq!(tables, 2);
 }
+
+/// The fallbacks fixture (`tests/fixtures/fallbacks.md`, opened by the GUI
+/// test in `tests/cli.rs`) really contains what it is meant to exercise: an
+/// inline and a display formula that fail, a working and a failing formula
+/// in table cells, and two diagrams that fail.
+#[test]
+fn fallbacks_fixture_fails_where_intended() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fallbacks.md");
+    let mut blocks = md_viewer::open_document(&path).unwrap();
+    render_document(&mut blocks, &RasterSettings::default());
+    let results: Vec<(bool, bool)> = formulas(&blocks)
+        .iter()
+        .map(|math| (math.display, matches!(math.image, Some(Ok(_)))))
+        .collect();
+    assert_eq!(
+        results,
+        vec![
+            (false, false),
+            (true, false),
+            (false, true),
+            (false, true),
+            (false, true),
+            (false, false),
+        ]
+    );
+    let diagrams = blocks
+        .iter()
+        .filter(|block| matches!(block, Block::Mermaid(d) if matches!(d.image, Some(Err(_)))))
+        .count();
+    assert_eq!(diagrams, 2);
+}

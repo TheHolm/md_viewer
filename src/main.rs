@@ -10,6 +10,7 @@ use clap::Parser;
 use gtk4::glib::translate::IntoGlib;
 use gtk4::{gdk, gio, glib, pango};
 use md_viewer::graphics::{Image, RasterSettings};
+use md_viewer::layout;
 use md_viewer::{Align, Block, Diagram, Inline, Math, Style, Table};
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -17,13 +18,6 @@ use std::rc::Rc;
 
 /// The application ID registered with GTK.
 const APP_ID: &str = "io.github.TheHolm.md_viewer";
-
-/// The left and right margin of the document, in pixels.
-const MARGIN: i32 = 16;
-
-/// The padding around a diagram on its card (see `.md-diagram` in [`CSS`]),
-/// plus the card's border, on each side.
-const DIAGRAM_PADDING: i32 = 13;
 
 /// The name of the text tag that centres display math on its line.
 const DISPLAY_MATH_TAG: &str = "math-display";
@@ -85,9 +79,29 @@ fn main() -> glib::ExitCode {
         .application_id(APP_ID)
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
-    app.connect_startup(|_| load_css());
+    app.connect_startup(|app| {
+        load_css();
+        quit_on_signals(app);
+    });
     app.connect_activate(move |app| build_window(app, args.file.clone()));
     app.run_with_args(&[env!("CARGO_PKG_NAME")])
+}
+
+/// SIGINT and SIGTERM (the same numbers on Linux and FreeBSD).
+const QUIT_SIGNALS: [i32; 2] = [2, 15];
+
+/// Makes SIGINT (Ctrl+C in a terminal) and SIGTERM quit the application
+/// cleanly through the main loop instead of killing the process outright.
+fn quit_on_signals(app: &adw::Application) {
+    for signal in QUIT_SIGNALS {
+        let app = app.downgrade();
+        glib::unix_signal_add_local(signal, move || {
+            if let Some(app) = app.upgrade() {
+                app.quit();
+            }
+            glib::ControlFlow::Continue
+        });
+    }
 }
 
 /// Installs the document widget styling for the whole application.
@@ -124,7 +138,6 @@ struct Resizable {
 impl Resizable {
     /// Re-sizes every registered widget for a view `width` pixels wide.
     fn update(&self, width: i32) {
-        let available = (width - 2 * MARGIN - 8).max(100);
         for scroller in self.tables.borrow().iter() {
             let Some(grid) = scroller.child() else {
                 continue;
@@ -135,18 +148,13 @@ impl Resizable {
             // table scrolls horizontally (libadwaita's scrollbars overlay
             // the content, so no extra height is needed for them).
             let height = grid.measure(gtk4::Orientation::Vertical, natural).1;
-            let size = (natural.min(available), height);
+            let size = layout::table_size(natural, height, width);
             if scroller.size_request() != size {
                 scroller.set_size_request(size.0, size.1);
             }
         }
-        let room = (available - 2 * DIAGRAM_PADDING).max(50) as f32;
-        for (picture, width, height) in self.diagrams.borrow().iter() {
-            let factor = (room / width).min(1.0);
-            let size = (
-                (width * factor).round() as i32,
-                (height * factor).round() as i32,
-            );
+        for (picture, natural_width, natural_height) in self.diagrams.borrow().iter() {
+            let size = layout::diagram_size(*natural_width, *natural_height, width);
             if picture.size_request() != size {
                 picture.set_size_request(size.0, size.1);
             }
@@ -162,8 +170,8 @@ fn build_window(app: &adw::Application, path: PathBuf) {
         .wrap_mode(gtk4::WrapMode::WordChar)
         .top_margin(12)
         .bottom_margin(12)
-        .left_margin(MARGIN)
-        .right_margin(MARGIN)
+        .left_margin(layout::DOCUMENT_MARGIN)
+        .right_margin(layout::DOCUMENT_MARGIN)
         .build();
     create_tags(&view.buffer().tag_table());
     let scrolled = gtk4::ScrolledWindow::builder()
@@ -225,21 +233,12 @@ fn raster_settings(view: &gtk4::TextView) -> RasterSettings {
     let font_px = view
         .pango_context()
         .font_description()
-        .map(|font| {
-            let size = font.size() as f32 / pango::SCALE as f32;
-            // Point sizes are relative to 96 dpi logical pixels.
-            if font.is_size_absolute() {
-                size
-            } else {
-                size * 96.0 / 72.0
-            }
-        })
-        .filter(|size| *size > 0.0)
-        .unwrap_or(15.0);
+        .and_then(|font| layout::font_size_px(font.size(), font.is_size_absolute(), pango::SCALE))
+        .unwrap_or(layout::DEFAULT_FONT_PX);
     // `style_context().color()` is the GTK 4.8 way to read the text colour.
     #[allow(deprecated)]
     let color = view.style_context().color();
-    let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let channel = layout::color_channel;
     RasterSettings {
         font_px,
         scale: view.scale_factor().max(1) as f32,
@@ -339,7 +338,7 @@ fn insert_math(buffer: &gtk4::TextBuffer, math: &Math) {
             buffer.insert_paintable(&mut buffer.end_iter(), &ScaledTexture::new(image));
             let range = (buffer.iter_at_offset(start), buffer.end_iter());
             let rise = gtk4::TextTag::builder()
-                .rise(-(image.depth * pango::SCALE as f32).round() as i32)
+                .rise(layout::math_rise(image.depth, pango::SCALE))
                 .build();
             buffer.tag_table().add(&rise);
             buffer.apply_tag(&rise, &range.0, &range.1);
@@ -378,18 +377,7 @@ fn table_widget(table: &Table) -> gtk4::ScrolledWindow {
     let row_count = table.rows.len() + 1;
     for (row_index, row) in rows.enumerate() {
         for (column, cell) in row.iter().enumerate() {
-            let mut classes = vec!["md-cell"];
-            if row_index == 0 {
-                classes.push("md-header");
-            } else if row_index % 2 == 0 {
-                classes.push("md-stripe");
-            }
-            if column + 1 == table.columns() {
-                classes.push("md-last-column");
-            }
-            if row_index + 1 == row_count {
-                classes.push("md-last-row");
-            }
+            let classes = layout::cell_classes(row_index, column, table.columns(), row_count);
             let alignment = table.alignments[column];
             let cell_widget = cell_widget(cell, alignment, &classes);
             grid.attach(&cell_widget, column as i32, row_index as i32, 1, 1);
@@ -412,10 +400,10 @@ fn cell_widget(cell: &[Inline], alignment: Align, classes: &[&str]) -> gtk4::Wid
     if cell.iter().any(|inline| matches!(inline, Inline::Math(_))) {
         return math_cell_widget(cell, alignment, classes);
     }
-    let (halign, xalign, justify) = match alignment {
-        Align::None | Align::Left => (gtk4::Align::Start, 0.0, gtk4::Justification::Left),
-        Align::Center => (gtk4::Align::Center, 0.5, gtk4::Justification::Center),
-        Align::Right => (gtk4::Align::End, 1.0, gtk4::Justification::Right),
+    let (halign, justify) = match alignment {
+        Align::None | Align::Left => (gtk4::Align::Start, gtk4::Justification::Left),
+        Align::Center => (gtk4::Align::Center, gtk4::Justification::Center),
+        Align::Right => (gtk4::Align::End, gtk4::Justification::Right),
     };
     let label = gtk4::Label::builder()
         .use_markup(true)
@@ -426,7 +414,7 @@ fn cell_widget(cell: &[Inline], alignment: Align, classes: &[&str]) -> gtk4::Wid
         .wrap_mode(pango::WrapMode::Word)
         .max_width_chars(CELL_WRAP_CHARS)
         .selectable(true)
-        .xalign(xalign)
+        .xalign(layout::align_fraction(alignment))
         .justify(justify)
         .halign(halign)
         .build();
@@ -501,20 +489,10 @@ fn tag_for(style: Style) -> gtk4::TextTag {
     let link = gdk::RGBA::parse(md_viewer::LINK_COLOR).expect("valid colour");
     let builder = gtk4::TextTag::builder().name(style.tag_name());
     match style {
-        Style::Heading(level) => {
-            let scale = match level {
-                1 => 2.0,
-                2 => 1.6,
-                3 => 1.3,
-                4 => 1.15,
-                5 => 1.0,
-                _ => 0.9,
-            };
-            builder
-                .weight(pango::Weight::Bold.into_glib())
-                .scale(scale)
-                .pixels_above_lines(6)
-        }
+        Style::Heading(level) => builder
+            .weight(pango::Weight::Bold.into_glib())
+            .scale(layout::heading_scale(level))
+            .pixels_above_lines(6),
         Style::Emphasis => builder.style(pango::Style::Italic),
         Style::Strong => builder.weight(pango::Weight::Bold.into_glib()),
         Style::Strikethrough => builder.strikethrough(true),

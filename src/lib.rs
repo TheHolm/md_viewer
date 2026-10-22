@@ -7,6 +7,7 @@
 //! one text tag per [`Style`], and tables become grid widgets.
 
 pub mod graphics;
+pub mod layout;
 
 use graphics::Rendered;
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};

@@ -48,6 +48,12 @@ section for the GitHub Release body.
 - Tests: `tests/render.rs` rewritten for the block model with table, math
   and Mermaid groups; new `tests/graphics.rs`; `tests/fixtures/showcase.md`
   covers every feature and is checked end to end.
+- Coverage: the GUI's sizing and styling arithmetic moved into
+  `md_viewer::layout` (tested in `tests/layout.rs`), and `tests/cli.rs`
+  runs the binary: argument handling always, and with a display an
+  unreadable file plus the showcase and a new `fallbacks.md` fixture.
+  SIGINT/SIGTERM now quit the viewer cleanly. Line coverage with a display
+  is about 98%.
 
 ## v0.1.0 — Initial release
 

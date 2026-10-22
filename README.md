@@ -97,7 +97,14 @@ cargo install cargo-llvm-cov --locked
 cargo llvm-cov --tests
 ```
 
-The GUI in `src/main.rs` is a thin wrapper and is not covered by the tests.
+`tests/cli.rs` also starts the GUI when a display is available and skips
+those tests otherwise. To cover the GUI on a headless machine, run the tests
+under a virtual display:
+
+```
+Xvfb :77 &
+DISPLAY=:77 GDK_BACKEND=x11 GSK_RENDERER=cairo cargo llvm-cov --tests
+```
 
 # TODO
 
