@@ -1,10 +1,11 @@
 //! Integration tests for the Markdown renderer (`md_viewer::render`), grouped
 //! by block type and by inline style.
 
-use md_viewer::{render, Align, Block, Cell, Inline, Span, Style, Table, RULE_TEXT};
+use md_viewer::{render, Align, Block, Cell, Inline, Math, Span, Style, Table, RULE_TEXT};
 
 /// Renders `source` and flattens every text block into one list of spans,
-/// skipping non-text blocks; most tests only care about flowing text.
+/// skipping non-text blocks and formulas; most tests only care about
+/// flowing text.
 fn r(source: &str) -> Vec<Span> {
     render(source)
         .into_iter()
@@ -13,8 +14,9 @@ fn r(source: &str) -> Vec<Span> {
             _ => None,
         })
         .flatten()
-        .map(|inline| match inline {
-            Inline::Text(span) => span,
+        .filter_map(|inline| match inline {
+            Inline::Text(span) => Some(span),
+            Inline::Math(_) => None,
         })
         .collect()
 }
@@ -47,6 +49,29 @@ fn only_table(source: &str) -> Table {
         .collect();
     assert_eq!(tables.len(), 1, "expected exactly one table");
     tables.into_iter().next().unwrap()
+}
+
+/// Every inline element of every text block of the rendered `source`.
+fn inlines(source: &str) -> Vec<Inline> {
+    render(source)
+        .into_iter()
+        .filter_map(|block| match block {
+            Block::Text(inlines) => Some(inlines),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+/// Every formula in the rendered `source`, in order.
+fn formulas(source: &str) -> Vec<Math> {
+    inlines(source)
+        .into_iter()
+        .filter_map(|inline| match inline {
+            Inline::Math(math) => Some(math),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The visible text of a table cell.
@@ -588,6 +613,120 @@ fn heading_tag_names_clamp() {
     assert_eq!(Style::Heading(1).tag_name(), "h1");
     assert_eq!(Style::Heading(6).tag_name(), "h6");
     assert_eq!(Style::Heading(9).tag_name(), "h6");
+}
+
+// --- Math -----------------------------------------------------------------
+
+/// `$…$` is inline math, kept in the flow of the paragraph's text.
+#[test]
+fn inline_math() {
+    assert_eq!(
+        inlines("a $x^2$ b"),
+        vec![
+            Inline::Text(span("a ", &[])),
+            Inline::Math(Math::new("x^2", false)),
+            Inline::Text(span(" b", &[])),
+        ]
+    );
+}
+
+/// `$$…$$` is display math; on its own paragraph it is separated from the
+/// surrounding paragraphs by blank lines.
+#[test]
+fn display_math_paragraph() {
+    assert_eq!(
+        outline("before\n\n$$\\frac{a}{b}$$\n\nafter"),
+        "before\n\n$$\\frac{a}{b}$$\n\nafter"
+    );
+    assert_eq!(formulas("$$y$$"), vec![Math::new("y", true)]);
+}
+
+/// Display math in the middle of a paragraph gets a line of its own.
+#[test]
+fn display_math_mid_paragraph() {
+    assert_eq!(outline("a $$y$$ b"), "a \n$$y$$\n b");
+}
+
+/// Display math spanning several source lines keeps its line breaks.
+#[test]
+fn display_math_multiline() {
+    assert_eq!(
+        formulas("$$\na = b\n\\\\ c\n$$"),
+        vec![Math::new("\na = b\n\\\\ c\n", true)]
+    );
+}
+
+/// mhchem's `\ce{…}` is passed through to the math renderer unchanged.
+#[test]
+fn mhchem_formula() {
+    assert_eq!(
+        formulas("Water: $\\ce{2H2 + O2 -> 2H2O}$."),
+        vec![Math::new("\\ce{2H2 + O2 -> 2H2O}", false)]
+    );
+}
+
+/// A lone `$` (a price, say) is plain text, not the start of math.
+#[test]
+fn lone_dollar_is_text() {
+    assert!(formulas("It costs $5.").is_empty());
+    assert_eq!(plain_text(&r("It costs $5.")), "It costs $5.");
+}
+
+/// An escaped `\$` is a literal dollar sign.
+#[test]
+fn escaped_dollar_is_text() {
+    assert!(formulas("\\$x\\$").is_empty());
+    assert_eq!(plain_text(&r("\\$x\\$")), "$x$");
+}
+
+/// Dollar signs inside inline code or code blocks are code, not math.
+#[test]
+fn dollars_in_code_are_not_math() {
+    assert!(formulas("`$x$`").is_empty());
+    assert!(formulas("```\n$x$\n```").is_empty());
+}
+
+/// Math inside a table cell stays inline in the cell, even display math.
+#[test]
+fn math_in_table_cell() {
+    let table = only_table("| f |\n|---|\n| $x$ and $$y$$ |");
+    assert_eq!(
+        table.rows[0][0],
+        vec![
+            Inline::Math(Math::new("x", false)),
+            Inline::Text(span(" and ", &[])),
+            Inline::Math(Math::new("y", true)),
+        ]
+    );
+}
+
+/// Math inside a list item stays in the item.
+#[test]
+fn math_in_list_item() {
+    assert_eq!(outline("- $x$ item"), "• $x$ item");
+}
+
+/// A formula that is a link's only content counts as the link's text, so
+/// the link destination is not added.
+#[test]
+fn math_as_link_text() {
+    assert_eq!(outline("[$x$](http://u)"), "$x$");
+}
+
+/// `Math::source` restores the dollar signs for display as a fallback.
+#[test]
+fn math_source() {
+    assert_eq!(Math::new("x", false).source(), "$x$");
+    assert_eq!(Math::new("x", true).source(), "$$x$$");
+}
+
+/// In Pango markup (table cells) a formula is shown as its source, in code
+/// style.
+#[test]
+fn pango_markup_math_source() {
+    let markup = md_viewer::pango_markup(&[Inline::Math(Math::new("a<b", false))]);
+    assert!(markup.contains(">$a&lt;b$</span>"), "{markup}");
+    assert!(markup.contains("monospace"));
 }
 
 // --- Pango markup (table cells) ------------------------------------------

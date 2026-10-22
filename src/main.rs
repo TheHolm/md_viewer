@@ -9,7 +9,8 @@ use adw::prelude::*;
 use clap::Parser;
 use gtk4::glib::translate::IntoGlib;
 use gtk4::{gdk, gio, glib, pango};
-use md_viewer::{Align, Block, Inline, Style, Table};
+use md_viewer::graphics::{Image, RasterSettings};
+use md_viewer::{Align, Block, Inline, Math, Style, Table};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -19,6 +20,9 @@ const APP_ID: &str = "io.github.TheHolm.md_viewer";
 
 /// The left and right margin of the document, in pixels.
 const MARGIN: i32 = 16;
+
+/// The name of the text tag that centres display math on its line.
+const DISPLAY_MATH_TAG: &str = "math-display";
 
 /// Roughly how many characters wide a table cell grows before its text wraps.
 const CELL_WRAP_CHARS: i32 = 40;
@@ -163,11 +167,18 @@ fn build_window(app: &adw::Application, path: PathBuf) {
         });
     }
 
-    // Read and render on the I/O thread pool, then fill the view back on the
-    // main thread.
+    // Read, render and rasterize on the I/O thread pool, then fill the view
+    // back on the main thread.
+    let settings = raster_settings(&view);
     glib::spawn_future_local(async move {
         let worker_path = path.clone();
-        let result = gio::spawn_blocking(move || md_viewer::open_document(&worker_path)).await;
+        let result = gio::spawn_blocking(move || {
+            md_viewer::open_document(&worker_path).map(|mut blocks| {
+                md_viewer::graphics::render_document(&mut blocks, &settings);
+                blocks
+            })
+        })
+        .await;
         match result {
             Ok(Ok(blocks)) => fill_view(&view, &blocks, &resizable),
             Ok(Err(error)) => {
@@ -180,6 +191,38 @@ fn build_window(app: &adw::Application, path: PathBuf) {
             }
         }
     });
+}
+
+/// The settings graphics are rendered with for `view`: its font size, the
+/// display's scale factor and the theme's text colour.
+fn raster_settings(view: &gtk4::TextView) -> RasterSettings {
+    let font_px = view
+        .pango_context()
+        .font_description()
+        .map(|font| {
+            let size = font.size() as f32 / pango::SCALE as f32;
+            // Point sizes are relative to 96 dpi logical pixels.
+            if font.is_size_absolute() {
+                size
+            } else {
+                size * 96.0 / 72.0
+            }
+        })
+        .filter(|size| *size > 0.0)
+        .unwrap_or(15.0);
+    // `style_context().color()` is the GTK 4.8 way to read the text colour.
+    #[allow(deprecated)]
+    let color = view.style_context().color();
+    let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+    RasterSettings {
+        font_px,
+        scale: view.scale_factor().max(1) as f32,
+        color: [
+            channel(color.red()),
+            channel(color.green()),
+            channel(color.blue()),
+        ],
+    }
 }
 
 /// Appends every block to `view`'s buffer: text as tagged text, tables as
@@ -206,8 +249,53 @@ fn insert_inlines(buffer: &gtk4::TextBuffer, inlines: &[Inline]) {
     for inline in inlines {
         match inline {
             Inline::Text(span) => {
-                let names: Vec<&str> = span.styles.iter().map(|style| style.tag_name()).collect();
-                buffer.insert_with_tags_by_name(&mut buffer.end_iter(), &span.text, &names);
+                let styles: Vec<Style> = span.styles.clone();
+                insert_styled(buffer, &span.text, &styles);
+            }
+            Inline::Math(math) => insert_math(buffer, math),
+        }
+    }
+}
+
+/// Inserts `text` at the end of `buffer` with the tags for `styles`.
+fn insert_styled(buffer: &gtk4::TextBuffer, text: &str, styles: &[Style]) {
+    let names: Vec<&str> = styles.iter().map(|style| style.tag_name()).collect();
+    buffer.insert_with_tags_by_name(&mut buffer.end_iter(), text, &names);
+}
+
+/// Inserts a rendered formula at the end of `buffer`: inline math is lowered
+/// so its baseline lines up with the text, display math is centred. A
+/// formula that could not be rendered is shown as its source in code style,
+/// display math with a note saying why.
+fn insert_math(buffer: &gtk4::TextBuffer, math: &Math) {
+    match &math.image {
+        Some(Ok(image)) => {
+            let start = buffer.end_iter().offset();
+            buffer.insert_paintable(&mut buffer.end_iter(), &ScaledTexture::new(image));
+            let range = (buffer.iter_at_offset(start), buffer.end_iter());
+            let rise = gtk4::TextTag::builder()
+                .rise(-(image.depth * pango::SCALE as f32).round() as i32)
+                .build();
+            buffer.tag_table().add(&rise);
+            buffer.apply_tag(&rise, &range.0, &range.1);
+            if math.display {
+                buffer.apply_tag_by_name(DISPLAY_MATH_TAG, &range.0, &range.1);
+            }
+        }
+        failed => {
+            let reason = match failed {
+                Some(Err(reason)) => reason.as_str(),
+                _ => "not rendered",
+            };
+            if math.display {
+                insert_styled(buffer, &math.source(), &[Style::CodeBlock]);
+                insert_styled(
+                    buffer,
+                    &format!("\n⚠ formula could not be rendered: {reason}"),
+                    &[Style::Image],
+                );
+            } else {
+                insert_styled(buffer, &math.source(), &[Style::Code]);
             }
         }
     }
@@ -256,6 +344,9 @@ fn table_widget(table: &Table) -> gtk4::ScrolledWindow {
 /// as Pango markup, aligned according to the column's alignment. Long cells
 /// wrap at about [`CELL_WRAP_CHARS`] characters instead of widening the table.
 fn cell_widget(cell: &[Inline], alignment: Align, classes: &[&str]) -> gtk4::Widget {
+    if cell.iter().any(|inline| matches!(inline, Inline::Math(_))) {
+        return math_cell_widget(cell, alignment, classes);
+    }
     let (halign, xalign, justify) = match alignment {
         Align::None | Align::Left => (gtk4::Align::Start, 0.0, gtk4::Justification::Left),
         Align::Center => (gtk4::Align::Center, 0.5, gtk4::Justification::Center),
@@ -280,11 +371,61 @@ fn cell_widget(cell: &[Inline], alignment: Align, classes: &[&str]) -> gtk4::Wid
     frame.upcast()
 }
 
-/// Registers one text tag per [`Style`] in `table`.
+/// Builds a table cell containing formulas: a single (non-wrapping) row of
+/// labels for the text and pictures for the formulas; formulas that could
+/// not be rendered show their source.
+fn math_cell_widget(cell: &[Inline], alignment: Align, classes: &[&str]) -> gtk4::Widget {
+    let halign = match alignment {
+        Align::None | Align::Left => gtk4::Align::Start,
+        Align::Center => gtk4::Align::Center,
+        Align::Right => gtk4::Align::End,
+    };
+    let row = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .halign(halign)
+        .hexpand(true)
+        .build();
+    for inline in cell {
+        match inline {
+            Inline::Math(Math {
+                image: Some(Ok(image)),
+                ..
+            }) => {
+                let picture = gtk4::Picture::for_paintable(&ScaledTexture::new(image));
+                picture.set_can_shrink(false);
+                picture.set_valign(gtk4::Align::Center);
+                row.append(&picture);
+            }
+            other => {
+                let label = gtk4::Label::builder()
+                    .use_markup(true)
+                    .label(md_viewer::pango_markup(std::slice::from_ref(other)))
+                    .selectable(true)
+                    .valign(gtk4::Align::Center)
+                    .build();
+                row.append(&label);
+            }
+        }
+    }
+    let frame = gtk4::Box::builder().css_classes(classes.to_vec()).build();
+    frame.append(&row);
+    frame.upcast()
+}
+
+/// Registers one text tag per [`Style`] in `table`, plus the display math
+/// centring tag.
 fn create_tags(table: &gtk4::TextTagTable) {
     for style in Style::ALL {
         table.add(&tag_for(style));
     }
+    table.add(
+        &gtk4::TextTag::builder()
+            .name(DISPLAY_MATH_TAG)
+            .justification(gtk4::Justification::Center)
+            .pixels_above_lines(4)
+            .pixels_below_lines(4)
+            .build(),
+    );
 }
 
 /// Builds the text tag implementing `style`.
@@ -331,4 +472,84 @@ fn tag_for(style: Style) -> gtk4::TextTag {
         Style::Rule => builder.foreground_rgba(&muted),
     }
     .build()
+}
+
+/// A texture drawn at its logical size: a [`Image`] rendered at a device
+/// scale of 2 has twice the pixels but the same on-screen size, so formulas
+/// and diagrams stay sharp on HiDPI displays.
+mod scaled_texture {
+    use gtk4::gdk::subclass::prelude::*;
+    use gtk4::prelude::*;
+    use gtk4::{gdk, glib, graphene};
+    use std::cell::{Cell, RefCell};
+
+    /// The instance state: the texture and its logical size.
+    #[derive(Default)]
+    pub struct Imp {
+        /// The device-pixel texture.
+        pub texture: RefCell<Option<gdk::Texture>>,
+        /// The logical width, in pixels.
+        pub width: Cell<f64>,
+        /// The logical height, in pixels.
+        pub height: Cell<f64>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for Imp {
+        const NAME: &'static str = "MdViewerScaledTexture";
+        type Type = super::ScaledTexture;
+        type Interfaces = (gdk::Paintable,);
+    }
+
+    impl ObjectImpl for Imp {}
+
+    impl PaintableImpl for Imp {
+        /// The logical width, rounded up.
+        fn intrinsic_width(&self) -> i32 {
+            self.width.get().ceil() as i32
+        }
+
+        /// The logical height, rounded up.
+        fn intrinsic_height(&self) -> i32 {
+            self.height.get().ceil() as i32
+        }
+
+        /// Draws the texture scaled into the requested area.
+        fn snapshot(&self, snapshot: &gdk::Snapshot, width: f64, height: f64) {
+            let (Some(texture), Some(snapshot)) = (
+                self.texture.borrow().clone(),
+                snapshot.downcast_ref::<gtk4::Snapshot>(),
+            ) else {
+                return;
+            };
+            let bounds = graphene::Rect::new(0.0, 0.0, width as f32, height as f32);
+            snapshot.append_texture(&texture, &bounds);
+        }
+    }
+}
+
+glib::wrapper! {
+    /// A paintable showing an [`Image`] at its logical size.
+    pub struct ScaledTexture(ObjectSubclass<scaled_texture::Imp>)
+        @implements gdk::Paintable;
+}
+
+impl ScaledTexture {
+    /// Wraps `image` (premultiplied RGBA) in a paintable of its logical size.
+    fn new(image: &Image) -> Self {
+        use gtk4::subclass::prelude::ObjectSubclassIsExt;
+        let paintable: Self = glib::Object::new();
+        let texture = gdk::MemoryTexture::new(
+            image.width as i32,
+            image.height as i32,
+            gdk::MemoryFormat::R8g8b8a8Premultiplied,
+            &glib::Bytes::from(&image.pixels),
+            image.width as usize * 4,
+        );
+        let imp = paintable.imp();
+        imp.texture.replace(Some(texture.upcast()));
+        imp.width.set(image.logical_width() as f64);
+        imp.height.set(image.logical_height() as f64);
+        paintable
+    }
 }

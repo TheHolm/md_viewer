@@ -6,6 +6,9 @@
 //! walks the blocks in order: text blocks are inserted into a text buffer with
 //! one text tag per [`Style`], and tables become grid widgets.
 
+pub mod graphics;
+
+use graphics::Rendered;
 use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};
 use std::fs;
 use std::io;
@@ -117,18 +120,52 @@ pub struct Span {
     pub styles: Vec<Style>,
 }
 
-/// One element of flowing text: a run of styled text.
+/// A formula: `$…$` (inline) or `$$…$$` (display) LaTeX, including mhchem.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Math {
+    /// The LaTeX source, without the dollar signs.
+    pub tex: String,
+    /// True for display math (`$$…$$`), shown centred on a line of its own.
+    pub display: bool,
+    /// The rendered formula, filled in by [`graphics::render_document`];
+    /// `None` straight after [`render`].
+    pub image: Option<Rendered>,
+}
+
+impl Math {
+    /// Creates a not-yet-rendered formula.
+    pub fn new(tex: &str, display: bool) -> Self {
+        Math {
+            tex: tex.to_string(),
+            display,
+            image: None,
+        }
+    }
+
+    /// The source as written in Markdown (with its dollar signs), shown in
+    /// place of a formula that could not be rendered.
+    pub fn source(&self) -> String {
+        let fence = if self.display { "$$" } else { "$" };
+        format!("{fence}{}{fence}", self.tex)
+    }
+}
+
+/// One element of flowing text: a run of styled text or a formula.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Inline {
     /// Styled text.
     Text(Span),
+    /// A formula.
+    Math(Math),
 }
 
 impl Inline {
-    /// The text this inline element displays.
-    pub fn text(&self) -> &str {
+    /// The text this inline element displays: a span's text, or a formula's
+    /// Markdown source.
+    pub fn text(&self) -> String {
         match self {
-            Inline::Text(span) => &span.text,
+            Inline::Text(span) => span.text.clone(),
+            Inline::Math(math) => math.source(),
         }
     }
 }
@@ -229,7 +266,14 @@ pub fn escape_markup(text: &str) -> String {
 pub fn pango_markup(inlines: &[Inline]) -> String {
     let mut markup = String::new();
     for inline in inlines {
-        let Inline::Text(span) = inline;
+        let span = match inline {
+            Inline::Text(span) => span.clone(),
+            // A label cannot show the rendered formula; show its source.
+            Inline::Math(math) => Span {
+                text: math.source(),
+                styles: vec![Style::Code],
+            },
+        };
         let text = escape_markup(&span.text);
         let attributes: Vec<String> = span.styles.iter().map(|s| markup_attributes(*s)).collect();
         if attributes.is_empty() {
@@ -295,8 +339,10 @@ pub fn window_title(path: &Path) -> String {
 /// text with identical styles is merged into one span. See the "Rendering
 /// model" section of `AGENTS.md` for the full set of rules.
 pub fn render(source: &str) -> Vec<Block> {
-    let options =
-        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let options = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_MATH;
     let mut renderer = Renderer::default();
     for event in Parser::new_ext(source, options) {
         renderer.event(event);
@@ -376,6 +422,9 @@ struct Renderer {
     /// The destination of the link being rendered and whether any of its text
     /// has been written yet, if inside a link.
     link: Option<(String, bool)>,
+    /// True right after display math, so the text that follows starts on a
+    /// new line.
+    after_display: bool,
 }
 
 impl Renderer {
@@ -391,7 +440,8 @@ impl Renderer {
                 self.style_stack.pop();
             }
             Event::Html(text) | Event::InlineHtml(text) => self.text(&text),
-            Event::InlineMath(text) | Event::DisplayMath(text) => self.text(&text),
+            Event::InlineMath(tex) => self.math(&tex, false),
+            Event::DisplayMath(tex) => self.math(&tex, true),
             Event::FootnoteReference(label) => self.text(&format!("[^{label}]")),
             Event::SoftBreak => self.text(" "),
             Event::HardBreak => self.text("\n"),
@@ -571,6 +621,24 @@ impl Renderer {
         self.push(text, styles);
     }
 
+    /// Writes a formula. Display math outside a table cell gets a line of its
+    /// own; inside a cell it stays inline (a cell is a single line of text).
+    fn math(&mut self, tex: &str, display: bool) {
+        if let Some((_, has_text)) = self.link.as_mut() {
+            *has_text = true;
+        }
+        let math = Inline::Math(Math::new(tex, display));
+        if let Some(cell) = self.table.as_mut().and_then(|t| t.current_cell.as_mut()) {
+            cell.push(math);
+            return;
+        }
+        if display && !self.blocks.is_empty() && trailing_newlines(&self.blocks) == 0 {
+            self.push("\n", Vec::new());
+        }
+        self.push_inline_element(math);
+        self.after_display = display;
+    }
+
     /// Separates the block about to start from whatever came before it.
     ///
     /// The first block of a list item continues on the marker's line; any
@@ -623,11 +691,33 @@ impl Renderer {
             push_inline(cell, text, styles);
             return;
         }
+        let owned;
+        let mut text = text;
+        if std::mem::take(&mut self.after_display) && !text.starts_with('\n') {
+            owned = format!("\n{text}");
+            text = &owned;
+        }
+        if let Some(inlines) = self.text_block() {
+            push_inline(inlines, text, styles);
+        }
+    }
+
+    /// Appends a non-text inline element (a formula) to the trailing text
+    /// block, starting a new one if needed.
+    fn push_inline_element(&mut self, inline: Inline) {
+        if let Some(inlines) = self.text_block() {
+            inlines.push(inline);
+        }
+    }
+
+    /// The trailing text block, created if the last block is not text.
+    fn text_block(&mut self) -> Option<&mut Vec<Inline>> {
         if !matches!(self.blocks.last(), Some(Block::Text(_))) {
             self.blocks.push(Block::Text(Vec::new()));
         }
-        if let Some(Block::Text(inlines)) = self.blocks.last_mut() {
-            push_inline(inlines, text, styles);
+        match self.blocks.last_mut() {
+            Some(Block::Text(inlines)) => Some(inlines),
+            _ => None,
         }
     }
 }
@@ -654,15 +744,18 @@ fn normalize(styles: &mut Vec<Style>) {
 }
 
 /// Counts the newlines at the very end of the rendered output, looking back
-/// across span boundaries. A trailing non-text block (a table) counts as
-/// content, i.e. zero newlines.
+/// across span boundaries. A trailing non-text block (a table) or formula
+/// counts as content, i.e. ends the count.
 fn trailing_newlines(blocks: &[Block]) -> usize {
     let Some(Block::Text(inlines)) = blocks.last() else {
         return 0;
     };
     let mut count = 0;
     for inline in inlines.iter().rev() {
-        for c in inline.text().chars().rev() {
+        let Inline::Text(span) = inline else {
+            return count;
+        };
+        for c in span.text.chars().rev() {
             if c == '\n' {
                 count += 1;
             } else {
@@ -711,6 +804,12 @@ mod tests {
         assert_eq!(trailing_newlines(&[text_block(&["\n", "\n\n"])]), 3);
         assert_eq!(trailing_newlines(&[text_block(&["a\nb"])]), 0);
         assert_eq!(trailing_newlines(&[text_block(&["\n"]), empty_table()]), 0);
+        let mut with_math = vec![text_block(&["\n"])];
+        if let Block::Text(inlines) = &mut with_math[0] {
+            inlines.push(Inline::Math(Math::new("x", false)));
+            push_inline(inlines, "\n", Vec::new());
+        }
+        assert_eq!(trailing_newlines(&with_math), 1);
     }
 
     /// `normalize` sorts and deduplicates so equal style sets compare equal.
