@@ -183,10 +183,12 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   (renders one release's section as a GitHub Release body)
 - `AGENTS.md` - rules for coding agents working on this repository
 - `NOTES.md` - this file: persistent facts and knowledge about the project
-- `BUGS.md` - known bugs, gaps and limitations
+- `BUGS.md` - known bugs and limitations (planned features go in the
+  README's TODO list instead)
 - `RELEASE_NOTES.md` - per-version release notes; the matching `## vX.Y.Z`
   section is what a release publishes
-- `README.md` - user-facing usage, build instructions and TODO list
+- `README.md` - user-facing usage, build instructions and the TODO list of
+  planned features
 - `LICENSE` - AGPL v3
 
 ## Rendering model

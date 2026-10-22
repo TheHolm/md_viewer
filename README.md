@@ -132,8 +132,9 @@ DISPLAY=:77 GDK_BACKEND=x11 GSK_RENDERER=cairo cargo llvm-cov --tests
 
 # TODO
 
+Planned features. Known bugs are listed in `BUGS.md`.
+
 * Clickable links.
-* Re-render formulas when switching between light and dark themes.
 * Inline images.
 * Reload a document when it changes on disk.
 * An error popup instead of a message on STDERR for a bad `FILE` argument.

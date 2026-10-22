@@ -1,8 +1,9 @@
 # BUGS.md
 
-Known bugs, gaps and limitations of `md_viewer`. Add an entry when you find
-a problem you are not fixing right away; remove it when it is fixed (and
-mention the fix in `RELEASE_NOTES.md`). Background on the rendering crates
+Known bugs and limitations of `md_viewer`: things that are wrong or behave
+badly. Add an entry when you find a problem you are not fixing right away;
+remove it when it is fixed (and mention the fix in `RELEASE_NOTES.md`).
+Planned features are not bugs: they go in the TODO list in `README.md`. Background on the rendering crates
 is in `NOTES.md`.
 
 ## Bugs
@@ -28,14 +29,6 @@ is in `NOTES.md`.
   the old colour.
 - Table cells containing math do not wrap (they are a row of labels and
   pictures, not one wrapping label).
-
-## Missing features
-
-- A `FILE` on the command line that cannot be opened (unreadable, invalid
-  UTF-8) is reported on STDERR with exit status 1; a popup would be better.
-  Files picked in the GUI already get a dialog.
-- Links are styled but not clickable; images are placeholders only.
-- No reload when the file changes on disk.
 
 ## Limitations
 

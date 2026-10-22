@@ -4,8 +4,10 @@ Rules for coding agents working on this repository. The project's facts
 (overview, stack, layout, rendering model, versioning, commands) and
 hard-won knowledge are in `NOTES.md`; known bugs and gaps are in `BUGS.md`.
 Read both before starting work, and keep them current: record new
-persistent facts and lessons in `NOTES.md`, and new or fixed bugs in
-`BUGS.md`. Session-specific or transient details belong in neither.
+persistent facts and lessons in `NOTES.md`, new or fixed bugs in
+`BUGS.md`, and planned features in the TODO list in `README.md` (features
+are not bugs: keep them out of `BUGS.md`). Session-specific or transient
+details belong in none of them.
 
 ## Repository visibility
 
