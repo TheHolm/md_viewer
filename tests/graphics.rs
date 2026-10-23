@@ -33,7 +33,7 @@ fn formulas(blocks: &[Block]) -> Vec<&Math> {
                 .iter()
                 .chain(table.rows.iter().flatten())
                 .collect(),
-            Block::Mermaid(_) => Vec::new(),
+            Block::Mermaid(_) | Block::Code(_) => Vec::new(),
         };
         for inline in cells.into_iter().flatten() {
             if let Inline::Math(math) = inline {

@@ -151,3 +151,49 @@ fn cell_classes_header_only() {
         vec!["md-cell", "md-header", "md-last-column", "md-last-row"]
     );
 }
+
+/// A code card fills the available width minus its indentation, with a
+/// floor for deeply nested cards in narrow windows.
+#[test]
+fn code_card_widths() {
+    use md_viewer::layout::{available_width, code_card_width, CODE_INDENT, MIN_TABLE_WIDTH};
+    assert_eq!(code_card_width(800, 0), available_width(800));
+    assert_eq!(
+        code_card_width(800, 2),
+        available_width(800) - 2 * CODE_INDENT
+    );
+    assert_eq!(code_card_width(150, 3), MIN_TABLE_WIDTH);
+    assert_eq!(code_card_width(800, usize::MAX), MIN_TABLE_WIDTH);
+}
+
+/// Scrolling passed on from a table: pixels as they are, wheel clicks in
+/// GTK's step of the page height to the power 2/3.
+#[test]
+fn scroll_pixels_steps() {
+    use md_viewer::layout::scroll_pixels;
+    assert_eq!(scroll_pixels(12.5, true, 1000.0), 12.5);
+    assert!((scroll_pixels(1.0, false, 1000.0) - 100.0).abs() < 1e-9);
+    assert!((scroll_pixels(-2.0, false, 1000.0) + 200.0).abs() < 1e-9);
+    assert_eq!(scroll_pixels(1.0, false, -5.0), 0.0);
+}
+
+/// The spot at the top of the window is remembered as a fraction of its
+/// line and restored for the line's new position and size.
+#[test]
+fn zoom_anchor() {
+    use md_viewer::layout::{anchor_fraction, anchored_scroll, ANCHOR_HOLD_MS};
+    assert_eq!(anchor_fraction(150.0, 100.0, 200.0), 0.25);
+    assert_eq!(anchor_fraction(100.0, 100.0, 0.0), 0.0);
+    assert_eq!(anchor_fraction(50.0, 100.0, 200.0), 0.0);
+    assert_eq!(anchor_fraction(400.0, 100.0, 200.0), 1.0);
+    assert_eq!(anchored_scroll(300.0, 400.0, 0.25), 400.0);
+    assert_eq!(anchored_scroll(300.0, -1.0, 0.5), 300.0);
+    const { assert!(ANCHOR_HOLD_MS > 0) };
+}
+
+/// The copy button's check mark shows for a noticeable but short time.
+#[test]
+fn copy_feedback_time() {
+    let millis = md_viewer::layout::COPY_FEEDBACK_MS;
+    assert!((500..=5000).contains(&millis));
+}

@@ -2,8 +2,8 @@
 //! by block type and by inline style.
 
 use md_viewer::{
-    is_mermaid_info, render, Align, Block, Cell, Diagram, Inline, Math, Span, Style, Table,
-    RULE_TEXT,
+    code_language, is_mermaid_info, render, Align, Block, Cell, CodeBlock, Diagram, Inline, Math,
+    Span, Style, Table, RULE_TEXT,
 };
 
 /// Renders `source` and flattens every text block into one list of spans,
@@ -30,8 +30,8 @@ fn plain_text(spans: &[Span]) -> String {
 }
 
 /// Describes a whole rendered document as text: text blocks verbatim, each
-/// table as `<table>` and each diagram as `<mermaid>`, to check how they sit
-/// between other blocks.
+/// table as `<table>`, each diagram as `<mermaid>` and each code block as
+/// `<code>`, to check how they sit between other blocks.
 fn outline(source: &str) -> String {
     render(source)
         .iter()
@@ -39,8 +39,29 @@ fn outline(source: &str) -> String {
             Block::Text(inlines) => inlines.iter().map(Inline::text).collect(),
             Block::Table(_) => "<table>".to_string(),
             Block::Mermaid(_) => "<mermaid>".to_string(),
+            Block::Code(_) => "<code>".to_string(),
         })
         .collect()
+}
+
+/// Every code block in the rendered `source`, in order.
+fn code_blocks(source: &str) -> Vec<CodeBlock> {
+    render(source)
+        .into_iter()
+        .filter_map(|block| match block {
+            Block::Code(code) => Some(code),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Builds the code block a test expects.
+fn code(language: Option<&str>, text: &str, indent: usize) -> CodeBlock {
+    CodeBlock {
+        language: language.map(str::to_string),
+        text: text.to_string(),
+        indent,
+    }
 }
 
 /// Returns the only table in the rendered `source`, panicking otherwise.
@@ -296,36 +317,107 @@ fn nested_block_quote() {
 
 // --- Code blocks ----------------------------------------------------------
 
-/// A fenced code block keeps its line breaks and indentation verbatim, drops
-/// the final newline, and does not interpret Markdown inside it.
+/// A fenced code block becomes a code card: its text verbatim (line breaks,
+/// indentation, Markdown not interpreted) without the final newline, and
+/// the language named after the fence.
 #[test]
 fn fenced_code_block() {
     let source = "```rust\nfn main() {\n    *x*\n}\n```";
     assert_eq!(
-        r(source),
-        vec![span("fn main() {\n    *x*\n}", &[Style::CodeBlock])]
+        render(source),
+        vec![Block::Code(code(
+            Some("rust"),
+            "fn main() {\n    *x*\n}",
+            0
+        ))]
     );
 }
 
-/// An indented code block is rendered the same way as a fenced one.
+/// A fence without an info string has no language.
+#[test]
+fn fenced_code_block_without_language() {
+    assert_eq!(code_blocks("```\nx\n```"), vec![code(None, "x", 0)]);
+}
+
+/// The language is the info string's first word; attributes after it are
+/// ignored.
+#[test]
+fn code_language_first_word() {
+    assert_eq!(code_language("rust").as_deref(), Some("rust"));
+    assert_eq!(code_language("sh title=x").as_deref(), Some("sh"));
+    assert_eq!(
+        code_language("python{.numbered}").as_deref(),
+        Some("python")
+    );
+    assert_eq!(code_language("c++,linenos").as_deref(), Some("c++"));
+    assert_eq!(code_language(""), None);
+    assert_eq!(code_language(" rust"), None);
+}
+
+/// An indented code block is a code card without a language.
 #[test]
 fn indented_code_block() {
-    assert_eq!(r("    a\n    b"), vec![span("a\nb", &[Style::CodeBlock])]);
+    assert_eq!(code_blocks("    a\n    b"), vec![code(None, "a\nb", 0)]);
 }
 
-/// A code block is separated from surrounding blocks by blank lines.
+/// Tabs, trailing spaces and blank lines inside the code are kept exactly;
+/// only the one newline before the closing fence is dropped.
+#[test]
+fn code_block_text_verbatim() {
+    let source = "```\n\tindented  \n\nlast\n\n```";
+    assert_eq!(
+        code_blocks(source),
+        vec![code(None, "\tindented  \n\nlast\n", 0)]
+    );
+}
+
+/// The copy button copies exactly the code block's text.
+#[test]
+fn code_block_clipboard_text() {
+    let block = code(Some("sh"), "echo hi\necho bye", 0);
+    assert_eq!(block.clipboard_text(), "echo hi\necho bye");
+}
+
+/// An empty code block is still a (blank) code card.
+#[test]
+fn empty_code_block() {
+    assert_eq!(code_blocks("```py\n```"), vec![code(Some("py"), "", 0)]);
+}
+
+/// A code card is separated from surrounding text by blank lines, like a
+/// table.
 #[test]
 fn code_block_between_paragraphs() {
-    assert_eq!(plain_text(&r("a\n\n```\ncode\n```\n\nb")), "a\n\ncode\n\nb");
+    assert_eq!(outline("a\n\n```\ncode\n```\n\nb"), "a\n\n<code>\n\nb");
 }
 
-/// A code block inside a block quote carries both styles.
+/// A code block inside a block quote is indented one level; the quote's
+/// text around it keeps its style.
 #[test]
 fn code_block_in_quote() {
+    assert_eq!(code_blocks("> ```\n> x\n> ```"), vec![code(None, "x", 1)]);
     assert_eq!(
-        styles_of(&r("> ```\n> x\n> ```"), "x"),
-        vec![Style::CodeBlock, Style::Quote]
+        styles_of(&r("> a\n>\n> ```\n> x\n> ```\n>\n> b"), "b"),
+        vec![Style::Quote]
     );
+}
+
+/// A code block in a list item starts on its own line after the item's
+/// marker, is indented by the list depth, and the list carries on after it.
+#[test]
+fn code_block_in_list() {
+    let source = "- item\n\n  ```\n  x\n  ```\n- next";
+    assert_eq!(code_blocks(source), vec![code(None, "x", 1)]);
+    assert_eq!(outline(source), "• item\n<code>\n• next");
+    let nested = "- a\n  - b\n\n    ```\n    y\n    ```";
+    assert_eq!(code_blocks(nested), vec![code(None, "y", 2)]);
+}
+
+/// A code block as the first thing in a list item goes on the line after
+/// the marker, not next to it.
+#[test]
+fn code_block_first_in_list_item() {
+    assert_eq!(outline("- ```\n  x\n  ```"), "• \n<code>");
 }
 
 // --- Horizontal rules -----------------------------------------------------
@@ -802,7 +894,9 @@ fn other_code_blocks_are_not_diagrams() {
         "```mermaid-like\nx\n```",
     ] {
         assert!(diagrams(source).is_empty(), "{source}");
-        assert!(plain_text(&r(source)).contains(match source {
+        let blocks = code_blocks(source);
+        assert_eq!(blocks.len(), 1, "{source}");
+        assert!(blocks[0].text.contains(match source {
             s if s.contains("fn main") => "fn main",
             s if s.contains("graph") => "graph TD;",
             _ => "x",
@@ -838,12 +932,12 @@ fn mermaid_source_is_verbatim() {
 }
 
 /// An empty mermaid block is still a diagram (rendering then reports it as
-/// empty), and an empty ordinary code block adds no text, only the usual
-/// single blank line between its neighbours.
+/// empty), and an empty ordinary code block is still a (blank) code card
+/// between its neighbours.
 #[test]
 fn empty_code_blocks() {
     assert_eq!(diagrams("```mermaid\n```"), vec![Diagram::new("")]);
-    assert_eq!(outline("a\n\n```\n```\n\nb"), "a\n\nb");
+    assert_eq!(outline("a\n\n```\n```\n\nb"), "a\n\n<code>\n\nb");
 }
 
 /// A diagram inside a block quote or list item is still a diagram.

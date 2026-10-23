@@ -8,6 +8,8 @@
 
 pub mod graphics;
 pub mod layout;
+pub mod progressive;
+pub mod zoom;
 
 use graphics::Rendered;
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
@@ -307,6 +309,37 @@ pub fn is_mermaid_info(info: &str) -> bool {
         .is_some_and(|language| language.eq_ignore_ascii_case("mermaid"))
 }
 
+/// A fenced or indented code block (other than a Mermaid diagram), shown as
+/// a card with its language and a copy button.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeBlock {
+    /// The language named after the opening fence (` ```rust ` gives
+    /// `rust`), if any; indented code blocks have none.
+    pub language: Option<String>,
+    /// The code exactly as written, without the final newline.
+    pub text: String,
+    /// How many levels of block quote and list the block is nested in; the
+    /// card is indented by that many steps.
+    pub indent: usize,
+}
+
+impl CodeBlock {
+    /// The text the copy button puts on the clipboard: the code exactly as
+    /// written, without a trailing newline.
+    pub fn clipboard_text(&self) -> &str {
+        &self.text
+    }
+}
+
+/// The language a fenced code block's info string names: its first word
+/// (up to whitespace, `{` or `,`), or `None` if there is none.
+pub fn code_language(info: &str) -> Option<String> {
+    info.split(|c: char| c.is_whitespace() || c == '{' || c == ',')
+        .next()
+        .filter(|language| !language.is_empty())
+        .map(str::to_string)
+}
+
 /// One block of a rendered document.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
@@ -317,6 +350,8 @@ pub enum Block {
     Table(Table),
     /// A Mermaid diagram, shown as a picture on a line of its own.
     Mermaid(Diagram),
+    /// A code block, shown as a card on a line of its own.
+    Code(CodeBlock),
 }
 
 /// The colour of link text, as `#rrggbb`.
@@ -492,8 +527,19 @@ struct BufferedBlock {
     text: String,
     /// The styles applied to the whole block.
     styles: Vec<Style>,
-    /// True for a ` ```mermaid ` block, which becomes a diagram.
-    mermaid: bool,
+    /// What the block becomes when it ends.
+    kind: BufferedKind,
+}
+
+/// What a [`BufferedBlock`] turns into.
+#[derive(Debug, PartialEq)]
+enum BufferedKind {
+    /// Text with the block's styles (raw HTML blocks).
+    Text,
+    /// A Mermaid diagram (` ```mermaid `).
+    Mermaid,
+    /// A code block card, with its language and nesting depth.
+    Code(Option<String>, usize),
 }
 
 /// The state of an in-progress rendering of one document.
@@ -562,15 +608,22 @@ impl Renderer {
                 self.style_stack.push(Style::Quote);
             }
             Tag::CodeBlock(kind) => {
-                self.block_break();
-                let mut styles = self.current_styles();
-                styles.push(Style::CodeBlock);
-                normalize(&mut styles);
-                let mermaid = matches!(&kind, CodeBlockKind::Fenced(info) if is_mermaid_info(info));
+                let kind = match &kind {
+                    CodeBlockKind::Fenced(info) if is_mermaid_info(info) => BufferedKind::Mermaid,
+                    CodeBlockKind::Fenced(info) => {
+                        BufferedKind::Code(code_language(info), self.nesting())
+                    }
+                    CodeBlockKind::Indented => BufferedKind::Code(None, self.nesting()),
+                };
+                if matches!(kind, BufferedKind::Code(..)) {
+                    self.card_break();
+                } else {
+                    self.block_break();
+                }
                 self.block = Some(BufferedBlock {
                     text: String::new(),
-                    styles,
-                    mermaid,
+                    styles: Vec::new(),
+                    kind,
                 });
             }
             Tag::HtmlBlock => {
@@ -578,7 +631,7 @@ impl Renderer {
                 self.block = Some(BufferedBlock {
                     text: String::new(),
                     styles: self.current_styles(),
-                    mermaid: false,
+                    kind: BufferedKind::Text,
                 });
             }
             Tag::List(first) => {
@@ -636,10 +689,18 @@ impl Renderer {
             TagEnd::CodeBlock | TagEnd::HtmlBlock => {
                 if let Some(block) = self.block.take() {
                     let text = block.text.strip_suffix('\n').unwrap_or(&block.text);
-                    if block.mermaid {
-                        self.blocks.push(Block::Mermaid(Diagram::new(text)));
-                    } else {
-                        self.push(text, block.styles);
+                    match block.kind {
+                        BufferedKind::Mermaid => {
+                            self.blocks.push(Block::Mermaid(Diagram::new(text)));
+                        }
+                        BufferedKind::Code(language, indent) => {
+                            self.blocks.push(Block::Code(CodeBlock {
+                                language,
+                                text: text.to_string(),
+                                indent,
+                            }));
+                        }
+                        BufferedKind::Text => self.push(text, block.styles),
                     }
                 }
             }
@@ -756,6 +817,25 @@ impl Renderer {
         } else {
             self.ensure_newlines(2);
         }
+    }
+
+    /// Separates a code card from whatever came before it: it always starts
+    /// on a line of its own (also as the first block of a list item, rather
+    /// than after the item's marker), with a blank line before it outside
+    /// lists.
+    fn card_break(&mut self) {
+        self.item_fresh = false;
+        self.ensure_newlines(if self.lists.is_empty() { 2 } else { 1 });
+    }
+
+    /// How many block quotes and lists are open around the current block.
+    fn nesting(&self) -> usize {
+        let quotes = self
+            .style_stack
+            .iter()
+            .filter(|style| **style == Style::Quote)
+            .count();
+        quotes + self.lists.len()
     }
 
     /// Makes the output end with at least `count` newlines, unless the output

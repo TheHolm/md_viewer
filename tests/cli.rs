@@ -79,6 +79,11 @@ fn unreadable_file_exits_with_error() {
 /// SIGTERM and checks that the viewer stayed up, shut down cleanly (status
 /// 0) and printed no GTK criticals or panics.
 fn run_and_close(args: &[&str]) {
+    run_for_and_close(args, Duration::from_secs(5));
+}
+
+/// [`run_and_close`], sending SIGTERM after `time` instead.
+fn run_for_and_close(args: &[&str], time: Duration) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_md_viewer"))
         .args(args)
         .stdout(Stdio::null())
@@ -86,7 +91,7 @@ fn run_and_close(args: &[&str]) {
         .spawn()
         .expect("start md_viewer");
     let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(5) {
+    while started.elapsed() < time {
         if let Some(status) = child.try_wait().unwrap() {
             panic!("md_viewer exited early with {status}");
         }
@@ -144,5 +149,46 @@ fn root_showcase_opens() {
 fn fallbacks_open() {
     if have_display() {
         open_and_close("fallbacks.md");
+    }
+}
+
+/// Writes a large document to `dir`: many sections, each with inline and
+/// display math, a diagram, a table with a formula and a code block, so
+/// loading it takes a while and goes through every loading phase.
+fn large_document(dir: &std::path::Path) -> std::path::PathBuf {
+    let mut text = String::new();
+    for i in 0..40 {
+        text += &format!("## Section {i}\n\nInline $x_{{{i}}}^2$ and $\\ce{{H2O}}$.\n\n");
+        text += &format!("$$\\int_0^{{{i}}} e^{{-t}}\\,dt$$\n\n");
+        text += &format!("```mermaid\ngraph TD;\n  A{i}[Start {i}] --> B{i}[End {i}];\n```\n\n");
+        text += &format!("| n | value |\n|---|---|\n| {i} | $\\sqrt{{{i}}}$ |\n\n");
+        text += &format!("```rust\nlet n = {i};\n```\n\n");
+    }
+    let path = dir.join("large.md");
+    std::fs::write(&path, text).unwrap();
+    path
+}
+
+/// With a display, a large document (graphics rendered in the background,
+/// blocks appended as they complete) opens and exits cleanly.
+#[test]
+fn large_document_opens() {
+    if have_display() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = large_document(dir.path());
+        run_and_close(&[path.to_str().unwrap()]);
+    }
+}
+
+/// With a display, closing the viewer while a large document is still
+/// loading (workers busy, the loading spinner up) exits cleanly too.
+#[test]
+fn closing_while_loading() {
+    if have_display() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = large_document(dir.path());
+        for millis in [1500, 2500] {
+            run_for_and_close(&[path.to_str().unwrap()], Duration::from_millis(millis));
+        }
     }
 }
