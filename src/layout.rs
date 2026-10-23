@@ -18,6 +18,14 @@ pub const MIN_TABLE_WIDTH: i32 = 100;
 /// The narrowest a diagram may be scaled to, in pixels.
 pub const MIN_DIAGRAM_WIDTH: i32 = 50;
 
+/// How far a code card is indented per level of block quote or list it is
+/// nested in, in pixels.
+pub const CODE_INDENT: i32 = 28;
+
+/// How long the copy button of a code card shows its check mark after
+/// copying, in milliseconds.
+pub const COPY_FEEDBACK_MS: u64 = 1500;
+
 /// The body font size assumed when the view does not report one, in pixels.
 pub const DEFAULT_FONT_PX: f32 = 15.0;
 
@@ -37,6 +45,49 @@ pub fn table_size(natural_width: i32, natural_height: i32, view_width: i32) -> (
         natural_height,
     )
 }
+
+/// The width of a code card nested `indent` levels deep in a view
+/// `view_width` pixels wide: the available width minus its indentation,
+/// but never less than [`MIN_TABLE_WIDTH`]. Longer lines scroll sideways
+/// inside the card.
+pub fn code_card_width(view_width: i32, indent: usize) -> i32 {
+    let indent = i32::try_from(indent).unwrap_or(i32::MAX / CODE_INDENT);
+    (available_width(view_width) - indent * CODE_INDENT).max(MIN_TABLE_WIDTH)
+}
+
+/// How many pixels a document scrolls for a scroll of `dy` that a table
+/// passes on to it: `dy` itself for smooth (touchpad, `pixels`) scrolling;
+/// for a mouse wheel, `dy` clicks of GTK's own step, the page height to the
+/// power 2/3.
+pub fn scroll_pixels(dy: f64, pixels: bool, page_size: f64) -> f64 {
+    if pixels {
+        dy
+    } else {
+        dy * page_size.max(0.0).powf(2.0 / 3.0)
+    }
+}
+
+/// Where the top of the window is within the line under it, as a fraction
+/// of the line's height (0.0 = the line's top), so the same spot can be
+/// brought back after a zoom changes the line's size. A line without height
+/// gives 0.0.
+pub fn anchor_fraction(top: f64, line_top: f64, line_height: f64) -> f64 {
+    if line_height > 0.0 {
+        ((top - line_top) / line_height).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// The scroll position that puts the spot [`anchor_fraction`] described
+/// back at the top of the window, for the line's new position and height.
+pub fn anchored_scroll(line_top: f64, line_height: f64, fraction: f64) -> f64 {
+    line_top + fraction * line_height.max(0.0)
+}
+
+/// How long the view keeps the anchored spot in place after the last zoom
+/// step or re-rendered picture, in milliseconds.
+pub const ANCHOR_HOLD_MS: u64 = 400;
 
 /// The size to request for a diagram picture of logical size `width` x
 /// `height`: unchanged if it fits next to its card padding, otherwise scaled

@@ -13,13 +13,24 @@ md_viewer [FILE]
 
 Without a file the window offers an "Open…" button. The Open button in the
 header bar (or Ctrl+O) picks another document, which opens in a new window;
-Ctrl+W closes a window. Installed from a package, MD Viewer is also in the
+Ctrl+W closes a window.
+
+Zoom with Ctrl+mouse wheel, Ctrl+plus / Ctrl+minus (Ctrl+0 resets to 100%)
+or a touchpad pinch, from 50% to 300%: text, tables, code, formulas and
+diagrams all grow, and the part you are reading stays in place.
+
+Large documents appear quickly: the first screen is shown as soon as it is
+ready (a spinner fills the window until then), and the rest is added below
+while a small spinner in the header bar turns. Formulas and diagrams are
+drawn on all CPU cores. Installed from a package, MD Viewer is also in the
 desktop's app grid and in "Open With" for Markdown files.
 
 The document is shown with headings, emphasis, strong text, strikethrough,
-inline code and code blocks, block quotes, ordered/unordered and task lists,
-horizontal rules, and:
+inline code, block quotes, ordered/unordered and task lists, horizontal
+rules, and:
 
+* **Code blocks** as cards with their language and a copy-to-clipboard
+  button; long lines scroll sideways.
 * **Tables** as real grids: shaded header, striped rows, column alignment,
   formatting inside cells, and long cells wrapped. Tables wider than the
   window scroll sideways.
@@ -138,3 +149,6 @@ Planned features. Known bugs are listed in `BUGS.md`.
 * Inline images.
 * Reload a document when it changes on disk.
 * An error popup instead of a message on STDERR for a bad `FILE` argument.
+* Remember the zoom level between runs.
+* For very large documents, render graphics far below the window only when
+  scrolled near (today everything is rendered, first screen first).

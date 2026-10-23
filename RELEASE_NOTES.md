@@ -6,6 +6,62 @@ changes** summary (what also appears in the GitHub Release body) and a
 added at the top. `scripts/extract-release-notes.sh` prints just one release's
 section for the GitHub Release body.
 
+## v0.4.0 — Zoom, copyable code blocks, faster loading
+
+### User-facing changes
+
+- Zoom: Ctrl+mouse wheel, Ctrl+plus / Ctrl+minus, Ctrl+0 to reset, or a
+  touchpad pinch, from 50% to 300%. Text, tables, code, formulas and
+  diagrams all grow; formulas and diagrams are redrawn sharp at the new size,
+  and the part being read stays in place. The zoom applies to the window
+  and to the next document opened in it.
+- Code blocks are cards with their language and a copy-to-clipboard button
+  (it shows a check mark after copying); long lines scroll sideways.
+- Large documents open much faster: formulas and diagrams are drawn on all
+  CPU cores, the first screen appears as soon as it is ready (a spinner
+  fills the window until then), and the rest is added below it while a
+  small spinner turns in the header bar. Nothing already shown moves.
+- Fixed: labels in diagrams (class and state diagrams especially) were cut
+  off at their edges.
+- Fixed: the mouse wheel over a table stopped the document from scrolling.
+- Diagrams use GNOME's UI font (Adwaita Sans) when it is installed.
+
+### Details
+
+- Version 0.3.0 → 0.4.0 (new features).
+- Diagram labels: merman's `native-fonts` feature measures label text with
+  the same font files resvg draws it with (`graphics::native_fonts`,
+  `font_files`), so a label's clipping box fits its text; merman's built-in
+  estimates remain the fallback when no font files can be loaded. A unit
+  test checks every label box against resvg's drawn width. Adwaita Sans
+  now leads `pick_family`. Costs about 20-30% more per diagram layout and
+  1.8 MB of binary.
+- `Block::Code(CodeBlock)` (language, verbatim text, nesting indent) for
+  fenced and indented code other than Mermaid, with `code_language` and
+  `CodeBlock::clipboard_text`; a code card always starts on its own line.
+  `Style::CodeBlock` is now only used for the sources of formulas and
+  diagrams that could not be rendered.
+- New `md_viewer::progressive`: graphics numbered in document order
+  (`jobs`, `for_each_graphic`, `place`), `Progress` (blocks appended in
+  order once complete), `Phase`, `zoom_order` and `Pool` (one worker thread
+  per CPU over a shared queue, cancellable). `graphics::Cache` (shared)
+  keeps rendered formulas and laid-out diagrams. `render_document` now uses
+  the same walk. Measured on 300 graphics (release, 12 CPUs): 1.1 s one
+  after another vs 0.22 s in the pool.
+- New `md_viewer::zoom` (`Zoom`, `STEPS`, `wheel_clicks`, `css`) and
+  `RasterSettings::zoom`; the GUI zooms text with a per-window CSS class,
+  stretches pictures at once and re-renders them 150 ms after the last
+  step, holding the line at the top of the window in place.
+- The GUI reads and parses on the I/O pool, then builds the page from a
+  `Session` that collects worker results every frame; the page sits behind
+  a crossfading cover with a centred `adw::Spinner` until the first screen
+  is full; a header bar spinner shows while loading or re-rendering.
+- Tables pass vertical scrolling on to the document (an `External`
+  scrollbar policy still swallowed the wheel); code cards use `Never`.
+- Tests: new `tests/progressive.rs` and `tests/zoom.rs`; code block, layout
+  and graphics (zoom, cache, fonts, label width) tests; GUI tests open a
+  large generated document and close it while it is still loading.
+
 ## v0.3.0 — Open files from the GUI, app icon and menu entry
 
 ### User-facing changes

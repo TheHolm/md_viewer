@@ -58,31 +58,54 @@ run there; runtime verification on a real FreeBSD system is a manual step.
 
 - `src/main.rs` - the GTK4/libadwaita GUI: the application and its windows.
   Each window is a `DocWindow`: an `adw::ToolbarView` with a header bar
-  (Open button) over either the empty start page (`adw::StatusPage`, shown
-  when no `FILE` is given) or a read-only `GtkTextView` inside a
-  `GtkScrolledWindow`. The `win.open` action (Ctrl+O) runs a
+  (Open button on the left, a small loading `adw::Spinner` on the right)
+  over either the empty start page (`adw::StatusPage`, shown when no `FILE`
+  is given) or the document: a read-only `GtkTextView` in a
+  `GtkScrolledWindow`, in a `GtkOverlay` whose `GtkRevealer` "cover" (a
+  centred 48 px spinner, shown after `SPINNER_DELAY_MS`) hides the page
+  until the first screen is full. The `win.open` action (Ctrl+O) runs a
   `gtk4::FileDialog`; the picked file opens in a new window, except that an
-  empty window is reused (`md_viewer::open_target`). The file is read before
-  any window changes: a failure for the command line `FILE` goes to stderr
-  with exit status 1, one for a picked file to an `adw::AlertDialog`
-  (`md_viewer::Origin`). Ctrl+W closes a window. Deliberately thin: it walks
-  the library's blocks and handles errors and exit codes. Text goes into the buffer with one `GtkTextTag` per `Style`;
-  formulas are inserted as paintables (`ScaledTexture`, which draws a
-  device-pixel texture at its logical size for HiDPI), lowered by a `rise`
-  tag to line up baselines, display math centred; tables become a `GtkGrid`
-  of wrapping labels (Pango markup from the library) in a horizontal
-  `GtkScrolledWindow`; diagrams become a `GtkPicture` on a white card. Tables
-  and diagrams are anchored in the text view, which only gives anchored
-  widgets their minimum size, so `Resizable` (run from a tick callback)
-  sizes them from their content and the view width: tables at their natural
-  width capped to the view (wider ones scroll), diagrams scaled down to fit.
-  Widget styling is the `CSS` constant; sizes and classes come from
-  `md_viewer::layout`. SIGINT/SIGTERM quit cleanly through the main loop.
-  Reading, rendering and rasterizing run on `gio::spawn_blocking` (the I/O
-  thread pool), not the GTK main loop, with `RasterSettings` (font size,
-  scale factor, text colour) taken from the new view first; the results are
-  awaited from a `glib::spawn_future_local` block so the widgets are built
-  back on the main thread.
+  empty window is reused (`md_viewer::open_target`). The file is read and
+  parsed on `gio::spawn_blocking` before any window changes: a failure for
+  the command line `FILE` goes to stderr with exit status 1, one for a
+  picked file to an `adw::AlertDialog` (`md_viewer::Origin`). Ctrl+W closes
+  a window. SIGINT/SIGTERM quit cleanly through the main loop.
+  - Each shown document is a `Session`: it starts a `progressive::Pool`
+    (one worker per CPU) over all graphics, collects results from an
+    `mpsc` channel every 16 ms (`POLL_MS`, a `glib::timeout_add_local`
+    that stops when idle), stores them with their blocks and appends each
+    block once it and every block before it are complete
+    (`progressive::Progress`). Content is only ever appended, so nothing on
+    the page moves. `progressive::Phase` decides the cover / header spinner.
+  - Text goes into the buffer with one `GtkTextTag` per `Style`; formulas
+    are paintables (`ScaledTexture`: a device-pixel texture drawn at its
+    logical size, replaceable in place), lowered by a per-formula `rise` tag,
+    display math centred; tables are a `GtkGrid` of wrapping labels in a
+    horizontal `GtkScrolledWindow`; code blocks are cards (`code_card`:
+    language label, copy button, monospace selectable label in a horizontal
+    scroller); diagrams are a `GtkPicture` on a white card. Every graphic on
+    the page has a `Slot` (its `ScaledTexture`, rise tag, diagram entry,
+    buffer offset) so a re-render can replace it.
+  - Anchored widgets only get their minimum size, so `Resizable` (run from
+    a tick callback) sizes them from their content and the view width:
+    tables at their natural width capped to the view (wider ones scroll),
+    code cards as wide as the view minus their indent, diagrams scaled down
+    to fit.
+  - Zoom (`md_viewer::zoom`): `win.zoom-in`/`zoom-out`/`zoom-reset`
+    (Ctrl+plus/=/minus/0 and keypad), Ctrl+scroll and a pinch
+    (`GestureZoom`), all on the toolbar in the capture phase. The text size
+    is a per-window CSS class (`md-zoom-N`, `font-size` in px from the
+    window's base font) on the text view, inherited by the cells and code
+    cards. Pictures are stretched at once (`Slot::stretch`), the run is
+    cancelled, and `REZOOM_DELAY_MS` after the last step all graphics are
+    re-rendered at the new zoom in `progressive::zoom_order`. A mark at the
+    line at the top of the window plus the fraction into it is held in
+    place (`hold_anchor`/`keep_anchor`, every frame for `ANCHOR_HOLD_MS`
+    after the last change; a normal scroll releases it).
+  - Vertical wheel scrolling over a table is passed to the document
+    (`pass_vertical_scrolls`); horizontal scrolling still scrolls the table.
+  - Widget styling is the `CSS` constant; sizes and classes come from
+    `md_viewer::layout`.
 - `src/lib.rs` - all non-GUI logic, exposed publicly so the GUI and the
   integration tests share exactly one implementation: the app version
   (`version`, the `VERSION` file embedded at compile time), the application
@@ -97,8 +120,11 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   `Block::Text` (flowing `Inline`s: `Inline::Text(Span)` - text plus its
   `Style`s - and `Inline::Math(Math)`), `Block::Table(Table)` (per-column
   `Align`, header and rows of `Cell`s, i.e. `Vec<Inline>`) and
-  `Block::Mermaid(Diagram)`. `Math` and `Diagram` carry an `image` that is
-  `None` after `render` and filled in by `graphics::render_document`.
+  `Block::Mermaid(Diagram)` and `Block::Code(CodeBlock)` (language from
+  `code_language`, verbatim text, nesting `indent`; `clipboard_text` is what
+  the copy button copies). `Math` and `Diagram` carry an `image` that is
+  `None` after `render` and filled in by `graphics::render_document` or the
+  GUI's worker pool.
   `Style::tag_name` names each style's text tag; `Style::ALL` lists every
   style so all tags can be created up front. Private helpers (`Renderer`,
   `TableBuilder`, `push_inline`, `trailing_newlines`, `normalize`) have unit
@@ -109,14 +135,36 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   the baseline), `mermaid_svg`/`render_mermaid` (merman), `rasterize` (resvg
   into premultiplied RGBA `Image`s at a device scale; the system font
   database is loaded once and generic `sans-serif` is pointed at an
-  installed family) and `render_document`, which fills in every graphic of a
-  rendered document.
+  installed family, GNOME's Adwaita Sans first, see `pick_family`) and
+  `render_document`, which fills in every graphic of a rendered document one
+  after another. `RasterSettings` carries the text size, device scale, text
+  colour and zoom (math is typeset at `font_px * zoom`, diagrams drawn
+  `zoom` times their natural size). Diagram labels are measured with the
+  same font files resvg draws them with (merman's `native-fonts`,
+  `native_fonts`/`font_files`; merman's built-in estimates if no font files
+  can be loaded). `Graphic` names one formula or diagram; `Cache` (one
+  shared instance, `Cache::shared`) keeps rendered formulas by source and
+  settings and laid-out diagram SVG by source, each map emptied when it
+  reaches its limit.
+- `src/progressive.rs` (`md_viewer::progressive`) - progressive, parallel
+  loading: `for_each_graphic`/`jobs`/`place` number the graphics in
+  document order and store results; `Progress` decides which blocks may go
+  on the page (strictly in order, each once complete) and what to re-render
+  after a zoom (`reset_unshown`); `zoom_order`; `Phase` (FirstScreen,
+  Background, Done); `Pool`, the worker threads (a shared queue taken from
+  the front, cancelled on `cancel` or drop; a result finished at that
+  moment may still arrive, so the GUI tags runs with a generation).
+- `src/zoom.rs` (`md_viewer::zoom`) - zoom levels (`STEPS`, 50%-300%),
+  `Zoom` (step in/out, reset, free `set` for pinches, `scroll` accumulating
+  wheel clicks), `wheel_clicks` (touchpad pixels to clicks) and the zoom CSS.
 - `src/layout.rs` (`md_viewer::layout`) - the GUI's sizing and styling
   arithmetic as plain functions, so it is tested without a display: the
   width available to anchored widgets, table and diagram sizes, Pango font
   size to pixels, colour channels, heading scales, the baseline `rise` of
-  inline math, column alignment and table cell CSS classes. `main.rs` only
-  applies the results to widgets.
+  inline math, column alignment and table cell CSS classes, code card
+  widths, scroll distances passed on from tables, the zoom anchor
+  arithmetic and a few GUI timings. `main.rs` only applies the results to
+  widgets.
 - `tests/` - integration tests split by topic:
   - `render.rs` - the renderer: one group of tests per block type
     (paragraphs, headings, lists, block quotes, code blocks, rules, tables,
@@ -127,12 +175,17 @@ run there; runtime verification on a real FreeBSD system is a manual step.
     showcase fixture renders, and that the root `showcase.md` renders with
     no fallbacks at all (every formula and diagram `Ok`)
   - `layout.rs` - the `md_viewer::layout` functions
+  - `progressive.rs` - numbering and placing graphics, `Progress`,
+    `zoom_order`, `Phase`, worker counts and the `Pool` (delivers every
+    result, stops when cancelled or dropped)
+  - `zoom.rs` - zoom steps, clamping, scroll accumulation and the zoom CSS
   - `cli.rs` - the binary end to end: `--version`, `--help` and argument
     errors always; with a display (`DISPLAY`/`WAYLAND_DISPLAY` set) also an
-    unreadable file (status 1), the empty start window (no `FILE`) and
-    opening both fixtures and the root `showcase.md`, checking that the viewer stays up, prints no GTK
-    criticals and exits 0 on SIGTERM. Without a display those tests print
-    "skipped" and pass
+    unreadable file (status 1), the empty start window (no `FILE`),
+    opening both fixtures, the root `showcase.md` and a large generated
+    document, and closing that one while it is still loading, checking
+    that the viewer stays up, prints no GTK criticals and exits 0 on
+    SIGTERM. Without a display those tests print "skipped" and pass
   - `desktop.rs` - the files in `data/`: the `.desktop` file agrees with
     `APP_ID`, `APP_NAME` and `MARKDOWN_MIME_TYPES` and passes
     `desktop-file-validate` (skipped if not installed), the icons render at
@@ -207,6 +260,23 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   (inline inside a table cell). Only the dollar syntax is supported, not
   `\(…\)` or `\[…\]`. A lone `$`, `\$` and dollars in code are text.
   mhchem's `\ce{}` and `\pu{}` work inside math.
+- Other code blocks (fenced or indented) are `Block::Code` cards: the
+  language from the info string's first word in a small header, a copy
+  button that copies the code exactly (no trailing newline) and shows a
+  check mark for `COPY_FEEDBACK_MS`, monospace text whose long lines scroll
+  sideways. A card always starts on its own line (in a list item, on the
+  line after the marker) and is indented `CODE_INDENT` px per enclosing list
+  or quote. A text selection cannot run from the surrounding text into a
+  card (it is a separate widget).
+- Loading is progressive: text is never shown before the graphics in it,
+  but blocks appear in document order as soon as they are complete; the
+  page is revealed (behind a spinner until then) once the first screen is
+  full, and a header bar spinner shows until everything is on the page and
+  while a zoom re-renders.
+- Zoom (50%-300%) scales text, tables, code cards, math and diagrams;
+  graphics are re-rendered sharp at the new size, visible ones first. The
+  zoom belongs to the window and carries over to the next document opened
+  in it; it is not saved between runs.
 - A fenced code block whose info string starts with `mermaid`
   (case-insensitive) is a `Block::Mermaid` diagram, drawn on a white card
   in both themes (Mermaid's colours assume a light background).
@@ -277,11 +347,51 @@ Things learned the hard way; add to this list when you learn another.
   math visually (see "Checking graphics visually" below).
 - In mhchem `\pu{}`, write the degree sign directly (`\pu{100 °C}`);
   `\pu{100 ^\circ C}` draws a spaced-out ring operator ("100 ∘ C").
-- merman lays out text with its own font metrics, while resvg draws it with
-  whatever system font `sans-serif` resolves to (see `pick_family` in
-  `src/graphics.rs`). Each label is a nested `<svg>` with
-  `overflow:hidden` sized by merman, so a wider real font clips labels (see
-  `BUGS.md`). Diagram appearance therefore depends on the installed fonts.
+- merman sizes each diagram label as a nested `<svg>` with
+  `overflow:hidden`, while resvg draws the text with whatever system font
+  `sans-serif` resolves to. With merman's default (deterministic) text
+  estimates, a wider real font clipped labels ("Appliance" drawn as
+  "ppliand"). Fixed in 0.4.0 by merman's `native-fonts` feature, measuring
+  with exactly the font files of the family `pick_family` chose (`font_files`);
+  merman's own `with_system_fonts(true)` may pick a different family than
+  ours and is not used. The unit test `labels_fit_their_boxes` checks every
+  label box against resvg's drawn width. Diagram sizes therefore depend on
+  the installed fonts. Cost: about 20-30% more time per diagram layout,
+  some tens of ms to load the fonts once, +1.8 MB stripped binary.
+- Which font draws what: body text, headings, lists and table cells use the
+  GTK UI font (`gtk-font-name`: Adwaita Sans on GNOME 48, Cantarell before);
+  inline code, code cards and the fallback sources use fontconfig's
+  `monospace`; math and chemistry use STIX Two Math, built into mathra and
+  drawn as outlines (identical everywhere); diagrams ask for
+  `"Recursive Variable", arial, sans-serif`, which resolves to the first
+  installed of Adwaita Sans, Cantarell, Noto Sans, DejaVu Sans, Liberation
+  Sans, Inter (`pick_family`), at merman's own sizes (zoomed).
+- Timings (release build, 12 CPUs, a generated document of 300 graphics:
+  280 formulas, 20 flowcharts): rendering them one after another took about
+  1.1 s, which 0.3.0 waited for before showing anything; the worker pool
+  takes about 0.22 s in total, and the first section's graphics arrive
+  within about 10 ms. Rasterizing dominates, not diagram layout: re-rendering
+  everything at another zoom with every layout cached still took about
+  1.05 s serially. In debug builds everything is several times slower.
+- A `GtkScrolledWindow` with `vscrollbar_policy` `External` still counts as
+  vertically scrollable and swallows mouse wheel scrolling (0.3.0's tables
+  stopped the document from scrolling under the pointer). Use `Never` where
+  the content's own height is right (code cards); tables need `External`
+  (their height is measured for the right width by `Resizable`), so they
+  pass vertical scrolls on with a capture-phase controller.
+- A text view's vertical adjustment never has an `upper` below the window
+  height, so "is the page taller than the window" must be measured at the
+  end of the buffer (`line_yrange(end_iter)`).
+- `TextView::iter_at_location` returns `None` inside the left margin (x = 0
+  of `visible_rect`); use `line_at_y` to find the line at the top.
+- Paintables in a text buffer (`insert_paintable`) and in a `GtkPicture`
+  follow `invalidate_size`/`invalidate_contents`, so `ScaledTexture` can
+  change picture and size in place.
+- Driving a headless GUI for manual checks: `xdotool` works against the
+  Xvfb display (`xdotool mousemove 400 500 click 5` scrolls,
+  `keydown ctrl click 4 keyup ctrl` zooms in, `key ctrl+0`); combine with
+  `import` screenshots. The automated tests cannot press keys, so zoom and
+  the copy button are checked this way.
 - Headless GUI runs: start `Xvfb :77 &` and run with `DISPLAY=:77
   GDK_BACKEND=x11 GSK_RENDERER=cairo`. GTK then warns that it cannot
   acquire a session bus (no `dbus-launch`); that warning is harmless, and
