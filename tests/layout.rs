@@ -3,8 +3,8 @@
 
 use md_viewer::layout::{
     align_fraction, available_width, cell_classes, color_channel, diagram_size, font_size_px,
-    heading_scale, math_rise, table_size, DIAGRAM_PADDING, DOCUMENT_MARGIN, MIN_DIAGRAM_WIDTH,
-    MIN_TABLE_WIDTH,
+    heading_scale, math_rise, pango_channel, table_size, DIAGRAM_PADDING, DOCUMENT_MARGIN,
+    MIN_DIAGRAM_WIDTH, MIN_TABLE_WIDTH,
 };
 use md_viewer::Align;
 
@@ -95,6 +95,16 @@ fn color_channels() {
     assert_eq!(color_channel(0.5), 128);
     assert_eq!(color_channel(-1.0), 0);
     assert_eq!(color_channel(2.0), 255);
+}
+
+/// `pango_channel` widens an 8-bit channel to Pango's 16-bit range: 255
+/// becomes full (65535), not near-black.
+#[test]
+fn pango_channel_widens() {
+    assert_eq!(pango_channel(0), 0);
+    assert_eq!(pango_channel(255), 65535);
+    assert_eq!(pango_channel(128), 32896);
+    assert_eq!(pango_channel(1), 257);
 }
 
 /// Heading scales shrink with the level and clamp past level 6.

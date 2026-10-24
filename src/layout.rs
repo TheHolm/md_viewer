@@ -134,6 +134,13 @@ pub fn color_channel(value: f32) -> u8 {
     (value.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
+/// Converts an 8-bit colour channel (0-255) to Pango's 16-bit range
+/// (0-65535), which `pango::AttrColor` uses. 255 maps to 65535 (not 255,
+/// which would be nearly black).
+pub fn pango_channel(value: u8) -> u16 {
+    u16::from(value) * 257
+}
+
 /// The font scale of a heading level (1 largest); levels past 6 use the
 /// level 6 scale.
 pub fn heading_scale(level: u8) -> f64 {

@@ -32,14 +32,15 @@ const SEARCH_MATCH_TAG: &str = "search-match";
 /// The text tag marking the current search match.
 const SEARCH_CURRENT_TAG: &str = "search-current";
 
-/// The colour a matched search string is drawn in, as RGB 0-65535 (Pango)
-/// and as `#rrggbb` (the text tags).
-const SEARCH_MATCH_RGB: (u16, u16, u16) = (255, 213, 0);
-const SEARCH_CURRENT_RGB: (u16, u16, u16) = (255, 145, 0);
+/// The colour a matched search string is drawn in, as 8-bit RGB
+/// (`#rrggbb`); Pango attributes need `layout::pango_channel` to widen them
+/// to 16 bits.
+const SEARCH_MATCH_RGB: (u8, u8, u8) = (255, 213, 0);
+const SEARCH_CURRENT_RGB: (u8, u8, u8) = (255, 145, 0);
 
 /// The text colour drawn on a highlighted label (black on the light
 /// background, readable in both themes).
-const SEARCH_TEXT_RGB: (u16, u16, u16) = (0, 0, 0);
+const SEARCH_TEXT_RGB: (u8, u8, u8) = (0, 0, 0);
 
 /// Roughly how many characters wide a table cell grows before its text wraps.
 const CELL_WRAP_CHARS: i32 = 40;
@@ -2078,15 +2079,18 @@ fn highlight_attributes(ranges: &[(std::ops::Range<usize>, bool)]) -> pango::Att
         } else {
             SEARCH_MATCH_RGB
         };
-        let mut background_attr =
-            pango::AttrColor::new_background(background.0, background.1, background.2);
+        let mut background_attr = pango::AttrColor::new_background(
+            layout::pango_channel(background.0),
+            layout::pango_channel(background.1),
+            layout::pango_channel(background.2),
+        );
         background_attr.set_start_index(range.start as u32);
         background_attr.set_end_index(range.end as u32);
         list.insert(background_attr);
         let mut foreground_attr = pango::AttrColor::new_foreground(
-            SEARCH_TEXT_RGB.0,
-            SEARCH_TEXT_RGB.1,
-            SEARCH_TEXT_RGB.2,
+            layout::pango_channel(SEARCH_TEXT_RGB.0),
+            layout::pango_channel(SEARCH_TEXT_RGB.1),
+            layout::pango_channel(SEARCH_TEXT_RGB.2),
         );
         foreground_attr.set_start_index(range.start as u32);
         foreground_attr.set_end_index(range.end as u32);
@@ -2294,6 +2298,26 @@ mod tests {
                 .chars()
                 .count(),
             4
+        );
+    }
+
+    /// Match highlights use Pango's 16-bit colour range: the intended
+    /// yellow background is full red + green, not the near-black of an
+    /// 8-bit value passed straight through.
+    #[test]
+    fn highlight_attributes_use_16_bit_colours() {
+        let list = highlight_attributes(&[(0..1, false)]);
+        let mut colours: Vec<String> = list
+            .iterator()
+            .attrs()
+            .into_iter()
+            .filter_map(|attr| attr.downcast::<pango::AttrColor>().ok())
+            .map(|color| color.color().to_str().to_string())
+            .collect();
+        colours.sort();
+        assert_eq!(
+            colours,
+            vec!["#000000000000".to_string(), "#ffffd5d50000".to_string()]
         );
     }
 }

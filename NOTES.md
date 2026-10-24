@@ -435,6 +435,10 @@ Things learned the hard way; add to this list when you learn another.
   byte ranges; `search::char_ranges` maps them. Pango `AttrList` indices
   (used to highlight table and code labels) are byte offsets into the
   label's text, so the byte ranges are used directly there.
+- Pango `AttrColor` channels are 16-bit (0-65535), unlike the 8-bit hex
+  used by GDK/CSS; `layout::pango_channel` widens an 8-bit value by 257.
+  Passing an 8-bit value straight through made the highlight background
+  effectively black (matched text looked like black squares).
 - `TextBuffer::text` (`get_text`) omits the U+FFFC characters that represent
   embedded child anchors and paintables, so its indexes drift from buffer
   offsets; `TextBuffer::slice` (`get_slice`) keeps them. The find bar uses

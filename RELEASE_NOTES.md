@@ -23,6 +23,9 @@ section for the GitHub Release body.
 - Fixed: highlights were offset (highlighting the wrong characters) after a
   table, code card, diagram or formula, because the buffer text searched
   omitted the embedded objects whose characters buffer offsets count.
+- Fixed: matches inside tables and code cards were drawn as black squares;
+  Pango colour channels are 16-bit, and the highlight colours were passed
+  as 8-bit values.
 
 ### Details
 
