@@ -299,6 +299,28 @@ fn mermaid_errors() {
     }
 }
 
+/// A diagram's labels are extracted from the laid-out SVG (the find bar
+/// searches them); math draws outlines, so it has none.
+#[test]
+fn diagram_labels_are_extracted() {
+    let settings = RasterSettings::default();
+    let image = render_mermaid("graph TD; A[Coffee] --> B[Water]", &settings).unwrap();
+    assert!(
+        image.labels.iter().any(|label| label == "Coffee"),
+        "{:?}",
+        image.labels
+    );
+    assert!(
+        image.labels.iter().any(|label| label == "Water"),
+        "{:?}",
+        image.labels
+    );
+    assert!(render_math("x", false, &settings)
+        .unwrap()
+        .labels
+        .is_empty());
+}
+
 // --- Whole documents ------------------------------------------------------
 
 /// `render_document` renders every formula, in text and in table cells.

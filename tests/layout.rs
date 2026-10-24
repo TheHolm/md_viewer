@@ -197,3 +197,19 @@ fn copy_feedback_time() {
     let millis = md_viewer::layout::COPY_FEEDBACK_MS;
     assert!((500..=5000).contains(&millis));
 }
+
+/// A scrollbar mark sits at its fraction of the track and is clamped so it
+/// never spills out of the track.
+#[test]
+fn search_mark_positions() {
+    use md_viewer::layout::{search_mark_y, SEARCH_MARK_HEIGHT};
+    let mark = SEARCH_MARK_HEIGHT;
+    assert_eq!(search_mark_y(0.0, 100.0, mark), 0.0);
+    assert_eq!(search_mark_y(1.0, 100.0, mark), 100.0 - mark);
+    assert_eq!(search_mark_y(0.5, 100.0, mark), 50.0 - mark / 2.0);
+    assert_eq!(search_mark_y(1.5, 100.0, mark), 100.0 - mark);
+    assert_eq!(search_mark_y(-0.5, 100.0, mark), 0.0);
+    // A track shorter than the mark just pins the mark to the top.
+    assert_eq!(search_mark_y(1.0, 2.0, mark), 0.0);
+    assert_eq!(search_mark_y(0.0, 0.0, mark), 0.0);
+}
