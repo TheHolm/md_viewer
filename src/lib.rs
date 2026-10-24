@@ -9,6 +9,7 @@
 pub mod graphics;
 pub mod layout;
 pub mod progressive;
+pub mod search;
 pub mod zoom;
 
 use graphics::Rendered;

@@ -26,6 +26,18 @@ pub const CODE_INDENT: i32 = 28;
 /// copying, in milliseconds.
 pub const COPY_FEEDBACK_MS: u64 = 1500;
 
+/// The height of a find-bar scrollbar mark, in pixels.
+pub const SEARCH_MARK_HEIGHT: f64 = 4.0;
+
+/// Where a scrollbar mark sits on a track `track_height` pixels high for a
+/// match `fraction` of the way through the document (0.0 = top, 1.0 =
+/// bottom): the y of its top, clamped so the mark stays fully inside the
+/// track.
+pub fn search_mark_y(fraction: f64, track_height: f64, mark_height: f64) -> f64 {
+    let room = (track_height - mark_height).max(0.0);
+    (fraction * room).clamp(0.0, room)
+}
+
 /// The body font size assumed when the view does not report one, in pixels.
 pub const DEFAULT_FONT_PX: f32 = 15.0;
 

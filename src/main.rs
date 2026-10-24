@@ -13,6 +13,7 @@ use gtk4::glib::translate::IntoGlib;
 use gtk4::{gdk, gio, glib, pango};
 use md_viewer::graphics::{Image, RasterSettings, Rendered};
 use md_viewer::progressive::{self, Job, Phase, Pool, Progress};
+use md_viewer::search::{self, Matcher, SearchMode};
 use md_viewer::zoom::{self, Zoom};
 use md_viewer::{layout, CodeBlock};
 use md_viewer::{Align, Block, Diagram, Inline, Math, Origin, Style, Table, Target, APP_ID};
@@ -24,6 +25,21 @@ use std::time::Duration;
 
 /// The name of the text tag that centres display math on its line.
 const DISPLAY_MATH_TAG: &str = "math-display";
+
+/// The text tag marking a matched search string.
+const SEARCH_MATCH_TAG: &str = "search-match";
+
+/// The text tag marking the current search match.
+const SEARCH_CURRENT_TAG: &str = "search-current";
+
+/// The colour a matched search string is drawn in, as RGB 0-65535 (Pango)
+/// and as `#rrggbb` (the text tags).
+const SEARCH_MATCH_RGB: (u16, u16, u16) = (255, 213, 0);
+const SEARCH_CURRENT_RGB: (u16, u16, u16) = (255, 145, 0);
+
+/// The text colour drawn on a highlighted label (black on the light
+/// background, readable in both themes).
+const SEARCH_TEXT_RGB: (u16, u16, u16) = (0, 0, 0);
 
 /// Roughly how many characters wide a table cell grows before its text wraps.
 const CELL_WRAP_CHARS: i32 = 40;
@@ -68,6 +84,12 @@ const CSS: &str = r#"
   border-radius: 6px;
   padding: 12px;
 }
+.md-diagram.md-search-hit {
+  box-shadow: 0 0 0 2px alpha(#f5c211, 0.55);
+}
+.md-diagram.md-search-current {
+  box-shadow: 0 0 0 3px alpha(#f08c00, 0.65);
+}
 .md-code {
   background-color: alpha(currentColor, 0.06);
   border: 1px solid alpha(currentColor, 0.15);
@@ -110,6 +132,7 @@ fn main() -> glib::ExitCode {
         quit_on_signals(app);
         gtk4::Window::set_default_icon_name(APP_ID);
         app.set_accels_for_action("win.open", &["<Control>o"]);
+        app.set_accels_for_action("win.find", &["<Control>f"]);
         app.set_accels_for_action("window.close", &["<Control>w"]);
         app.set_accels_for_action(
             "win.zoom-in",
@@ -263,6 +286,80 @@ impl Slot {
 /// One rendered result from a worker: generation, graphic id and result.
 type Delivery = (u64, usize, Rendered);
 
+/// What the window shows for a search, to update the find bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SearchSummary {
+    /// The number of matches found.
+    total: usize,
+    /// The 1-based number of the current match (0 when there is none).
+    current: usize,
+    /// True when the query could not be matched (an invalid regex).
+    error: bool,
+}
+
+/// Where a match can be highlighted.
+enum SearchTarget {
+    /// A label (a table cell or a code card) whose substrings can be marked.
+    Label(gtk4::Label),
+    /// A whole diagram card, marked by a CSS class.
+    Diagram(gtk4::Box),
+}
+
+/// One searchable piece of text, in document order.
+struct SearchEntry {
+    /// The text searched.
+    text: String,
+    /// The buffer offset the piece is at (its anchor), for ordering and
+    /// scrolling.
+    offset: i32,
+    /// The order within the same offset, so ties keep document order.
+    order: usize,
+    /// What to highlight.
+    target: SearchTarget,
+}
+
+/// A found match and where it is.
+struct SearchMatch {
+    /// The buffer offset, for ordering, scrolling and scrollbar marks.
+    offset: i32,
+    /// The order within the same offset.
+    order: usize,
+    /// The part of the document the match is in.
+    target: MatchTarget,
+}
+
+/// The part of the document a match is in.
+enum MatchTarget {
+    /// A range of the text buffer, in character offsets.
+    Buffer { chars: std::ops::Range<i32> },
+    /// A byte range in entry `entry`'s text.
+    Entry {
+        entry: usize,
+        range: std::ops::Range<usize>,
+    },
+}
+
+/// The state of the find bar for one session.
+#[derive(Default)]
+struct Search {
+    /// The query as typed.
+    query: String,
+    /// How the query is matched; kept when the query is cleared.
+    mode: SearchMode,
+    /// The compiled query, `None` when there is no query or it is invalid.
+    matcher: Option<Matcher>,
+    /// True when the query could not be matched (an invalid regex).
+    error: bool,
+    /// Every searchable widget on the page, in document order.
+    entries: Vec<SearchEntry>,
+    /// Every match, sorted by document position.
+    matches: Vec<SearchMatch>,
+    /// The index in `matches` of the current match, if any.
+    current: Option<usize>,
+    /// The next `order` to hand out, for ordering within one offset.
+    next_order: usize,
+}
+
 /// A document being shown in a window: its view, the blocks not on the page
 /// yet, and the rendering of its graphics (see `md_viewer::progressive`).
 struct Session {
@@ -314,6 +411,12 @@ struct Session {
     sender: Mutex<mpsc::Sender<Delivery>>,
     /// True while results are being collected regularly.
     polling: Cell<bool>,
+    /// The state of the find bar for this document.
+    search: RefCell<Search>,
+    /// The strip over the scrollbar that marks matches.
+    marks: gtk4::DrawingArea,
+    /// Reports the outcome of a search to the window.
+    search_changed: Box<dyn Fn(SearchSummary)>,
 }
 
 impl Session {
@@ -415,6 +518,7 @@ impl Session {
             self.insert_block(index);
         }
         self.resizable.update(self.view.width());
+        self.refresh_search();
     }
 
     /// Moves to the next loading phase, revealing the page once the first
@@ -533,6 +637,14 @@ impl Session {
                 let offset = buffer.end_iter().offset();
                 let anchor = buffer.create_child_anchor(&mut buffer.end_iter());
                 self.view.add_child_at_anchor(&card, &anchor);
+                let labels = image
+                    .labels
+                    .iter()
+                    .filter(|label| !label.is_empty())
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.add_diagram_entry(&card, labels, offset);
                 let mut diagrams = self.resizable.diagrams.borrow_mut();
                 self.add_slot(Some(Slot {
                     texture,
@@ -563,10 +675,12 @@ impl Session {
     /// language and a copy button over the code, which scrolls sideways
     /// when its lines are longer than the card is wide.
     fn insert_code(&self, code: &CodeBlock) {
-        let card = code_card(code);
+        let (card, text) = code_card(code);
         let buffer = self.view.buffer();
+        let offset = buffer.end_iter().offset();
         let anchor = buffer.create_child_anchor(&mut buffer.end_iter());
         self.view.add_child_at_anchor(&card, &anchor);
+        self.add_label_entry(&text, code.text.clone(), offset);
         self.resizable.codes.borrow_mut().push((card, code.indent));
     }
 
@@ -691,6 +805,7 @@ impl Session {
             .justify(justify)
             .halign(halign)
             .build();
+        self.add_label_entry(&label, cell.iter().map(Inline::text).collect(), offset);
         let frame = gtk4::Box::builder().css_classes(classes.to_vec()).build();
         label.set_hexpand(true);
         frame.append(&label);
@@ -746,6 +861,7 @@ impl Session {
                         .selectable(true)
                         .valign(gtk4::Align::Center)
                         .build();
+                    self.add_label_entry(&label, other.text(), offset);
                     row.append(&label);
                 }
             }
@@ -810,6 +926,295 @@ impl Session {
         let top = self.view.visible_rect().y();
         self.view.line_at_y(top).0.offset()
     }
+
+    /// Registers `text`, shown in `label` at buffer `offset`, as searchable.
+    fn add_label_entry(&self, label: &gtk4::Label, text: String, offset: i32) {
+        let mut search = self.search.borrow_mut();
+        let order = search.next_order;
+        search.next_order += 1;
+        search.entries.push(SearchEntry {
+            text,
+            offset,
+            order,
+            target: SearchTarget::Label(label.clone()),
+        });
+    }
+
+    /// Registers a whole diagram `card` as searchable for its label `text`.
+    fn add_diagram_entry(&self, card: &gtk4::Box, text: String, offset: i32) {
+        if text.is_empty() {
+            return;
+        }
+        let mut search = self.search.borrow_mut();
+        let order = search.next_order;
+        search.next_order += 1;
+        search.entries.push(SearchEntry {
+            text,
+            offset,
+            order,
+            target: SearchTarget::Diagram(card.clone()),
+        });
+    }
+
+    /// Runs a search for `query` in `mode`, replacing the current one, and
+    /// reports the outcome to the window.
+    fn search(&self, query: &str, mode: SearchMode) -> SearchSummary {
+        {
+            let mut search = self.search.borrow_mut();
+            search.query = query.to_string();
+            search.mode = mode;
+            search.error = false;
+            search.matcher = None;
+            search.matches.clear();
+            search.current = None;
+        }
+        if !query.is_empty() {
+            match Matcher::new(query, mode) {
+                Ok(matcher) => {
+                    self.search.borrow_mut().matcher = Some(matcher);
+                    self.collect_matches();
+                }
+                Err(_) => {
+                    self.search.borrow_mut().error = true;
+                }
+            }
+        }
+        self.choose_current_near_view();
+        self.apply_highlights();
+        self.scroll_current();
+        self.marks.queue_draw();
+        let summary = self.summary();
+        (self.search_changed)(summary);
+        summary
+    }
+
+    /// Steps the current match forward or backward, wrapping around.
+    fn navigate(&self, forward: bool) -> SearchSummary {
+        {
+            let mut search = self.search.borrow_mut();
+            search.current = search::next_index(search.current, search.matches.len(), forward);
+        }
+        self.apply_highlights();
+        self.scroll_current();
+        self.marks.queue_draw();
+        let summary = self.summary();
+        (self.search_changed)(summary);
+        summary
+    }
+
+    /// Clears the query and its highlights, keeping the mode.
+    fn clear_search(&self) {
+        {
+            let mut search = self.search.borrow_mut();
+            search.query.clear();
+            search.matcher = None;
+            search.error = false;
+            search.matches.clear();
+            search.current = None;
+        }
+        self.apply_highlights();
+        self.marks.queue_draw();
+        let summary = self.summary();
+        (self.search_changed)(summary);
+    }
+
+    /// Re-runs the search after more blocks were appended, keeping the
+    /// current match where it still exists.
+    fn refresh_search(&self) {
+        if self.search.borrow().query.is_empty() || self.search.borrow().error {
+            return;
+        }
+        let previous = {
+            let search = self.search.borrow();
+            search
+                .current
+                .and_then(|index| search.matches.get(index).map(|m| (m.offset, m.order)))
+        };
+        self.collect_matches();
+        {
+            let search = self.search.borrow();
+            let new_current = previous.and_then(|(offset, order)| {
+                search
+                    .matches
+                    .iter()
+                    .position(|m| m.offset == offset && m.order == order)
+            });
+            drop(search);
+            self.search.borrow_mut().current = new_current;
+        }
+        self.apply_highlights();
+        self.marks.queue_draw();
+        let summary = self.summary();
+        (self.search_changed)(summary);
+    }
+
+    /// Fills `search.matches` from the whole text buffer and every entry.
+    fn collect_matches(&self) {
+        let buffer = self.view.buffer();
+        let text = buffer
+            .text(&buffer.start_iter(), &buffer.end_iter(), true)
+            .to_string();
+        let matcher = self.search.borrow().matcher.clone();
+        let Some(matcher) = matcher else {
+            return;
+        };
+        let mut search = self.search.borrow_mut();
+        search.matches.clear();
+        search.current = None;
+        let byte_ranges = matcher.find(&text);
+        for chars in search::char_ranges(&text, &byte_ranges) {
+            search.matches.push(SearchMatch {
+                offset: chars.start as i32,
+                order: 0,
+                target: MatchTarget::Buffer {
+                    chars: chars.start as i32..chars.end as i32,
+                },
+            });
+        }
+        let mut entry_matches = Vec::new();
+        for (index, entry) in search.entries.iter().enumerate() {
+            for range in matcher.find(&entry.text) {
+                entry_matches.push(SearchMatch {
+                    offset: entry.offset,
+                    order: entry.order,
+                    target: MatchTarget::Entry {
+                        entry: index,
+                        range,
+                    },
+                });
+            }
+        }
+        search.matches.extend(entry_matches);
+        search.matches.sort_by_key(|m| (m.offset, m.order));
+    }
+
+    /// Picks the current match: the first at or after the top of the
+    /// window, or the first match overall.
+    fn choose_current_near_view(&self) {
+        let mut search = self.search.borrow_mut();
+        if search.matches.is_empty() {
+            search.current = None;
+            return;
+        }
+        let positions: Vec<i32> = search.matches.iter().map(|m| m.offset).collect();
+        let start = self.first_visible_offset();
+        search.current = Some(search::first_at_or_after(&positions, start).unwrap_or(0));
+    }
+
+    /// Applies (or clears) the match and current-match highlighting.
+    fn apply_highlights(&self) {
+        let buffer = self.view.buffer();
+        let start = buffer.start_iter();
+        let end = buffer.end_iter();
+        buffer.remove_tag_by_name(SEARCH_MATCH_TAG, &start, &end);
+        buffer.remove_tag_by_name(SEARCH_CURRENT_TAG, &start, &end);
+        {
+            let search = self.search.borrow();
+            let current = search.current;
+            for entry in &search.entries {
+                match &entry.target {
+                    SearchTarget::Label(label) => label.set_attributes(None),
+                    SearchTarget::Diagram(card) => {
+                        card.remove_css_class("md-search-hit");
+                        card.remove_css_class("md-search-current");
+                    }
+                }
+            }
+            let mut grouped: Vec<Vec<(std::ops::Range<usize>, bool)>> =
+                vec![Vec::new(); search.entries.len()];
+            for (index, m) in search.matches.iter().enumerate() {
+                match &m.target {
+                    MatchTarget::Buffer { chars } => {
+                        let tag = if Some(index) == current {
+                            SEARCH_CURRENT_TAG
+                        } else {
+                            SEARCH_MATCH_TAG
+                        };
+                        let start = buffer.iter_at_offset(chars.start);
+                        let end = buffer.iter_at_offset(chars.end);
+                        buffer.apply_tag_by_name(tag, &start, &end);
+                    }
+                    MatchTarget::Entry { entry, range } => {
+                        grouped[*entry].push((range.clone(), Some(index) == current));
+                    }
+                }
+            }
+            for (entry, ranges) in search.entries.iter().zip(grouped) {
+                if ranges.is_empty() {
+                    continue;
+                }
+                match &entry.target {
+                    SearchTarget::Label(label) => {
+                        label.set_attributes(Some(&highlight_attributes(&ranges)));
+                    }
+                    SearchTarget::Diagram(card) => {
+                        let current = ranges.iter().any(|(_, is_current)| *is_current);
+                        card.add_css_class(if current {
+                            "md-search-current"
+                        } else {
+                            "md-search-hit"
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// Scrolls the current match into view, a little below the top.
+    fn scroll_current(&self) {
+        let search = self.search.borrow();
+        let Some(current) = search.current else {
+            return;
+        };
+        let Some(m) = search.matches.get(current) else {
+            return;
+        };
+        let offset = m.offset;
+        drop(search);
+        let mut iter = self.view.buffer().iter_at_offset(offset);
+        self.view.scroll_to_iter(&mut iter, 0.15, true, 0.0, 0.3);
+    }
+
+    /// The current outcome of the search.
+    fn summary(&self) -> SearchSummary {
+        let search = self.search.borrow();
+        SearchSummary {
+            total: search.matches.len(),
+            current: search.current.map_or(0, |current| current + 1),
+            error: search.error,
+        }
+    }
+
+    /// Draws the scrollbar marks for the matches.
+    fn draw_marks(&self, cr: &gtk4::cairo::Context, width: f64, height: f64) {
+        let search = self.search.borrow();
+        if search.matches.is_empty() {
+            return;
+        }
+        let buffer = self.view.buffer();
+        let (end_top, end_height) = self.view.line_yrange(&buffer.end_iter());
+        let total = f64::from(end_top + end_height);
+        if total <= 0.0 || height <= 0.0 {
+            return;
+        }
+        let current = search.current;
+        let mark_height = layout::SEARCH_MARK_HEIGHT;
+        for (index, m) in search.matches.iter().enumerate() {
+            let iter = buffer.iter_at_offset(m.offset);
+            let (top, line_height) = self.view.line_yrange(&iter);
+            let centre = f64::from(top) + f64::from(line_height) / 2.0;
+            let fraction = (centre / total).clamp(0.0, 1.0);
+            let y = layout::search_mark_y(fraction, height, mark_height);
+            if Some(index) == current {
+                cr.set_source_rgba(1.0, 0.57, 0.0, 0.9);
+                cr.rectangle(0.0, y, width, mark_height);
+            } else {
+                cr.set_source_rgba(0.95, 0.78, 0.1, 0.65);
+                cr.rectangle(width / 2.0 - 1.5, y, 3.0, mark_height);
+            }
+            let _ = cr.fill();
+        }
+    }
 }
 
 /// Makes mostly vertical scrolling over `inner` (a table's scroller, which
@@ -834,8 +1239,9 @@ fn pass_vertical_scrolls(inner: &gtk4::ScrolledWindow, outer: &gtk4::ScrolledWin
 }
 
 /// Builds a code card: a header row with the language (if any) and a copy
-/// button, over the code in a horizontal scroller.
-fn code_card(code: &CodeBlock) -> gtk4::Box {
+/// button, over the code in a horizontal scroller. Returns the card and its
+/// code label (which the find bar searches).
+fn code_card(code: &CodeBlock) -> (gtk4::Box, gtk4::Label) {
     let header = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
         .css_classes(["md-code-header"])
@@ -872,7 +1278,7 @@ fn code_card(code: &CodeBlock) -> gtk4::Box {
         .build();
     card.append(&header);
     card.append(&scroller);
-    card
+    (card, text)
 }
 
 /// A flat button that copies `text` to the clipboard, briefly showing a
@@ -927,6 +1333,16 @@ struct DocWindow {
     zoom_css: gtk4::CssProvider,
     /// The text size at 100% zoom, in pixels.
     base_px: f32,
+    /// The find bar and its widgets.
+    search_bar: gtk4::SearchBar,
+    search_entry: gtk4::SearchEntry,
+    search_status: gtk4::Label,
+    search_prev: gtk4::Button,
+    search_next: gtk4::Button,
+    search_mode_button: gtk4::MenuButton,
+    /// The find bar's matching mode, kept for the window (and its future
+    /// documents); a new window starts with smart case.
+    mode: Cell<SearchMode>,
 }
 
 impl DocWindow {
@@ -951,6 +1367,48 @@ impl DocWindow {
         let toolbar = adw::ToolbarView::new();
         toolbar.add_top_bar(&header);
         toolbar.set_content(Some(&start_page()));
+
+        let search_entry = gtk4::SearchEntry::builder()
+            .placeholder_text("Search document")
+            .width_chars(24)
+            .hexpand(true)
+            .build();
+        let search_status = gtk4::Label::builder().css_classes(["dim-label"]).build();
+        let search_prev = gtk4::Button::builder()
+            .icon_name("go-up-symbolic")
+            .tooltip_text("Previous match")
+            .css_classes(["flat"])
+            .sensitive(false)
+            .build();
+        let search_next = gtk4::Button::builder()
+            .icon_name("go-down-symbolic")
+            .tooltip_text("Next match (Enter)")
+            .css_classes(["flat"])
+            .sensitive(false)
+            .build();
+        let search_mode_button = gtk4::MenuButton::builder()
+            .label(SearchMode::SmartCase.short())
+            .tooltip_text("Search mode")
+            .css_classes(["flat"])
+            .build();
+        let search_box = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(6)
+            .margin_start(12)
+            .margin_end(12)
+            .margin_top(6)
+            .margin_bottom(6)
+            .build();
+        search_box.append(&search_entry);
+        search_box.append(&search_status);
+        search_box.append(&search_prev);
+        search_box.append(&search_next);
+        search_box.append(&search_mode_button);
+        let search_bar = gtk4::SearchBar::builder()
+            .child(&search_box)
+            .show_close_button(true)
+            .build();
+        search_bar.connect_entry(&search_entry);
 
         let window = adw::ApplicationWindow::builder()
             .application(app)
@@ -979,6 +1437,13 @@ impl DocWindow {
             zoom_class: format!("md-zoom-{number}"),
             zoom_css: gtk4::CssProvider::new(),
             base_px,
+            search_bar,
+            search_entry,
+            search_status,
+            search_prev,
+            search_next,
+            search_mode_button,
+            mode: Cell::new(SearchMode::SmartCase),
         });
         add_css(
             &this.zoom_css,
@@ -994,12 +1459,127 @@ impl DocWindow {
         open.connect_activate(move |_, _| choose_file(&state));
         this.window.add_action(&open);
         this.install_zoom();
+        this.install_search();
         this.window.connect_close_request(|window| {
             window.remove_action("open");
             glib::Propagation::Proceed
         });
         this.window.present();
         this
+    }
+
+    /// Installs the find action (Ctrl+F), the mode popover and the key
+    /// bindings for `/`, `n`, `N` and Escape, and the find bar's signals.
+    fn install_search(self: &Rc<Self>) {
+        let find = gio::SimpleAction::new("find", None);
+        let state = Rc::downgrade(self);
+        find.connect_activate(move |_, _| {
+            if let Some(state) = state.upgrade() {
+                state.open_search();
+            }
+        });
+        self.window.add_action(&find);
+
+        let keys = gtk4::EventControllerKey::new();
+        keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let state = Rc::downgrade(self);
+        keys.connect_key_pressed(move |_, keyval, _, modifiers| {
+            let Some(state) = state.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            state.handle_key(keyval, modifiers)
+        });
+        self.window.add_controller(keys);
+
+        let weak = Rc::downgrade(self);
+        self.search_entry.connect_search_changed(move |entry| {
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
+            let query = entry.text().to_string();
+            let mode = state.mode.get();
+            let session = state.session.borrow().clone();
+            if let Some(session) = session {
+                session.search(&query, mode);
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.search_entry.connect_activate(move |_| {
+            if let Some(state) = weak.upgrade() {
+                state.navigate_from_key(true);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.search_entry.connect_next_match(move |_| {
+            if let Some(state) = weak.upgrade() {
+                state.navigate_from_key(true);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.search_entry.connect_previous_match(move |_| {
+            if let Some(state) = weak.upgrade() {
+                state.navigate_from_key(false);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.search_entry.connect_stop_search(move |_| {
+            if let Some(state) = weak.upgrade() {
+                state.search_bar.set_search_mode(false);
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.search_prev.connect_clicked(move |_| {
+            if let Some(state) = weak.upgrade() {
+                state.navigate_from_key(false);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.search_next.connect_clicked(move |_| {
+            if let Some(state) = weak.upgrade() {
+                state.navigate_from_key(true);
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.search_bar
+            .connect_search_mode_enabled_notify(move |bar| {
+                if !bar.is_search_mode() {
+                    if let Some(state) = weak.upgrade() {
+                        state.focus_view();
+                    }
+                }
+            });
+
+        let popover = gtk4::Popover::new();
+        let choices = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .build();
+        let mut group: Option<gtk4::CheckButton> = None;
+        for (index, mode) in SearchMode::ALL.iter().enumerate() {
+            let button = gtk4::CheckButton::with_label(mode.label());
+            if index == 0 {
+                button.set_active(true);
+            } else {
+                button.set_group(group.as_ref());
+            }
+            if group.is_none() {
+                group = Some(button.clone());
+            }
+            let weak = Rc::downgrade(self);
+            let mode = *mode;
+            button.connect_toggled(move |button| {
+                if button.is_active() {
+                    if let Some(state) = weak.upgrade() {
+                        state.set_search_mode(mode);
+                    }
+                }
+            });
+            choices.append(&button);
+        }
+        popover.set_child(Some(&choices));
+        self.search_mode_button.set_popover(Some(&popover));
     }
 
     /// Installs the zoom actions, Ctrl+scroll and the pinch gesture.
@@ -1082,13 +1662,122 @@ impl DocWindow {
         }
     }
 
+    /// Opens the find bar over the current document and focuses its entry.
+    fn open_search(&self) {
+        if self.session.borrow().is_none() {
+            return;
+        }
+        self.search_bar.set_search_mode(true);
+        self.search_entry.grab_focus();
+        self.search_entry.select_region(0, -1);
+    }
+
+    /// Handles a key press on the window (ignored while the search entry is
+    /// focused, so typing works normally): `/` opens the find bar, `n`/`N`
+    /// step between matches, and Escape hides the bar or clears the search.
+    fn handle_key(&self, keyval: gdk::Key, modifiers: gdk::ModifierType) -> glib::Propagation {
+        let in_entry = gtk4::prelude::RootExt::focus(&self.window)
+            .is_some_and(|focus| focus == self.search_entry.clone().upcast::<gtk4::Widget>());
+        if in_entry
+            || modifiers.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK)
+        {
+            return glib::Propagation::Proceed;
+        }
+        match keyval {
+            gdk::Key::slash => {
+                self.open_search();
+                glib::Propagation::Stop
+            }
+            gdk::Key::n => {
+                self.navigate_from_key(true);
+                glib::Propagation::Stop
+            }
+            gdk::Key::N => {
+                self.navigate_from_key(false);
+                glib::Propagation::Stop
+            }
+            gdk::Key::Escape => {
+                self.escape_search();
+                glib::Propagation::Stop
+            }
+            _ => glib::Propagation::Proceed,
+        }
+    }
+
+    /// Steps to the next (`forward`) or previous match, if there is a query.
+    fn navigate_from_key(&self, forward: bool) {
+        if let Some(session) = self.session.borrow().as_ref() {
+            session.navigate(forward);
+        }
+    }
+
+    /// Hides the find bar (keeping the query and highlights, so `n`/`N`
+    /// still work) or, when it is already hidden, clears the search.
+    fn escape_search(&self) {
+        if self.search_bar.is_search_mode() {
+            self.search_bar.set_search_mode(false);
+        } else if let Some(session) = self.session.borrow().as_ref() {
+            session.clear_search();
+        }
+    }
+
+    /// Puts the keyboard focus back on the document.
+    fn focus_view(&self) {
+        if let Some(session) = self.session.borrow().as_ref() {
+            session.view.grab_focus();
+        }
+    }
+
+    /// Switches the find bar to `mode`, re-running the current query.
+    fn set_search_mode(self: &Rc<Self>, mode: SearchMode) {
+        if self.mode.get() == mode {
+            return;
+        }
+        self.mode.set(mode);
+        self.search_mode_button.set_label(mode.short());
+        self.search_mode_button.set_tooltip_text(Some(mode.label()));
+        if let Some(session) = self.session.borrow().as_ref() {
+            let query = self.search_entry.text().to_string();
+            session.search(&query, mode);
+        }
+    }
+
+    /// Updates the find bar's count and buttons from a search outcome.
+    fn show_search_summary(&self, summary: SearchSummary) {
+        if summary.error {
+            self.search_entry.add_css_class("error");
+            self.search_status.set_label("Invalid pattern");
+            self.search_prev.set_sensitive(false);
+            self.search_next.set_sensitive(false);
+            return;
+        }
+        self.search_entry.remove_css_class("error");
+        if summary.total == 0 {
+            let text = if self.search_entry.text().is_empty() {
+                ""
+            } else {
+                "No results"
+            };
+            self.search_status.set_label(text);
+            self.search_prev.set_sensitive(false);
+            self.search_next.set_sensitive(false);
+            return;
+        }
+        self.search_status
+            .set_label(&format!("{} of {}", summary.current, summary.total));
+        self.search_prev.set_sensitive(true);
+        self.search_next.set_sensitive(true);
+    }
+
     /// Replaces the window's content with a fresh document view titled
     /// after `path`, covered by a loading spinner, and returns the session
-    /// for `blocks`.
-    fn show_document(&self, path: &Path, mut blocks: Vec<Block>) -> Rc<Session> {
+    /// for `blocks`. The find bar is hidden and cleared for the new
+    /// document.
+    fn show_document(self: &Rc<Self>, path: &Path, mut blocks: Vec<Block>) -> Rc<Session> {
         if let Some(old) = self.session.take() {
             old.pool.replace(None);
         }
+        self.search_bar.set_search_mode(false);
         let view = gtk4::TextView::builder()
             .editable(false)
             .cursor_visible(false)
@@ -1123,14 +1812,39 @@ impl DocWindow {
             .reveal_child(true)
             .child(&cover_box)
             .build();
+        // The strip over the scrollbar's right edge that marks matches; it
+        // must not catch clicks, and it sits under the cover so it is hidden
+        // while the first screen loads.
+        let marks = gtk4::DrawingArea::builder()
+            .width_request(6)
+            .halign(gtk4::Align::End)
+            .valign(gtk4::Align::Fill)
+            .can_target(false)
+            .build();
         let overlay = gtk4::Overlay::builder().child(&scrolled).build();
+        overlay.add_overlay(&marks);
         overlay.add_overlay(&cover);
-        self.toolbar.set_content(Some(&overlay));
+        overlay.set_vexpand(true);
+        overlay.set_hexpand(true);
+        let content = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .build();
+        content.append(&self.search_bar);
+        content.append(&overlay);
+        self.toolbar.set_content(Some(&content));
         self.window.set_title(Some(&md_viewer::window_title(path)));
         self.document.replace(Some(path.to_path_buf()));
 
         let jobs = progressive::jobs(&mut blocks);
         let (sender, receiver) = mpsc::channel();
+        let search_changed = {
+            let window = Rc::downgrade(self);
+            Box::new(move |summary| {
+                if let Some(window) = window.upgrade() {
+                    window.show_search_summary(summary);
+                }
+            })
+        };
         let session = Rc::new(Session {
             view,
             scrolled,
@@ -1154,6 +1868,9 @@ impl DocWindow {
             receiver,
             sender: Mutex::new(sender),
             polling: Cell::new(false),
+            search: RefCell::new(Search::default()),
+            marks,
+            search_changed,
         });
         {
             let weak = Rc::downgrade(&session);
@@ -1163,6 +1880,22 @@ impl DocWindow {
                     session.keep_anchor();
                 }
                 glib::ControlFlow::Continue
+            });
+        }
+        {
+            let weak = Rc::downgrade(&session);
+            session.marks.set_draw_func(move |_, cr, width, height| {
+                if let Some(session) = weak.upgrade() {
+                    session.draw_marks(cr, f64::from(width), f64::from(height));
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&session);
+            session.scrolled.vadjustment().connect_changed(move |_| {
+                if let Some(session) = weak.upgrade() {
+                    session.marks.queue_draw();
+                }
             });
         }
         let weak: Weak<Session> = Rc::downgrade(&session);
@@ -1177,6 +1910,11 @@ impl DocWindow {
             },
         );
         self.session.replace(Some(session.clone()));
+        // Clearing the entry triggers a search on the new, empty session.
+        self.search_entry.set_text("");
+        self.search_status.set_label("");
+        self.search_prev.set_sensitive(false);
+        self.search_next.set_sensitive(false);
         session
     }
 
@@ -1320,8 +2058,36 @@ fn insert_styled(buffer: &gtk4::TextBuffer, text: &str, styles: &[Style]) {
     buffer.insert_with_tags_by_name(&mut buffer.end_iter(), text, &names);
 }
 
+/// Builds the Pango attributes highlighting `ranges` of a label: a light
+/// background for every match, a stronger one (with dark text) for the
+/// current match.
+fn highlight_attributes(ranges: &[(std::ops::Range<usize>, bool)]) -> pango::AttrList {
+    let list = pango::AttrList::new();
+    for (range, current) in ranges {
+        let background = if *current {
+            SEARCH_CURRENT_RGB
+        } else {
+            SEARCH_MATCH_RGB
+        };
+        let mut background_attr =
+            pango::AttrColor::new_background(background.0, background.1, background.2);
+        background_attr.set_start_index(range.start as u32);
+        background_attr.set_end_index(range.end as u32);
+        list.insert(background_attr);
+        let mut foreground_attr = pango::AttrColor::new_foreground(
+            SEARCH_TEXT_RGB.0,
+            SEARCH_TEXT_RGB.1,
+            SEARCH_TEXT_RGB.2,
+        );
+        foreground_attr.set_start_index(range.start as u32);
+        foreground_attr.set_end_index(range.end as u32);
+        list.insert(foreground_attr);
+    }
+    list
+}
+
 /// Registers one text tag per [`Style`] in `table`, plus the display math
-/// centring tag.
+/// centring tag and the two search tags.
 fn create_tags(table: &gtk4::TextTagTable) {
     for style in Style::ALL {
         table.add(&tag_for(style));
@@ -1332,6 +2098,22 @@ fn create_tags(table: &gtk4::TextTagTable) {
             .justification(gtk4::Justification::Center)
             .pixels_above_lines(4)
             .pixels_below_lines(4)
+            .build(),
+    );
+    let mut match_background = gdk::RGBA::parse("#ffd500").expect("valid colour");
+    match_background.set_alpha(0.45);
+    table.add(
+        &gtk4::TextTag::builder()
+            .name(SEARCH_MATCH_TAG)
+            .background_rgba(&match_background)
+            .build(),
+    );
+    let mut current_background = gdk::RGBA::parse("#ff9100").expect("valid colour");
+    current_background.set_alpha(0.6);
+    table.add(
+        &gtk4::TextTag::builder()
+            .name(SEARCH_CURRENT_TAG)
+            .background_rgba(&current_background)
             .build(),
     );
 }

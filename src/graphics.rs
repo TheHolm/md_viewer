@@ -32,6 +32,10 @@ pub struct Image {
     pub depth: f32,
     /// Premultiplied RGBA pixels, row by row, `width * 4` bytes per row.
     pub pixels: Vec<u8>,
+    /// The text drawn in the SVG, in reading order. Diagrams use this for
+    /// the find bar (their labels are otherwise only pixels); formulas draw
+    /// outlines, so their list is empty.
+    pub labels: Vec<String>,
 }
 
 impl Image {
@@ -151,6 +155,7 @@ fn svg_options(font_px: f32) -> usvg::Options<'static> {
 /// resolving to `font_px`. Fails on invalid SVG or an empty image.
 pub fn rasterize(svg: &str, font_px: f32, scale: f32) -> Rendered {
     let tree = usvg::Tree::from_str(svg, &svg_options(font_px)).map_err(|e| e.to_string())?;
+    let labels = text_labels(&tree);
     let size = tree.size();
     let width = (size.width() * scale).ceil() as u32;
     let height = (size.height() * scale).ceil() as u32;
@@ -167,7 +172,37 @@ pub fn rasterize(svg: &str, font_px: f32, scale: f32) -> Rendered {
         scale,
         depth: 0.0,
         pixels: pixmap.take(),
+        labels,
     })
+}
+
+/// Every text node drawn in `tree`, as its decoded text, in document order
+/// (a multi-line label is one node per line). `use` elements are expanded by
+/// usvg, so labels appear at their drawn position rather than in the
+/// `<defs>` they are stored in.
+fn text_labels(tree: &usvg::Tree) -> Vec<String> {
+    fn walk(group: &usvg::Group, labels: &mut Vec<String>) {
+        for node in group.children() {
+            match node {
+                usvg::Node::Group(group) => walk(group, labels),
+                usvg::Node::Text(text) => {
+                    let text: String = text
+                        .chunks()
+                        .iter()
+                        .map(usvg::TextChunk::text)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !text.is_empty() {
+                        labels.push(text);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut labels = Vec::new();
+    walk(tree.root(), &mut labels);
+    labels
 }
 
 /// Formats an RGB colour as `#rrggbb`.
@@ -214,6 +249,9 @@ pub fn render_math(tex: &str, display: bool, settings: &RasterSettings) -> Rende
     let svg = svg.replace("currentColor", &hex_color(settings.color));
     let mut image = rasterize(&svg, font_px, settings.scale)?;
     image.depth = math_depth_em(&svg) * font_px;
+    // Formulas are drawn as outlines; any SVG text mathra emits is not the
+    // TeX source, so it is never offered to the find bar.
+    image.labels.clear();
     Ok(image)
 }
 
