@@ -1051,9 +1051,7 @@ impl Session {
     /// Fills `search.matches` from the whole text buffer and every entry.
     fn collect_matches(&self) {
         let buffer = self.view.buffer();
-        let text = buffer
-            .text(&buffer.start_iter(), &buffer.end_iter(), true)
-            .to_string();
+        let text = searchable_text(&buffer);
         let matcher = self.search.borrow().matcher.clone();
         let Some(matcher) = matcher else {
             return;
@@ -2058,6 +2056,17 @@ fn insert_styled(buffer: &gtk4::TextBuffer, text: &str, styles: &[Style]) {
     buffer.insert_with_tags_by_name(&mut buffer.end_iter(), text, &names);
 }
 
+/// The whole buffer's text with embedded objects (child anchors and
+/// paintables) represented by U+FFFC, so that character indexes into the
+/// string match buffer offsets. `TextBuffer::text` omits those characters,
+/// which would drift every match after a table, code card, diagram or
+/// formula; `slice` keeps them.
+fn searchable_text(buffer: &gtk4::TextBuffer) -> String {
+    buffer
+        .slice(&buffer.start_iter(), &buffer.end_iter(), true)
+        .to_string()
+}
+
 /// Builds the Pango attributes highlighting `ranges` of a label: a light
 /// background for every match, a stronger one (with dark text) for the
 /// current match.
@@ -2256,5 +2265,35 @@ impl ScaledTexture {
         self.invalidate_size();
         self.invalidate_contents();
         (imp.width.get() as f32, imp.height.get() as f32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The text searched for the buffer keeps character indexes aligned with
+    /// buffer offsets: an embedded child anchor becomes U+FFFC in the search
+    /// text (via `slice`), while `TextBuffer::text` drops it. Needs a
+    /// display, so it is skipped when GTK cannot initialize.
+    #[test]
+    fn searchable_text_keeps_offsets_aligned() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let buffer = gtk4::TextBuffer::new(None);
+        buffer.insert(&mut buffer.end_iter(), "ab");
+        buffer.create_child_anchor(&mut buffer.end_iter());
+        buffer.insert(&mut buffer.end_iter(), "cd");
+        let text = searchable_text(&buffer);
+        assert_eq!(text.chars().count(), buffer.end_iter().offset() as usize);
+        assert_eq!(text.chars().filter(|&c| c == '\u{fffc}').count(), 1);
+        assert_eq!(
+            buffer
+                .text(&buffer.start_iter(), &buffer.end_iter(), true)
+                .chars()
+                .count(),
+            4
+        );
     }
 }

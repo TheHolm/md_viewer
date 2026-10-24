@@ -20,6 +20,9 @@ section for the GitHub Release body.
 - A button next to the search field switches between smart case (the
   default), ignore case and regular expressions; an invalid pattern is
   reported in the bar.
+- Fixed: highlights were offset (highlighting the wrong characters) after a
+  table, code card, diagram or formula, because the buffer text searched
+  omitted the embedded objects whose characters buffer offsets count.
 
 ### Details
 
@@ -36,7 +39,9 @@ section for the GitHub Release body.
   per table-cell label, code-card label and diagram, highlighted with text
   tags, Pango attributes and a CSS class respectively. Marks are drawn on
   a `DrawingArea` over the scrollbar, and the search re-runs as blocks are
-  appended while a document loads.
+  appended while a document loads. The buffer is searched via
+  `TextBuffer::slice`, which keeps embedded objects as U+FFFC so its
+  character indexes match buffer offsets.
 
 ## v0.4.0 — Zoom, copyable code blocks, faster loading
 

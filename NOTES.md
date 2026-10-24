@@ -435,6 +435,11 @@ Things learned the hard way; add to this list when you learn another.
   byte ranges; `search::char_ranges` maps them. Pango `AttrList` indices
   (used to highlight table and code labels) are byte offsets into the
   label's text, so the byte ranges are used directly there.
+- `TextBuffer::text` (`get_text`) omits the U+FFFC characters that represent
+  embedded child anchors and paintables, so its indexes drift from buffer
+  offsets; `TextBuffer::slice` (`get_slice`) keeps them. The find bar uses
+  `slice` (`searchable_text` in `main.rs`) so highlights do not shift after
+  tables, code cards, diagrams or formulas.
 - A search started while a document is still loading only covers what is on
   the page so far; `append_ready` re-runs it as blocks arrive, so the count
   and marks grow until loading finishes.
