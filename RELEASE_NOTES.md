@@ -6,6 +6,38 @@ changes** summary (what also appears in the GitHub Release body) and a
 added at the top. `scripts/extract-release-notes.sh` prints just one release's
 section for the GitHub Release body.
 
+## v0.5.0 — Search
+
+### User-facing changes
+
+- Find text with Ctrl+F or `/`: matches are highlighted in the text, tables
+  and code, and a match inside a diagram highlights the whole diagram.
+- Step through matches with Enter / `n` / `N` (or Ctrl+G / Ctrl+Shift+G)
+  and the up/down buttons in the find bar; every match is marked on the
+  scrollbar, with the current one emphasised.
+- Escape closes the find bar but keeps the highlights so `n`/`N` still
+  work; a second Escape clears the search.
+- A button next to the search field switches between smart case (the
+  default), ignore case and regular expressions; an invalid pattern is
+  reported in the bar.
+
+### Details
+
+- Version 0.4.0 → 0.5.0 (new feature).
+- New `md_viewer::search`: `SearchMode` (smart case, ignore case, regex),
+  `Matcher` (a query compiled once; byte-range matches; Unicode case
+  folding; zero-width regex matches skipped), `char_ranges` and the match
+  navigation helpers. The `regex` dependency is added.
+- `graphics::rasterize` now collects the SVG's text nodes into
+  `Image::labels`, so the find bar can search diagram text; `render_math`
+  clears them (formulas are outlines, so their TeX source is not
+  searchable). A diagram match highlights its whole card.
+- The GUI keeps a `Search` per `Session`: the text buffer plus one entry
+  per table-cell label, code-card label and diagram, highlighted with text
+  tags, Pango attributes and a CSS class respectively. Marks are drawn on
+  a `DrawingArea` over the scrollbar, and the search re-runs as blocks are
+  appended while a document loads.
+
 ## v0.4.0 — Zoom, copyable code blocks, faster loading
 
 ### User-facing changes

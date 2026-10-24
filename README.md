@@ -21,6 +21,14 @@ Zoom with Ctrl+mouse wheel, Ctrl+plus / Ctrl+minus (Ctrl+0 resets to 100%)
 or a touchpad pinch, from 50% to 300%: text, tables, code, formulas and
 diagrams all grow, and the part you are reading stays in place.
 
+Find text with Ctrl+F or `/`: matches are highlighted in the text, tables
+and code, marked on the scrollbar, and a matching label inside a diagram
+highlights the whole diagram. Step through matches with Enter / `n` / `N`
+(or Ctrl+G / Ctrl+Shift+G) and the up/down buttons in the find bar. Escape
+closes the bar but keeps the highlights so `n`/`N` still work; a second
+Escape clears the search. A button next to the search field switches
+between smart case (the default), ignore case and regular expressions.
+
 Large documents appear quickly: the first screen is shown as soon as it is
 ready (a spinner fills the window until then), and the rest is added below
 while a small spinner in the header bar turns. Formulas and diagrams are

@@ -34,6 +34,7 @@ Raise them only when every target platform ships the newer version.
   Rust; used through its resvg-safe pipeline (labels as SVG text)
 - `resvg` (features `text`, `system-fonts`, `memmap-fonts`) - rasterizes
   every SVG; SVG text uses the system fonts
+- `regex` - the find bar's regular-expression mode, pure Rust
 - `clap` - command line argument parsing (the `FILE` argument)
 - `tempfile` (dev-dependency) - temporary files for integration tests
 
@@ -106,6 +107,18 @@ run there; runtime verification on a real FreeBSD system is a manual step.
     (`pass_vertical_scrolls`); horizontal scrolling still scrolls the table.
   - Widget styling is the `CSS` constant; sizes and classes come from
     `md_viewer::layout`.
+  - Search (Ctrl+F or `/`) shows a `GtkSearchBar` above the document with a
+    search entry, count label, previous/next buttons and a mode button
+    (smart case, ignore case, regex). A `Session` keeps a `Search`: the
+    whole text buffer is one search source, and every table-cell label,
+    code-card label and diagram (its extracted labels joined) is a
+    `SearchEntry` registered as it is appended. Matches are highlighted
+    with text tags (buffer), Pango attributes (labels) or a CSS class
+    (diagram cards), the current match scrolls into view, and a narrow
+    `DrawingArea` over the scrollbar's right edge draws a mark per match.
+    `/`, `n`, `N` and Escape are a capture-phase key controller on the
+    window that lets keys through while the search entry is focused.
+    Searching re-runs as blocks are appended while loading.
 - `src/lib.rs` - all non-GUI logic, exposed publicly so the GUI and the
   integration tests share exactly one implementation: the app version
   (`version`, the `VERSION` file embedded at compile time), the application
@@ -137,7 +150,9 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   database is loaded once and generic `sans-serif` is pointed at an
   installed family, GNOME's Adwaita Sans first, see `pick_family`) and
   `render_document`, which fills in every graphic of a rendered document one
-  after another. `RasterSettings` carries the text size, device scale, text
+  after another. `rasterize` also collects every SVG text node into
+  `Image::labels` (usvg expands `<use>`, so a diagram's labels are found at
+  their drawn positions); math clears them because it draws outlines. `RasterSettings` carries the text size, device scale, text
   colour and zoom (math is typeset at `font_px * zoom`, diagrams drawn
   `zoom` times their natural size). Diagram labels are measured with the
   same font files resvg draws them with (merman's `native-fonts`,
@@ -165,6 +180,13 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   widths, scroll distances passed on from tables, the zoom anchor
   arithmetic and a few GUI timings. `main.rs` only applies the results to
   widgets.
+- `src/search.rs` (`md_viewer::search`) - the find bar's matching, pure
+  and tested: `SearchMode` (smart case, ignore case, regex), `Matcher`
+  (a query compiled once; `find` returns byte ranges; Unicode case
+  folding maps each folded byte back to its source character, and
+  zero-width regex matches are skipped), `char_ranges` (byte to
+  character-offset ranges for the text buffer) and the match navigation
+  helpers (`next_index`, `first_at_or_after`).
 - `tests/` - integration tests split by topic:
   - `render.rs` - the renderer: one group of tests per block type
     (paragraphs, headings, lists, block quotes, code blocks, rules, tables,
@@ -175,6 +197,8 @@ run there; runtime verification on a real FreeBSD system is a manual step.
     showcase fixture renders, and that the root `showcase.md` renders with
     no fallbacks at all (every formula and diagram `Ok`)
   - `layout.rs` - the `md_viewer::layout` functions
+  - `search.rs` - the find bar's matcher and navigation helpers (modes,
+    smart case, ignore case, regex, Unicode folding)
   - `progressive.rs` - numbering and placing graphics, `Progress`,
     `zoom_order`, `Phase`, worker counts and the `Pool` (delivers every
     result, stops when cancelled or dropped)
@@ -285,6 +309,11 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   is ever dropped.
 - Images show as `[image: <alt text>]`; the image itself is not loaded.
 - Adjacent text with identical styles is merged into one span.
+- Search matches the rendered document: the whole text buffer (including
+  fallback sources), table-cell text, code-card text and the labels inside
+  diagrams; formula source is not searchable (a rendered formula is
+  pixels). Matches are found per source and kept in document order by
+  buffer offset; a diagram match highlights its whole card.
 
 ## Versioning
 
@@ -402,6 +431,13 @@ Things learned the hard way; add to this list when you learn another.
 - Stopping a viewer started in the background: use `pkill -x md_viewer`.
   `pkill -f md_viewer` also matches the shell running the command (its
   command line contains the pattern) and kills or hangs it.
+- Text buffer offsets count characters, but `search::Matcher::find` returns
+  byte ranges; `search::char_ranges` maps them. Pango `AttrList` indices
+  (used to highlight table and code labels) are byte offsets into the
+  label's text, so the byte ranges are used directly there.
+- A search started while a document is still loading only covers what is on
+  the page so far; `append_ready` re-runs it as blocks arrive, so the count
+  and marks grow until loading finishes.
 
 ### Checking graphics visually
 

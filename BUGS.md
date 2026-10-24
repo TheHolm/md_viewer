@@ -37,6 +37,13 @@ Background on the rendering crates is in `NOTES.md`.
 - The `.desktop` file and icons are only installed by the packages; a binary
   built from source shows a generic icon under GNOME unless they are copied
   into `~/.local/share` (see the README).
+- Search does not cover the source of a rendered formula (it is drawn as
+  pixels); only the fallback source shown for a formula that could not be
+  rendered is searchable.
+- A match inside a diagram highlights the whole diagram card, not the exact
+  label characters.
+- A search started while a document is still loading only covers the part
+  already on the page; its results grow as blocks are appended.
 
 ## Testing gaps
 
@@ -46,3 +53,7 @@ Background on the rendering crates is in `NOTES.md`.
   button need input events, so the GUI tests do not reach them; the
   library logic behind them is tested, and the GUI is checked by hand (or
   with `xdotool` on Xvfb, see `NOTES.md`).
+- The find bar (Ctrl+F, `/`, highlighting, marks and the mode popover)
+  needs input events too, so the GUI tests only confirm the viewer starts
+  and exits cleanly with it installed; the matching logic is fully tested
+  and the interaction is checked by hand.
