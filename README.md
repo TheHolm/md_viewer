@@ -1,6 +1,8 @@
 # md_viewer
 
-**!!! WORK IN PROGRESS !!!**
+# THIS IS VIBE CODED GARBAGE, USE AT YOUR OWN RISK
+
+I did not check what is in the code at all, so who knows what it is really doing.
 
 A simple GTK4/libadwaita program for viewing Markdown documents. It opens a
 file, renders it read-only in a scrollable window, and never modifies it.
@@ -152,3 +154,4 @@ Planned features. Known bugs are listed in `BUGS.md`.
 * Remember the zoom level between runs.
 * For very large documents, render graphics far below the window only when
   scrolled near (today everything is rendered, first screen first).
+* Package as Flatpak and publish on Flathub.
