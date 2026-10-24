@@ -141,6 +141,32 @@ pub fn pango_channel(value: u8) -> u16 {
     u16::from(value) * 257
 }
 
+/// Parses a `#rrggbb` colour into Pango's 16-bit channels, or `None` when
+/// the string is not a valid hex colour.
+pub fn pango_color(hex: &str) -> Option<(u16, u16, u16)> {
+    let hex = hex.strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+    let value = |range: std::ops::Range<usize>| {
+        u8::from_str_radix(hex.get(range)?, 16)
+            .ok()
+            .map(pango_channel)
+    };
+    Some((value(0..2)?, value(2..4)?, value(4..6)?))
+}
+
+/// Parses a percentage like `"15%"` into Pango's 16-bit alpha channel
+/// (0-65535); anything unparseable is fully transparent.
+pub fn percent_alpha(percent: &str) -> u16 {
+    let value = percent
+        .trim()
+        .trim_end_matches('%')
+        .parse::<f64>()
+        .unwrap_or(0.0);
+    (value.clamp(0.0, 100.0) / 100.0 * 65535.0).round() as u16
+}
+
 /// The font scale of a heading level (1 largest); levels past 6 use the
 /// level 6 scale.
 pub fn heading_scale(level: u8) -> f64 {

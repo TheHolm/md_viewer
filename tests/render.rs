@@ -2,8 +2,8 @@
 //! by block type and by inline style.
 
 use md_viewer::{
-    code_language, is_mermaid_info, render, Align, Block, Cell, CodeBlock, Diagram, Inline, Math,
-    Span, Style, Table, RULE_TEXT,
+    code_language, is_mermaid_info, label_text, render, Align, Block, Cell, CodeBlock, Diagram,
+    Inline, Math, Span, Style, Table, RULE_TEXT,
 };
 
 /// Renders `source` and flattens every text block into one list of spans,
@@ -987,6 +987,66 @@ fn pango_markup_code_and_link() {
     let link = md_viewer::pango_markup(&[Inline::Text(span("l", &[Style::Link]))]);
     assert!(link.contains(&format!("foreground=\"{}\"", md_viewer::LINK_COLOR)));
     assert!(link.contains("underline=\"single\""));
+}
+
+// --- Label text (plain text + style runs) ---------------------------------
+
+/// `label_text` flattens inlines into plain text plus one style run per
+/// span, addressed by byte offsets into the text.
+#[test]
+fn label_text_runs_and_offsets() {
+    let inlines = vec![
+        Inline::Text(span("a", &[Style::Strong])),
+        Inline::Text(span(" ", &[])),
+        Inline::Text(span("b", &[Style::Emphasis])),
+    ];
+    let content = label_text(&inlines);
+    assert_eq!(content.text, "a b");
+    assert_eq!(
+        content.runs,
+        vec![
+            md_viewer::StyledRun {
+                range: 0..1,
+                styles: vec![Style::Strong],
+            },
+            md_viewer::StyledRun {
+                range: 2..3,
+                styles: vec![Style::Emphasis],
+            },
+        ]
+    );
+}
+
+/// A formula in a label becomes its source in code style, like
+/// `pango_markup`.
+#[test]
+fn label_text_math_source() {
+    let content = label_text(&[Inline::Math(Math::new("a<b", false))]);
+    assert_eq!(content.text, "$a<b$");
+    assert_eq!(
+        content.runs,
+        vec![md_viewer::StyledRun {
+            range: 0..5,
+            styles: vec![Style::Code],
+        }]
+    );
+}
+
+/// Byte offsets stay correct across multi-byte characters.
+#[test]
+fn label_text_multibyte_offsets() {
+    let content = label_text(&[
+        Inline::Text(span("λ", &[Style::Strong])),
+        Inline::Text(span("x", &[])),
+    ]);
+    assert_eq!(content.text, "λx");
+    assert_eq!(
+        content.runs,
+        vec![md_viewer::StyledRun {
+            range: 0..2,
+            styles: vec![Style::Strong],
+        }]
+    );
 }
 
 /// A formula that has already been rendered is still shown as its source

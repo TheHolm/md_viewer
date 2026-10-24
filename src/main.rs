@@ -15,8 +15,11 @@ use md_viewer::graphics::{Image, RasterSettings, Rendered};
 use md_viewer::progressive::{self, Job, Phase, Pool, Progress};
 use md_viewer::search::{self, Matcher, SearchMode};
 use md_viewer::zoom::{self, Zoom};
+use md_viewer::{
+    label_text, Align, Block, Diagram, Inline, LabelText, Math, Origin, Style, StyledRun, Table,
+    Target, APP_ID,
+};
 use md_viewer::{layout, CodeBlock};
-use md_viewer::{Align, Block, Diagram, Inline, Math, Origin, Style, Table, Target, APP_ID};
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
@@ -301,7 +304,12 @@ struct SearchSummary {
 /// Where a match can be highlighted.
 enum SearchTarget {
     /// A label (a table cell or a code card) whose substrings can be marked.
-    Label(gtk4::Label),
+    /// `runs` are the base style runs of the label's text, used to rebuild
+    /// the label's attribute list.
+    Label {
+        label: gtk4::Label,
+        runs: Vec<StyledRun>,
+    },
     /// A whole diagram card, marked by a CSS class.
     Diagram(gtk4::Box),
 }
@@ -317,6 +325,9 @@ struct SearchEntry {
     order: usize,
     /// What to highlight.
     target: SearchTarget,
+    /// True while the label carries search highlights, so they can be
+    /// cleared back to the base styling when the query changes.
+    highlighted: Cell<bool>,
 }
 
 /// A found match and where it is.
@@ -681,7 +692,14 @@ impl Session {
         let offset = buffer.end_iter().offset();
         let anchor = buffer.create_child_anchor(&mut buffer.end_iter());
         self.view.add_child_at_anchor(&card, &anchor);
-        self.add_label_entry(&text, code.text.clone(), offset);
+        self.add_label_entry(
+            &text,
+            LabelText {
+                text: code.text.clone(),
+                runs: Vec::new(),
+            },
+            offset,
+        );
         self.resizable.codes.borrow_mut().push((card, code.indent));
     }
 
@@ -793,9 +811,9 @@ impl Session {
             Align::Center => (gtk4::Align::Center, gtk4::Justification::Center),
             Align::Right => (gtk4::Align::End, gtk4::Justification::Right),
         };
+        let content = label_text(cell);
         let label = gtk4::Label::builder()
-            .use_markup(true)
-            .label(md_viewer::pango_markup(cell))
+            .label(&content.text)
             .wrap(true)
             // Word wrapping keeps a cell at least as wide as its longest
             // word, so short cells are never broken mid-word.
@@ -806,7 +824,8 @@ impl Session {
             .justify(justify)
             .halign(halign)
             .build();
-        self.add_label_entry(&label, cell.iter().map(Inline::text).collect(), offset);
+        set_base_attributes(&label, &content.runs);
+        self.add_label_entry(&label, content, offset);
         let frame = gtk4::Box::builder().css_classes(classes.to_vec()).build();
         label.set_hexpand(true);
         frame.append(&label);
@@ -856,13 +875,14 @@ impl Session {
                     if matches!(other, Inline::Math(_)) {
                         self.add_slot(None);
                     }
+                    let content = label_text(std::slice::from_ref(other));
                     let label = gtk4::Label::builder()
-                        .use_markup(true)
-                        .label(md_viewer::pango_markup(std::slice::from_ref(other)))
+                        .label(&content.text)
                         .selectable(true)
                         .valign(gtk4::Align::Center)
                         .build();
-                    self.add_label_entry(&label, other.text(), offset);
+                    set_base_attributes(&label, &content.runs);
+                    self.add_label_entry(&label, content, offset);
                     row.append(&label);
                 }
             }
@@ -928,16 +948,20 @@ impl Session {
         self.view.line_at_y(top).0.offset()
     }
 
-    /// Registers `text`, shown in `label` at buffer `offset`, as searchable.
-    fn add_label_entry(&self, label: &gtk4::Label, text: String, offset: i32) {
+    /// Registers `content`, shown in `label` at buffer `offset`, as searchable.
+    fn add_label_entry(&self, label: &gtk4::Label, content: LabelText, offset: i32) {
         let mut search = self.search.borrow_mut();
         let order = search.next_order;
         search.next_order += 1;
         search.entries.push(SearchEntry {
-            text,
+            text: content.text,
             offset,
             order,
-            target: SearchTarget::Label(label.clone()),
+            target: SearchTarget::Label {
+                label: label.clone(),
+                runs: content.runs,
+            },
+            highlighted: Cell::new(false),
         });
     }
 
@@ -954,6 +978,7 @@ impl Session {
             offset,
             order,
             target: SearchTarget::Diagram(card.clone()),
+            highlighted: Cell::new(false),
         });
     }
 
@@ -1107,46 +1132,44 @@ impl Session {
         let end = buffer.end_iter();
         buffer.remove_tag_by_name(SEARCH_MATCH_TAG, &start, &end);
         buffer.remove_tag_by_name(SEARCH_CURRENT_TAG, &start, &end);
-        {
-            let search = self.search.borrow();
-            let current = search.current;
-            for entry in &search.entries {
-                match &entry.target {
-                    SearchTarget::Label(label) => label.set_attributes(None),
-                    SearchTarget::Diagram(card) => {
-                        card.remove_css_class("md-search-hit");
-                        card.remove_css_class("md-search-current");
-                    }
+        let search = self.search.borrow();
+        let current = search.current;
+        let mut grouped: Vec<Vec<(std::ops::Range<usize>, bool)>> =
+            vec![Vec::new(); search.entries.len()];
+        for (index, m) in search.matches.iter().enumerate() {
+            match &m.target {
+                MatchTarget::Buffer { chars } => {
+                    let tag = if Some(index) == current {
+                        SEARCH_CURRENT_TAG
+                    } else {
+                        SEARCH_MATCH_TAG
+                    };
+                    let start = buffer.iter_at_offset(chars.start);
+                    let end = buffer.iter_at_offset(chars.end);
+                    buffer.apply_tag_by_name(tag, &start, &end);
+                }
+                MatchTarget::Entry { entry, range } => {
+                    grouped[*entry].push((range.clone(), Some(index) == current));
                 }
             }
-            let mut grouped: Vec<Vec<(std::ops::Range<usize>, bool)>> =
-                vec![Vec::new(); search.entries.len()];
-            for (index, m) in search.matches.iter().enumerate() {
-                match &m.target {
-                    MatchTarget::Buffer { chars } => {
-                        let tag = if Some(index) == current {
-                            SEARCH_CURRENT_TAG
-                        } else {
-                            SEARCH_MATCH_TAG
-                        };
-                        let start = buffer.iter_at_offset(chars.start);
-                        let end = buffer.iter_at_offset(chars.end);
-                        buffer.apply_tag_by_name(tag, &start, &end);
-                    }
-                    MatchTarget::Entry { entry, range } => {
-                        grouped[*entry].push((range.clone(), Some(index) == current));
+        }
+        for (entry, ranges) in search.entries.iter().zip(grouped) {
+            match &entry.target {
+                SearchTarget::Label { label, runs } => {
+                    if ranges.is_empty() {
+                        if entry.highlighted.get() {
+                            set_base_attributes(label, runs);
+                            entry.highlighted.set(false);
+                        }
+                    } else {
+                        label.set_attributes(Some(&label_attributes(runs, &ranges)));
+                        entry.highlighted.set(true);
                     }
                 }
-            }
-            for (entry, ranges) in search.entries.iter().zip(grouped) {
-                if ranges.is_empty() {
-                    continue;
-                }
-                match &entry.target {
-                    SearchTarget::Label(label) => {
-                        label.set_attributes(Some(&highlight_attributes(&ranges)));
-                    }
-                    SearchTarget::Diagram(card) => {
+                SearchTarget::Diagram(card) => {
+                    card.remove_css_class("md-search-hit");
+                    card.remove_css_class("md-search-current");
+                    if !ranges.is_empty() {
                         let current = ranges.iter().any(|(_, is_current)| *is_current);
                         card.add_css_class(if current {
                             "md-search-current"
@@ -2068,35 +2091,129 @@ fn searchable_text(buffer: &gtk4::TextBuffer) -> String {
         .to_string()
 }
 
-/// Builds the Pango attributes highlighting `ranges` of a label: a light
-/// background for every match, a stronger one (with dark text) for the
-/// current match.
-fn highlight_attributes(ranges: &[(std::ops::Range<usize>, bool)]) -> pango::AttrList {
+/// Builds the Pango attribute list for a label: the base style attributes
+/// from `runs`, plus a light background for every highlighted range (a
+/// stronger one for the current match). Labels are styled this way rather
+/// than with markup, because mixing `use_markup` with `set_attributes`
+/// makes GTK fold the attributes into the label's markup list, where they
+/// cannot be cleared again.
+fn label_attributes(
+    runs: &[StyledRun],
+    highlights: &[(std::ops::Range<usize>, bool)],
+) -> pango::AttrList {
     let list = pango::AttrList::new();
-    for (range, current) in ranges {
+    for run in runs {
+        for style in &run.styles {
+            insert_style_attributes(&list, *style, &run.range);
+        }
+    }
+    for (range, current) in highlights {
         let background = if *current {
             SEARCH_CURRENT_RGB
         } else {
             SEARCH_MATCH_RGB
         };
-        let mut background_attr = pango::AttrColor::new_background(
-            layout::pango_channel(background.0),
-            layout::pango_channel(background.1),
-            layout::pango_channel(background.2),
+        insert_attribute(
+            &list,
+            pango::AttrColor::new_background(
+                layout::pango_channel(background.0),
+                layout::pango_channel(background.1),
+                layout::pango_channel(background.2),
+            ),
+            range,
         );
-        background_attr.set_start_index(range.start as u32);
-        background_attr.set_end_index(range.end as u32);
-        list.insert(background_attr);
-        let mut foreground_attr = pango::AttrColor::new_foreground(
-            layout::pango_channel(SEARCH_TEXT_RGB.0),
-            layout::pango_channel(SEARCH_TEXT_RGB.1),
-            layout::pango_channel(SEARCH_TEXT_RGB.2),
+        insert_attribute(
+            &list,
+            pango::AttrColor::new_foreground(
+                layout::pango_channel(SEARCH_TEXT_RGB.0),
+                layout::pango_channel(SEARCH_TEXT_RGB.1),
+                layout::pango_channel(SEARCH_TEXT_RGB.2),
+            ),
+            range,
         );
-        foreground_attr.set_start_index(range.start as u32);
-        foreground_attr.set_end_index(range.end as u32);
-        list.insert(foreground_attr);
     }
     list
+}
+
+/// Applies the base styling of a label (its `runs`, with no highlights),
+/// clearing any search highlights.
+fn set_base_attributes(label: &gtk4::Label, runs: &[StyledRun]) {
+    if runs.is_empty() {
+        label.set_attributes(None);
+    } else {
+        label.set_attributes(Some(&label_attributes(runs, &[])));
+    }
+}
+
+/// Inserts `attribute` into `list`, covering `range` (in bytes).
+fn insert_attribute(
+    list: &pango::AttrList,
+    attribute: impl Into<pango::Attribute>,
+    range: &std::ops::Range<usize>,
+) {
+    let mut attribute = attribute.into();
+    attribute.set_start_index(range.start as u32);
+    attribute.set_end_index(range.end as u32);
+    list.insert(attribute);
+}
+
+/// Inserts the Pango attributes implementing `style` over `range`; the
+/// attribute equivalent of `md_viewer::markup_attributes`.
+fn insert_style_attributes(list: &pango::AttrList, style: Style, range: &std::ops::Range<usize>) {
+    let muted = layout::pango_color(md_viewer::MUTED_COLOR).expect("valid colour");
+    match style {
+        Style::Heading(_) | Style::Strong => {
+            insert_attribute(list, pango::AttrInt::new_weight(pango::Weight::Bold), range)
+        }
+        Style::Emphasis => {
+            insert_attribute(list, pango::AttrInt::new_style(pango::Style::Italic), range)
+        }
+        Style::Strikethrough => {
+            insert_attribute(list, pango::AttrInt::new_strikethrough(true), range)
+        }
+        Style::Code | Style::CodeBlock => {
+            insert_attribute(list, pango::AttrString::new_family("monospace"), range);
+            let background = layout::pango_color(md_viewer::CODE_BACKGROUND).expect("valid colour");
+            insert_attribute(
+                list,
+                pango::AttrColor::new_background(background.0, background.1, background.2),
+                range,
+            );
+            insert_attribute(
+                list,
+                pango::AttrInt::new_background_alpha(layout::percent_alpha(
+                    md_viewer::CODE_BACKGROUND_ALPHA,
+                )),
+                range,
+            );
+        }
+        Style::Quote | Style::Image => {
+            insert_attribute(list, pango::AttrInt::new_style(pango::Style::Italic), range);
+            insert_attribute(
+                list,
+                pango::AttrColor::new_foreground(muted.0, muted.1, muted.2),
+                range,
+            );
+        }
+        Style::Link => {
+            insert_attribute(
+                list,
+                pango::AttrInt::new_underline(pango::Underline::Single),
+                range,
+            );
+            let link = layout::pango_color(md_viewer::LINK_COLOR).expect("valid colour");
+            insert_attribute(
+                list,
+                pango::AttrColor::new_foreground(link.0, link.1, link.2),
+                range,
+            );
+        }
+        Style::Rule => insert_attribute(
+            list,
+            pango::AttrColor::new_foreground(muted.0, muted.1, muted.2),
+            range,
+        ),
+    }
 }
 
 /// Registers one text tag per [`Style`] in `table`, plus the display math
@@ -2275,16 +2392,85 @@ impl ScaledTexture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
+
+    /// Initializes GTK once for the tests that need it, reporting whether a
+    /// display was available (tests that need one are skipped otherwise).
+    fn gtk_ready() -> bool {
+        static READY: OnceLock<bool> = OnceLock::new();
+        *READY.get_or_init(|| gtk4::init().is_ok())
+    }
+
+    /// Match highlights use Pango's 16-bit colour range: the intended
+    /// yellow background is full red + green, not the near-black of an
+    /// 8-bit value passed straight through.
+    #[test]
+    fn label_attributes_highlight_16_bit_colours() {
+        let list = label_attributes(&[], &[(0..1, false)]);
+        let mut colours: Vec<String> = list
+            .iterator()
+            .attrs()
+            .into_iter()
+            .filter_map(|attr| attr.downcast::<pango::AttrColor>().ok())
+            .map(|color| color.color().to_str().to_string())
+            .collect();
+        colours.sort();
+        assert_eq!(
+            colours,
+            vec!["#000000000000".to_string(), "#ffffd5d50000".to_string()]
+        );
+    }
+
+    /// The base style runs of a label become the matching Pango attributes:
+    /// bold, italic, strikethrough, monospace (with background and alpha),
+    /// link underline and quote foreground, each over its own byte range.
+    #[test]
+    fn label_attributes_include_styles() {
+        let runs = vec![
+            StyledRun {
+                range: 0..3,
+                styles: vec![Style::Strong, Style::Emphasis],
+            },
+            StyledRun {
+                range: 3..6,
+                styles: vec![Style::Code],
+            },
+            StyledRun {
+                range: 6..8,
+                styles: vec![Style::Link],
+            },
+        ];
+        let list = label_attributes(&runs, &[]);
+        let mut ints: Vec<(pango::AttrType, u32, u32)> = Vec::new();
+        let mut strings: Vec<(pango::AttrType, u32, u32)> = Vec::new();
+        for attrs in list.iterator() {
+            for attr in attrs {
+                if let Some(a) = attr.downcast_ref::<pango::AttrInt>() {
+                    ints.push((a.type_(), a.start_index(), a.end_index()));
+                }
+                if let Some(a) = attr.downcast_ref::<pango::AttrString>() {
+                    strings.push((a.type_(), a.start_index(), a.end_index()));
+                }
+            }
+        }
+        assert!(ints.contains(&(pango::AttrType::Weight, 0, 3)));
+        assert!(ints.contains(&(pango::AttrType::Style, 0, 3)));
+        assert!(ints.contains(&(pango::AttrType::BackgroundAlpha, 3, 6)));
+        assert!(ints.contains(&(pango::AttrType::Underline, 6, 8)));
+        assert!(strings.contains(&(pango::AttrType::Family, 3, 6)));
+    }
 
     /// The text searched for the buffer keeps character indexes aligned with
-    /// buffer offsets: an embedded child anchor becomes U+FFFC in the search
-    /// text (via `slice`), while `TextBuffer::text` drops it. Needs a
-    /// display, so it is skipped when GTK cannot initialize.
+    /// buffer offsets (an embedded child anchor becomes U+FFFC via `slice`),
+    /// and replacing a plain-text label's attributes drops its previous
+    /// highlights. Both need GTK, so they share one test (GTK is not
+    /// thread-safe) that is skipped when GTK cannot initialize.
     #[test]
-    fn searchable_text_keeps_offsets_aligned() {
-        if gtk4::init().is_err() {
+    fn gtk_search_support() {
+        if !gtk_ready() {
             return;
         }
+
         let buffer = gtk4::TextBuffer::new(None);
         buffer.insert(&mut buffer.end_iter(), "ab");
         buffer.create_child_anchor(&mut buffer.end_iter());
@@ -2299,25 +2485,30 @@ mod tests {
                 .count(),
             4
         );
-    }
 
-    /// Match highlights use Pango's 16-bit colour range: the intended
-    /// yellow background is full red + green, not the near-black of an
-    /// 8-bit value passed straight through.
-    #[test]
-    fn highlight_attributes_use_16_bit_colours() {
-        let list = highlight_attributes(&[(0..1, false)]);
-        let mut colours: Vec<String> = list
-            .iterator()
-            .attrs()
-            .into_iter()
-            .filter_map(|attr| attr.downcast::<pango::AttrColor>().ok())
-            .map(|color| color.color().to_str().to_string())
-            .collect();
-        colours.sort();
-        assert_eq!(
-            colours,
-            vec!["#000000000000".to_string(), "#ffffd5d50000".to_string()]
-        );
+        let label = gtk4::Label::new(Some("Alice coffee"));
+        let background_ranges = |label: &gtk4::Label| {
+            let layout = label.layout();
+            let Some(attrs) = layout.attributes() else {
+                return Vec::new();
+            };
+            let mut ranges = Vec::new();
+            for attrs in attrs.iterator() {
+                for attr in attrs {
+                    if let Ok(color) = attr.downcast::<pango::AttrColor>() {
+                        if color.type_() == pango::AttrType::Background {
+                            ranges.push((color.start_index(), color.end_index()));
+                        }
+                    }
+                }
+            }
+            ranges
+        };
+        label.set_attributes(Some(&label_attributes(&[], &[(0..1, false)])));
+        assert!(background_ranges(&label).contains(&(0, 1)));
+        label.set_attributes(Some(&label_attributes(&[], &[(6..12, false)])));
+        let ranges = background_ranges(&label);
+        assert!(!ranges.contains(&(0, 1)), "{ranges:?}");
+        assert!(ranges.contains(&(6, 12)), "{ranges:?}");
     }
 }

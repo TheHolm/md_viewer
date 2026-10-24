@@ -84,7 +84,10 @@ run there; runtime verification on a real FreeBSD system is a manual step.
     display math centred; tables are a `GtkGrid` of wrapping labels in a
     horizontal `GtkScrolledWindow`; code blocks are cards (`code_card`:
     language label, copy button, monospace selectable label in a horizontal
-    scroller); diagrams are a `GtkPicture` on a white card. Every graphic on
+    scroller); diagrams are a `GtkPicture` on a white card. Table and
+    math-cell labels are plain text (`use_markup` off) styled with a single
+    Pango attribute list built from `label_text`'s style runs (see
+    `src/lib.rs`), never with markup. Every graphic on
     the page has a `Slot` (its `ScaledTexture`, rise tag, diagram entry,
     buffer offset) so a re-render can replace it.
   - Anchored widgets only get their minimum size, so `Resizable` (run from
@@ -113,7 +116,8 @@ run there; runtime verification on a real FreeBSD system is a manual step.
     whole text buffer is one search source, and every table-cell label,
     code-card label and diagram (its extracted labels joined) is a
     `SearchEntry` registered as it is appended. Matches are highlighted
-    with text tags (buffer), Pango attributes (labels) or a CSS class
+    with text tags (buffer), a rebuilt Pango attribute list (labels, with
+    their base style runs plus the highlight ranges) or a CSS class
     (diagram cards), the current match scrolls into view, and a narrow
     `DrawingArea` over the scrollbar's right edge draws a mark per match.
     `/`, `n`, `N` and Escape are a capture-phase key controller on the
@@ -129,7 +133,9 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   (`read_document`, and `open_document` = read + render), the error text for an unreadable file (`error_message`), the
   window title (`window_title`), the Markdown renderer (`render`) and Pango
   markup for table cells (`pango_markup`, `escape_markup`, and the shared
-  colour constants). `render` turns Markdown into a `Vec<Block>`:
+  colour constants), plus `label_text` (flattens inlines into plain text
+  and `StyledRun`s so labels can be styled with Pango attributes instead of
+  markup). `render` turns Markdown into a `Vec<Block>`:
   `Block::Text` (flowing `Inline`s: `Inline::Text(Span)` - text plus its
   `Style`s - and `Inline::Math(Math)`), `Block::Table(Table)` (per-column
   `Align`, header and rows of `Cell`s, i.e. `Vec<Inline>`) and
@@ -439,6 +445,15 @@ Things learned the hard way; add to this list when you learn another.
   used by GDK/CSS; `layout::pango_channel` widens an 8-bit value by 257.
   Passing an 8-bit value straight through made the highlight background
   effectively black (matched text looked like black squares).
+- Never mix `use_markup` with `GtkLabel::set_attributes`. GTK's
+  `gtk_label_update_layout_attributes` merges the attribute lists with
+  `_gtk_pango_attr_list_merge`, which aliases `markup_attrs` when the CSS
+  style contributes no attributes and then folds the manually-set list into
+  it; `set_attributes(NULL)` cannot remove them, so old highlights stuck
+  around (single `c` letters stayed after the query changed). Table and
+  math-cell labels therefore use plain text and one attribute list rebuilt
+  from `label_text`'s `StyledRun`s plus the highlight ranges (`label_attributes`
+  in `main.rs`).
 - `TextBuffer::text` (`get_text`) omits the U+FFFC characters that represent
   embedded child anchors and paintables, so its indexes drift from buffer
   offsets; `TextBuffer::slice` (`get_slice`) keeps them. The find bar uses

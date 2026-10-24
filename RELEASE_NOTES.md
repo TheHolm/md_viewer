@@ -26,6 +26,12 @@ section for the GitHub Release body.
 - Fixed: matches inside tables and code cards were drawn as black squares;
   Pango colour channels are 16-bit, and the highlight colours were passed
   as 8-bit values.
+- Fixed: changing the query left old single-letter highlights behind in
+  table cells (e.g. every `c` stayed highlighted after searching `coffee`),
+  because mixing `use_markup` with `GtkLabel::set_attributes` folds the
+  highlight attributes into the label's markup list, where they cannot be
+  cleared. Table and math-cell labels are now plain text styled with a
+  single Pango attribute list, rebuilt for each search.
 
 ### Details
 
@@ -40,7 +46,8 @@ section for the GitHub Release body.
   searchable). A diagram match highlights its whole card.
 - The GUI keeps a `Search` per `Session`: the text buffer plus one entry
   per table-cell label, code-card label and diagram, highlighted with text
-  tags, Pango attributes and a CSS class respectively. Marks are drawn on
+  tags, a rebuilt Pango attribute list (base style runs plus highlights,
+  from `label_text`) and a CSS class respectively. Marks are drawn on
   a `DrawingArea` over the scrollbar, and the search re-runs as blocks are
   appended while a document loads. The buffer is searched via
   `TextBuffer::slice`, which keeps embedded objects as U+FFFC so its

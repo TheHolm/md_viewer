@@ -413,6 +413,50 @@ pub fn pango_markup(inlines: &[Inline]) -> String {
     markup
 }
 
+/// A run of label text that shares the same styles, addressed by byte
+/// offsets into the label's text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StyledRun {
+    /// The byte range into the label's text.
+    pub range: std::ops::Range<usize>,
+    /// The styles that apply to the whole run.
+    pub styles: Vec<Style>,
+}
+
+/// The plain text of a set of inlines, plus the style runs needed to render
+/// it with Pango attributes (instead of markup).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelText {
+    /// The text to display (and to search).
+    pub text: String,
+    /// The style runs over `text`.
+    pub runs: Vec<StyledRun>,
+}
+
+/// Flattens `inlines` into plain text plus style runs, for a label styled
+/// with Pango attributes rather than markup. A formula is shown as its
+/// source in code style, like [`pango_markup`].
+pub fn label_text(inlines: &[Inline]) -> LabelText {
+    let mut text = String::new();
+    let mut runs = Vec::new();
+    for inline in inlines {
+        let (span_text, styles) = match inline {
+            Inline::Text(span) => (span.text.clone(), span.styles.clone()),
+            Inline::Math(math) => (math.source(), vec![Style::Code]),
+        };
+        let start = text.len();
+        text.push_str(&span_text);
+        let end = text.len();
+        if !styles.is_empty() && start < end {
+            runs.push(StyledRun {
+                range: start..end,
+                styles,
+            });
+        }
+    }
+    LabelText { text, runs }
+}
+
 /// The Pango markup attributes implementing `style`.
 fn markup_attributes(style: Style) -> String {
     match style {

@@ -3,8 +3,8 @@
 
 use md_viewer::layout::{
     align_fraction, available_width, cell_classes, color_channel, diagram_size, font_size_px,
-    heading_scale, math_rise, pango_channel, table_size, DIAGRAM_PADDING, DOCUMENT_MARGIN,
-    MIN_DIAGRAM_WIDTH, MIN_TABLE_WIDTH,
+    heading_scale, math_rise, pango_channel, pango_color, percent_alpha, table_size,
+    DIAGRAM_PADDING, DOCUMENT_MARGIN, MIN_DIAGRAM_WIDTH, MIN_TABLE_WIDTH,
 };
 use md_viewer::Align;
 
@@ -105,6 +105,29 @@ fn pango_channel_widens() {
     assert_eq!(pango_channel(255), 65535);
     assert_eq!(pango_channel(128), 32896);
     assert_eq!(pango_channel(1), 257);
+}
+
+/// `pango_color` parses `#rrggbb` into Pango's 16-bit channels.
+#[test]
+fn pango_color_parses() {
+    assert_eq!(pango_color("#808080"), Some((32896, 32896, 32896)));
+    assert_eq!(pango_color("#3584e4"), Some((13621, 33924, 58596)));
+    assert_eq!(pango_color("#000000"), Some((0, 0, 0)));
+    assert_eq!(pango_color("#ffffff"), Some((65535, 65535, 65535)));
+    assert_eq!(pango_color("808080"), None);
+    assert_eq!(pango_color("#12345"), None);
+    assert_eq!(pango_color("#zzzzzz"), None);
+}
+
+/// `percent_alpha` converts a percentage to Pango's 16-bit alpha, and the
+/// inline code background alpha resolves to the same value as its markup.
+#[test]
+fn percent_alpha_converts() {
+    assert_eq!(percent_alpha("0%"), 0);
+    assert_eq!(percent_alpha("100%"), 65535);
+    assert_eq!(percent_alpha("15%"), 9830);
+    assert_eq!(percent_alpha("garbage"), 0);
+    assert_eq!(percent_alpha(md_viewer::CODE_BACKGROUND_ALPHA), 9830);
 }
 
 /// Heading scales shrink with the level and clamp past level 6.
