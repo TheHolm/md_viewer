@@ -1,11 +1,11 @@
 # md_viewer
 
+A simple GTK4/libadwaita program for viewing Markdown documents. It opens a
+file, renders it read-only in a scrollable window, and never modifies it.
+
 # THIS IS VIBE CODED GARBAGE, USE AT YOUR OWN RISK
 
 I did not check what is in the code at all, so who knows what it is really doing.
-
-A simple GTK4/libadwaita program for viewing Markdown documents. It opens a
-file, renders it read-only in a scrollable window, and never modifies it.
 
 # How to use
 
