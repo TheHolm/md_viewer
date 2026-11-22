@@ -78,6 +78,7 @@ fn open_document_renders() {
         vec![Block::Text(vec![Inline::Text(Span {
             text: "Hi".to_string(),
             styles: vec![Style::Heading(1)],
+            link: None,
         })])]
     );
 }
