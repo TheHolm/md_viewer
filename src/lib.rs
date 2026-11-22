@@ -8,6 +8,7 @@
 
 pub mod graphics;
 pub mod layout;
+pub mod links;
 pub mod progressive;
 pub mod search;
 pub mod zoom;
@@ -183,6 +184,9 @@ pub struct Span {
     pub text: String,
     /// The styles applied to `text`, sorted and deduplicated.
     pub styles: Vec<Style>,
+    /// The destination of the link this text is part of, if any. Only used
+    /// by the GUI to make the text clickable; it does not affect rendering.
+    pub link: Option<String>,
 }
 
 /// A formula: `$…$` (inline) or `$$…$$` (display) LaTeX, including mhchem.
@@ -400,6 +404,7 @@ pub fn pango_markup(inlines: &[Inline]) -> String {
             Inline::Math(math) => Span {
                 text: math.source(),
                 styles: vec![Style::Code],
+                link: None,
             },
         };
         let text = escape_markup(&span.text);
@@ -423,6 +428,16 @@ pub struct StyledRun {
     pub styles: Vec<Style>,
 }
 
+/// A link inside a label's text: a byte range into the text and the
+/// destination to open when it is clicked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelLink {
+    /// The byte range into the label's text.
+    pub range: std::ops::Range<usize>,
+    /// The link destination.
+    pub dest: String,
+}
+
 /// The plain text of a set of inlines, plus the style runs needed to render
 /// it with Pango attributes (instead of markup).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -431,6 +446,8 @@ pub struct LabelText {
     pub text: String,
     /// The style runs over `text`.
     pub runs: Vec<StyledRun>,
+    /// The links over `text`, for click handling.
+    pub links: Vec<LabelLink>,
 }
 
 /// Flattens `inlines` into plain text plus style runs, for a label styled
@@ -439,10 +456,11 @@ pub struct LabelText {
 pub fn label_text(inlines: &[Inline]) -> LabelText {
     let mut text = String::new();
     let mut runs = Vec::new();
+    let mut links = Vec::new();
     for inline in inlines {
-        let (span_text, styles) = match inline {
-            Inline::Text(span) => (span.text.clone(), span.styles.clone()),
-            Inline::Math(math) => (math.source(), vec![Style::Code]),
+        let (span_text, styles, link) = match inline {
+            Inline::Text(span) => (span.text.clone(), span.styles.clone(), span.link.clone()),
+            Inline::Math(math) => (math.source(), vec![Style::Code], None),
         };
         let start = text.len();
         text.push_str(&span_text);
@@ -453,8 +471,16 @@ pub fn label_text(inlines: &[Inline]) -> LabelText {
                 styles,
             });
         }
+        if let Some(dest) = link {
+            if start < end {
+                links.push(LabelLink {
+                    range: start..end,
+                    dest,
+                });
+            }
+        }
     }
-    LabelText { text, runs }
+    LabelText { text, runs, links }
 }
 
 /// The Pango markup attributes implementing `style`.
@@ -777,9 +803,14 @@ impl Renderer {
                 }
             }
             TagEnd::Link => {
-                if let Some((dest, has_text)) = self.link.take() {
+                let link = self.link.take();
+                if let Some((dest, has_text)) = link {
                     if !has_text {
+                        // Show the destination itself, still carrying the
+                        // link so it stays clickable.
+                        self.link = Some((dest.clone(), true));
                         self.text(&dest);
+                        self.link = None;
                     }
                 }
                 self.style_stack.pop();
@@ -913,8 +944,9 @@ impl Renderer {
         if text.is_empty() {
             return;
         }
+        let link = self.link.as_ref().map(|(dest, _)| dest.clone());
         if let Some(cell) = self.table.as_mut().and_then(|t| t.current_cell.as_mut()) {
-            push_inline(cell, text, styles);
+            push_inline(cell, text, styles, link);
             return;
         }
         let owned;
@@ -924,7 +956,7 @@ impl Renderer {
             text = &owned;
         }
         if let Some(inlines) = self.text_block() {
-            push_inline(inlines, text, styles);
+            push_inline(inlines, text, styles, link);
         }
     }
 
@@ -949,10 +981,10 @@ impl Renderer {
 }
 
 /// Appends `text` with `styles` to `inlines`, merging it into the last
-/// element when that is text with identical styles.
-fn push_inline(inlines: &mut Vec<Inline>, text: &str, styles: Vec<Style>) {
+/// element when that is text with identical styles and link destination.
+fn push_inline(inlines: &mut Vec<Inline>, text: &str, styles: Vec<Style>, link: Option<String>) {
     if let Some(Inline::Text(last)) = inlines.last_mut() {
-        if last.styles == styles {
+        if last.styles == styles && last.link == link {
             last.text.push_str(text);
             return;
         }
@@ -960,6 +992,7 @@ fn push_inline(inlines: &mut Vec<Inline>, text: &str, styles: Vec<Style>) {
     inlines.push(Inline::Text(Span {
         text: text.to_string(),
         styles,
+        link,
     }));
 }
 
@@ -1006,6 +1039,7 @@ mod tests {
                     Inline::Text(Span {
                         text: text.to_string(),
                         styles: Vec::new(),
+                        link: None,
                     })
                 })
                 .collect(),
@@ -1034,7 +1068,7 @@ mod tests {
         let mut with_math = vec![text_block(&["\n"])];
         if let Block::Text(inlines) = &mut with_math[0] {
             inlines.push(Inline::Math(Math::new("x", false)));
-            push_inline(inlines, "\n", Vec::new());
+            push_inline(inlines, "\n", Vec::new(), None);
         }
         assert_eq!(trailing_newlines(&with_math), 1);
     }
@@ -1052,9 +1086,9 @@ mod tests {
     #[test]
     fn push_inline_merges_equal_styles() {
         let mut inlines = Vec::new();
-        push_inline(&mut inlines, "a", Vec::new());
-        push_inline(&mut inlines, "b", Vec::new());
-        push_inline(&mut inlines, "c", vec![Style::Strong]);
+        push_inline(&mut inlines, "a", Vec::new(), None);
+        push_inline(&mut inlines, "b", Vec::new(), None);
+        push_inline(&mut inlines, "c", vec![Style::Strong], None);
         assert_eq!(inlines.len(), 2);
         assert_eq!(inlines[0].text(), "ab");
         assert_eq!(inlines[1].text(), "c");
@@ -1068,6 +1102,7 @@ mod tests {
             vec![Inline::Text(Span {
                 text: text.to_string(),
                 styles: Vec::new(),
+                link: None,
             })]
         };
         let builder = TableBuilder {

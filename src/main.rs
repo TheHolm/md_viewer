@@ -12,15 +12,17 @@ use clap::Parser;
 use gtk4::glib::translate::IntoGlib;
 use gtk4::{gdk, gio, glib, pango};
 use md_viewer::graphics::{Image, RasterSettings, Rendered};
+use md_viewer::links::{self, LinkRanges, Resolved};
 use md_viewer::progressive::{self, Job, Phase, Pool, Progress};
 use md_viewer::search::{self, Matcher, SearchMode};
 use md_viewer::zoom::{self, Zoom};
 use md_viewer::{
-    label_text, Align, Block, Diagram, Inline, LabelText, Math, Origin, Style, StyledRun, Table,
-    Target, APP_ID,
+    label_text, Align, Block, Diagram, Inline, LabelLink, LabelText, Math, Origin, Style,
+    StyledRun, Table, Target, APP_ID,
 };
 use md_viewer::{layout, CodeBlock};
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::{mpsc, Mutex};
@@ -429,6 +431,21 @@ struct Session {
     marks: gtk4::DrawingArea,
     /// Reports the outcome of a search to the window.
     search_changed: Box<dyn Fn(SearchSummary)>,
+    /// The path of the document, for resolving relative link destinations.
+    document: PathBuf,
+    /// The clickable ranges of the text buffer, in character offsets.
+    links: RefCell<LinkRanges>,
+    /// Each heading's anchor and the buffer offset of its first character.
+    anchors: RefCell<HashMap<String, i32>>,
+    /// An anchor requested before its heading was appended; scrolled to as
+    /// soon as the heading appears.
+    pending_anchor: RefCell<Option<String>>,
+    /// Opens a resolved link that is not a same-document anchor (the window
+    /// launches external links and opens linked Markdown documents).
+    open_link: Box<dyn Fn(Resolved)>,
+    /// A weak handle to this session, set once it is wrapped in `Rc`, so
+    /// callbacks attached to child widgets (table-cell labels) can reach it.
+    weak_self: RefCell<Option<Weak<Session>>>,
 }
 
 impl Session {
@@ -617,7 +634,11 @@ impl Session {
         let blocks = self.blocks.borrow();
         let buffer = self.view.buffer();
         match &blocks[index] {
-            Block::Text(inlines) => self.insert_inlines(&buffer, inlines),
+            Block::Text(inlines) => {
+                let offset = buffer.end_iter().offset();
+                self.record_heading(inlines, offset);
+                self.insert_inlines(&buffer, inlines);
+            }
             Block::Table(table) => {
                 let offset = buffer.end_iter().offset();
                 let widget = self.table_widget(table, offset);
@@ -697,6 +718,7 @@ impl Session {
             LabelText {
                 text: code.text.clone(),
                 runs: Vec::new(),
+                links: Vec::new(),
             },
             offset,
         );
@@ -707,7 +729,16 @@ impl Session {
     fn insert_inlines(&self, buffer: &gtk4::TextBuffer, inlines: &[Inline]) {
         for inline in inlines {
             match inline {
-                Inline::Text(span) => insert_styled(buffer, &span.text, &span.styles),
+                Inline::Text(span) => {
+                    let start = buffer.end_iter().offset();
+                    insert_styled(buffer, &span.text, &span.styles);
+                    if let Some(dest) = &span.link {
+                        let end = buffer.end_iter().offset();
+                        self.links
+                            .borrow_mut()
+                            .push(start as usize, end as usize, dest.clone());
+                    }
+                }
                 Inline::Math(math) => self.insert_math(buffer, math),
             }
         }
@@ -825,6 +856,7 @@ impl Session {
             .halign(halign)
             .build();
         set_base_attributes(&label, &content.runs);
+        self.make_label_clickable(&label, &content);
         self.add_label_entry(&label, content, offset);
         let frame = gtk4::Box::builder().css_classes(classes.to_vec()).build();
         label.set_hexpand(true);
@@ -882,6 +914,7 @@ impl Session {
                         .valign(gtk4::Align::Center)
                         .build();
                     set_base_attributes(&label, &content.runs);
+                    self.make_label_clickable(&label, &content);
                     self.add_label_entry(&label, content, offset);
                     row.append(&label);
                 }
@@ -979,6 +1012,150 @@ impl Session {
             order,
             target: SearchTarget::Diagram(card.clone()),
             highlighted: Cell::new(false),
+        });
+    }
+
+    /// Registers the heading of `inlines` (a text block that carries a
+    /// heading style) under its anchor slug at buffer `offset`, scrolled to
+    /// if a pending anchor names it.
+    fn record_heading(&self, inlines: &[Inline], offset: i32) {
+        let is_heading = inlines.iter().any(|inline| {
+            matches!(inline, Inline::Text(span) if span.styles.iter().any(|s| matches!(s, Style::Heading(_))))
+        });
+        if !is_heading {
+            return;
+        }
+        let base = links::heading_slug(&inlines.iter().map(Inline::text).collect::<String>());
+        if base.is_empty() {
+            return;
+        }
+        let mut anchors = self.anchors.borrow_mut();
+        let slug = if anchors.contains_key(&base) {
+            let mut n = 1;
+            loop {
+                let candidate = format!("{base}-{n}");
+                if !anchors.contains_key(&candidate) {
+                    break candidate;
+                }
+                n += 1;
+            }
+        } else {
+            base
+        };
+        anchors.insert(slug.clone(), offset);
+        drop(anchors);
+        if self.pending_anchor.borrow().as_deref() == Some(slug.as_str()) {
+            self.pending_anchor.borrow_mut().take();
+            let mut iter = self.view.buffer().iter_at_offset(offset);
+            self.view.scroll_to_iter(&mut iter, 0.15, true, 0.0, 0.3);
+        }
+    }
+
+    /// Opens the link under buffer position `x, y` (widget coordinates), if
+    /// any, for a primary click with no selection.
+    fn click_at(&self, x: f64, y: f64) {
+        if self.view.buffer().has_selection() {
+            return;
+        }
+        let Some(dest) = self.dest_at(x, y) else {
+            return;
+        };
+        self.click_link(&dest);
+    }
+
+    /// Shows a pointer cursor over the link under `x, y`, if any.
+    fn point_at(&self, x: f64, y: f64) {
+        let over_link = self.dest_at(x, y).is_some();
+        self.view
+            .set_cursor_from_name(if over_link { Some("pointer") } else { None });
+    }
+
+    /// The link destination at buffer position `x, y` (widget coordinates).
+    fn dest_at(&self, x: f64, y: f64) -> Option<String> {
+        let (bx, by) = self.view.window_to_buffer_coords(
+            gtk4::TextWindowType::Widget,
+            x.round() as i32,
+            y.round() as i32,
+        );
+        let iter = self.view.iter_at_location(bx, by)?;
+        let offset = iter.offset() as usize;
+        self.links.borrow().dest_at(offset).map(str::to_string)
+    }
+
+    /// Acts on a link `dest`: a same-document anchor scrolls to its heading,
+    /// everything else is handed to the window.
+    fn click_link(&self, dest: &str) {
+        match links::resolve_link(&self.document, dest) {
+            Resolved::Anchor(fragment) => self.scroll_to_anchor(&fragment),
+            other => (self.open_link.as_ref())(other),
+        }
+    }
+
+    /// Scrolls to the heading named `fragment`, or remembers it to scroll to
+    /// when that heading is appended.
+    fn scroll_to_anchor(&self, fragment: &str) {
+        let anchors = self.anchors.borrow();
+        if let Some(&offset) = anchors.get(fragment) {
+            drop(anchors);
+            let mut iter = self.view.buffer().iter_at_offset(offset);
+            self.view.scroll_to_iter(&mut iter, 0.15, true, 0.0, 0.3);
+        } else {
+            *self.pending_anchor.borrow_mut() = Some(fragment.to_string());
+        }
+    }
+
+    /// Makes the links inside a label's `content` clickable: a click is
+    /// mapped to a byte offset with the label's layout and resolved against
+    /// the document; a pointer cursor and a tooltip with the raw destination
+    /// show while over a link.
+    fn make_label_clickable(&self, label: &gtk4::Label, content: &LabelText) {
+        if content.links.is_empty() {
+            return;
+        }
+        let weak = self
+            .weak_self
+            .borrow()
+            .clone()
+            .expect("session weak handle set after construction");
+        let label_for_click = label.clone();
+        let links = content.links.clone();
+        let click = gtk4::GestureClick::new();
+        {
+            let weak = weak.clone();
+            let label = label_for_click.clone();
+            let links = links.clone();
+            click.connect_released(move |gesture, _, x, y| {
+                if gesture.current_button() != gdk::BUTTON_PRIMARY {
+                    return;
+                }
+                let Some(session) = weak.upgrade() else {
+                    return;
+                };
+                if let Some(dest) = label_link_at(&label, &links, x, y) {
+                    session.click_link(&dest);
+                }
+            });
+        }
+        label.add_controller(click);
+        let motion = gtk4::EventControllerMotion::new();
+        {
+            let label = label_for_click.clone();
+            let links = links.clone();
+            motion.connect_motion(move |_, x, y| {
+                let over_link = label_link_at(&label, &links, x, y).is_some();
+                label.set_cursor_from_name(if over_link { Some("pointer") } else { None });
+            });
+        }
+        label.add_controller(motion);
+        label.set_has_tooltip(true);
+        label.connect_query_tooltip(move |label, x, y, _, tooltip| {
+            match label_link_at(label, &links, f64::from(x), f64::from(y)) {
+                Some(dest) if !dest.is_empty() => {
+                    tooltip.set_text(Some(dest.as_str()));
+                    true
+                }
+                _ => false,
+            }
         });
     }
 
@@ -1867,6 +2044,14 @@ impl DocWindow {
                 }
             })
         };
+        let open_link = {
+            let window = Rc::downgrade(self);
+            Box::new(move |resolved| {
+                if let Some(window) = window.upgrade() {
+                    window.open_link(resolved);
+                }
+            })
+        };
         let session = Rc::new(Session {
             view,
             scrolled,
@@ -1893,7 +2078,14 @@ impl DocWindow {
             search: RefCell::new(Search::default()),
             marks,
             search_changed,
+            document: path.to_path_buf(),
+            links: RefCell::new(LinkRanges::default()),
+            anchors: RefCell::new(HashMap::new()),
+            pending_anchor: RefCell::new(None),
+            open_link,
+            weak_self: RefCell::new(None),
         });
+        session.weak_self.replace(Some(Rc::downgrade(&session)));
         {
             let weak = Rc::downgrade(&session);
             session.view.add_tick_callback(move |view, _| {
@@ -1911,6 +2103,47 @@ impl DocWindow {
                     session.draw_marks(cr, f64::from(width), f64::from(height));
                 }
             });
+        }
+        {
+            let weak = Rc::downgrade(&session);
+            let click = gtk4::GestureClick::new();
+            click.connect_released(move |gesture, _, x, y| {
+                if gesture.current_button() != gdk::BUTTON_PRIMARY {
+                    return;
+                }
+                if let Some(session) = weak.upgrade() {
+                    session.click_at(x, y);
+                }
+            });
+            session.view.add_controller(click);
+        }
+        {
+            let weak = Rc::downgrade(&session);
+            let motion = gtk4::EventControllerMotion::new();
+            motion.connect_motion(move |_, x, y| {
+                if let Some(session) = weak.upgrade() {
+                    session.point_at(x, y);
+                }
+            });
+            session.view.add_controller(motion);
+        }
+        {
+            let weak = Rc::downgrade(&session);
+            session.view.set_has_tooltip(true);
+            session
+                .view
+                .connect_query_tooltip(move |_, x, y, _, tooltip| {
+                    let Some(session) = weak.upgrade() else {
+                        return false;
+                    };
+                    match session.dest_at(f64::from(x), f64::from(y)) {
+                        Some(dest) if !dest.is_empty() => {
+                            tooltip.set_text(Some(dest.as_str()));
+                            true
+                        }
+                        _ => false,
+                    }
+                });
         }
         {
             let weak = Rc::downgrade(&session);
@@ -1957,6 +2190,37 @@ impl DocWindow {
             zoom: self.zoom.get().level() as f32,
         }
     }
+
+    /// Opens a resolved link: web, mail and file destinations are handed to
+    /// the desktop's default handler, a Markdown document opens in the
+    /// viewer (a new window, scrolled to its fragment if any).
+    fn open_link(self: &Rc<Self>, resolved: Resolved) {
+        match resolved {
+            Resolved::Web(uri) => launch_uri(&self.window, &uri),
+            Resolved::File(path) => {
+                if let Some(uri) = links::file_uri(&path) {
+                    launch_uri(&self.window, &uri);
+                }
+            }
+            Resolved::Markdown(path, fragment) => {
+                open_file_to(self, path, Origin::Chooser, fragment);
+            }
+            Resolved::Anchor(_) | Resolved::Ignored => {}
+        }
+    }
+}
+
+/// Hands `uri` to the desktop's default handler (a browser, mail client or
+/// file viewer).
+fn launch_uri(window: &adw::ApplicationWindow, uri: &str) {
+    let launcher = gtk4::UriLauncher::new(uri);
+    let window = window.clone();
+    let uri = uri.to_string();
+    launcher.launch(Some(&window), None::<&gio::Cancellable>, move |result| {
+        if let Err(error) = result {
+            glib::g_warning!("md_viewer", "Could not open {uri}: {error}");
+        }
+    });
 }
 
 /// The page an empty window shows: an invitation to open a document.
@@ -2046,6 +2310,12 @@ fn report_open_error(window: &DocWindow, origin: Origin, message: &str) {
 /// (`md_viewer::open_target`), and its graphics are rendered by the worker
 /// pool while its blocks are appended in order (see [`Session`]).
 fn open_file(window: &Rc<DocWindow>, path: PathBuf, origin: Origin) {
+    open_file_to(window, path, origin, None);
+}
+
+/// Opens the document at `path` from `window`, scrolling to `fragment` (a
+/// heading anchor) once it is shown, if given.
+fn open_file_to(window: &Rc<DocWindow>, path: PathBuf, origin: Origin, fragment: Option<String>) {
     let window = window.clone();
     glib::spawn_future_local(async move {
         let worker_path = path.clone();
@@ -2070,8 +2340,26 @@ fn open_file(window: &Rc<DocWindow>, path: PathBuf, origin: Origin) {
             Target::NewWindow => DocWindow::new(&window.app),
         };
         let session = target.show_document(&path, blocks);
+        session.pending_anchor.replace(fragment);
         session.start(target.raster_settings(&session.view));
     });
+}
+
+/// The raw destination of the link in `label` at label position `x, y`, if
+/// the pointer is over one. Used for clicking, the pointer cursor and the
+/// hover tooltip, so all three agree on the hit.
+fn label_link_at(label: &gtk4::Label, links: &[LabelLink], x: f64, y: f64) -> Option<String> {
+    let layout = label.layout();
+    let scale = f64::from(pango::SCALE);
+    let (hit, index, _trailing) =
+        layout.xy_to_index((x * scale).round() as i32, (y * scale).round() as i32);
+    if !hit {
+        return None;
+    }
+    links
+        .iter()
+        .find(|link| link.range.contains(&(index as usize)))
+        .map(|link| link.dest.clone())
 }
 
 /// Inserts `text` at the end of `buffer` with the tags for `styles`.

@@ -126,6 +126,24 @@ fn span(text: &str, styles: &[Style]) -> Span {
     Span {
         text: text.to_string(),
         styles: styles.to_vec(),
+        link: None,
+    }
+}
+
+/// The link destination of the span whose text is exactly `text`, if any.
+fn link_of(spans: &[Span], text: &str) -> Option<String> {
+    spans
+        .iter()
+        .find(|span| span.text == text)
+        .and_then(|span| span.link.clone())
+}
+
+/// Builds a span carrying a link destination, for exact-output assertions.
+fn link_span(text: &str, styles: &[Style], dest: &str) -> Span {
+    Span {
+        text: text.to_string(),
+        styles: styles.to_vec(),
+        link: Some(dest.to_string()),
     }
 }
 
@@ -505,7 +523,7 @@ fn table_cells_with_links_and_images() {
     assert_eq!(
         table.rows[0][0],
         vec![
-            Inline::Text(span("c", &[Style::Link])),
+            Inline::Text(link_span("c", &[Style::Link], "u")),
             Inline::Text(span(" ", &[])),
             Inline::Text(span("[image: d]", &[Style::Image])),
         ]
@@ -601,36 +619,57 @@ fn inline_code_in_strong() {
 
 // --- Links ----------------------------------------------------------------
 
-/// A link shows its text with the `Link` style; the URL is not shown.
+/// A link shows its text with the `Link` style and keeps its destination; the
+/// URL is not shown.
 #[test]
 fn link_text() {
     let spans = r("see [docs](https://example.com) now");
     assert_eq!(plain_text(&spans), "see docs now");
     assert_eq!(styles_of(&spans, "docs"), vec![Style::Link]);
+    assert_eq!(
+        link_of(&spans, "docs").as_deref(),
+        Some("https://example.com")
+    );
 }
 
-/// An autolink shows the URL itself as the link text.
+/// An autolink shows the URL itself as the link text and destination.
 #[test]
 fn autolink() {
     let spans = r("<https://example.com>");
     assert_eq!(styles_of(&spans, "https://example.com"), vec![Style::Link]);
+    assert_eq!(
+        link_of(&spans, "https://example.com").as_deref(),
+        Some("https://example.com")
+    );
 }
 
 /// A link with empty text shows its destination instead, so it is not
-/// silently dropped.
+/// silently dropped, and it stays clickable.
 #[test]
 fn empty_link_shows_destination() {
     let spans = r("[](https://example.com)");
-    assert_eq!(spans, vec![span("https://example.com", &[Style::Link])]);
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].text, "https://example.com");
+    assert_eq!(spans[0].styles, vec![Style::Link]);
+    assert_eq!(spans[0].link.as_deref(), Some("https://example.com"));
 }
 
-/// Styled text inside a link carries both styles.
+/// Styled text inside a link carries both styles and the destination.
 #[test]
 fn styled_link_text() {
-    assert_eq!(
-        styles_of(&r("[*a*](u)"), "a"),
-        vec![Style::Emphasis, Style::Link]
-    );
+    let spans = r("[*a*](u)");
+    assert_eq!(styles_of(&spans, "a"), vec![Style::Emphasis, Style::Link]);
+    assert_eq!(link_of(&spans, "a").as_deref(), Some("u"));
+}
+
+/// Adjacent text inside one link merges into a single span carrying the
+/// destination; different destinations stay separate spans.
+#[test]
+fn link_destinations_do_not_merge_across_links() {
+    let spans = r("[a](u)[b](v)");
+    assert_eq!(spans.len(), 2);
+    assert_eq!(link_of(&spans, "a").as_deref(), Some("u"));
+    assert_eq!(link_of(&spans, "b").as_deref(), Some("v"));
 }
 
 // --- Images ---------------------------------------------------------------

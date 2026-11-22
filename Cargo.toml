@@ -3,7 +3,7 @@ name = "md_viewer"
 # Copy of the VERSION file, which is the single source of the version. Cargo
 # needs a literal value here; `cargo test` (tests/version.rs) and the release
 # pipeline (scripts/check-version.sh) fail if the two ever differ.
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.98"
 description = "Simple GTK4/libadwaita Markdown viewer"
@@ -27,6 +27,8 @@ merman = { version = "0.9", default-features = false, features = ["svg", "all-di
 resvg = { version = "0.48", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
 # Search: regular-expression mode of the find bar (pure Rust).
 regex = "1"
+# Resolving and percent-decoding link destinations (pure Rust).
+url = "2.5"
 
 [dev-dependencies]
 tempfile = "3"
