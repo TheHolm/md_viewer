@@ -6,6 +6,43 @@ changes** summary (what also appears in the GitHub Release body) and a
 added at the top. `scripts/extract-release-notes.sh` prints just one release's
 section for the GitHub Release body.
 
+## v0.6.0 — Clickable links
+
+### User-facing changes
+
+- Links are clickable: a single click opens the destination in the text and
+  in table cells, and the pointer changes to a hand over a link. Dragging to
+  select still selects instead of opening. Hovering a link shows its raw
+  destination in a tooltip.
+- Web (`http`/`https`) and email (`mailto`) links open in the desktop's
+  default handler.
+- Local links open on disk: a Markdown file opens in the viewer (a new
+  window), any other file opens in its default application, and relative
+  paths are resolved against the document being viewed.
+- `#fragment` links scroll to the matching heading in the same document;
+  a Markdown link with a fragment opens that document and scrolls to the
+  heading. Unsafe or unsupported destinations (`javascript:`, `data:`, ...)
+  are ignored.
+
+### Details
+
+- Version 0.5.0 → 0.6.0 (new feature).
+- `Span` gains a `link` destination, threaded through the renderer (so
+  styled text inside a link, autolinks and empty links keep their
+  destination, and adjacent spans only merge when their destinations match).
+  `label_text` now also returns each link's byte range.
+- New `md_viewer::links`: `resolve_link` (resolves a destination against the
+  document into a web/local/Markdown/anchor target), `heading_slug`
+  (GitHub-style heading anchors), `LinkRanges` (character ranges of the
+  clickable text) and `file_uri`. The pure-Rust `url` dependency is added
+  for resolution and percent-decoding.
+- The GUI records link ranges while appending text and table cells, installs
+  a click gesture and a motion controller on the view (and per-cell labels,
+  hit-tested through the Pango layout), opens links with `GtkUriLauncher`,
+  and keeps a per-session map of heading anchors (with duplicate `-N`
+  suffixes) to scroll to. A fragment for a block not yet appended is
+  remembered and applied when it arrives.
+
 ## v0.5.0 — Search
 
 ### User-facing changes

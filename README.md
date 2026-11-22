@@ -50,6 +50,12 @@ rules, and:
 * **Mermaid diagrams** in ` ```mermaid ` code blocks: flowcharts, sequence
   diagrams, Gantt charts, pie charts, class and state diagrams and the other
   Mermaid diagram types.
+* **Clickable links** in text and table cells: web and `mailto:` links open
+  in the desktop's default handler, local links open on disk (Markdown files
+  in the viewer), relative paths resolve against the document, and
+  `#fragment` links scroll to the matching heading. Hovering a link shows
+  its destination in a tooltip. Unsafe schemes (`javascript:`, `data:`) are
+  ignored.
 
 A formula or diagram that cannot be rendered is shown as its source, with
 the reason. Images are shown as `[image: <alt text>]` placeholders, and raw
@@ -155,7 +161,6 @@ DISPLAY=:77 GDK_BACKEND=x11 GSK_RENDERER=cairo cargo llvm-cov --tests
 
 Planned features. Known bugs are listed in `BUGS.md`.
 
-* Clickable links.
 * Inline images.
 * Reload a document when it changes on disk.
 * An error popup instead of a message on STDERR for a bad `FILE` argument.

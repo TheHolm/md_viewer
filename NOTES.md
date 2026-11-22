@@ -35,6 +35,7 @@ Raise them only when every target platform ships the newer version.
 - `resvg` (features `text`, `system-fonts`, `memmap-fonts`) - rasterizes
   every SVG; SVG text uses the system fonts
 - `regex` - the find bar's regular-expression mode, pure Rust
+- `url` - resolving and percent-decoding link destinations, pure Rust
 - `clap` - command line argument parsing (the `FILE` argument)
 - `tempfile` (dev-dependency) - temporary files for integration tests
 
@@ -137,7 +138,8 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   and `StyledRun`s so labels can be styled with Pango attributes instead of
   markup). `render` turns Markdown into a `Vec<Block>`:
   `Block::Text` (flowing `Inline`s: `Inline::Text(Span)` - text plus its
-  `Style`s - and `Inline::Math(Math)`), `Block::Table(Table)` (per-column
+  `Style`s and an optional link destination - and `Inline::Math(Math)`),
+  `Block::Table(Table)` (per-column
   `Align`, header and rows of `Cell`s, i.e. `Vec<Inline>`) and
   `Block::Mermaid(Diagram)` and `Block::Code(CodeBlock)` (language from
   `code_language`, verbatim text, nesting `indent`; `clipboard_text` is what
@@ -193,11 +195,21 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   zero-width regex matches are skipped), `char_ranges` (byte to
   character-offset ranges for the text buffer) and the match navigation
   helpers (`next_index`, `first_at_or_after`).
+- `src/links.rs` (`md_viewer::links`) - clickable links, pure and tested:
+  `resolve_link` (a destination resolved against the document into a web,
+  local-file, Markdown-file or same-document-anchor target), `heading_slug`
+  (GitHub-style heading anchors; duplicate `-N` suffixes are added by the
+  GUI, which sees headings in order), `file_uri`, and `LinkRanges` (the
+  character ranges of the clickable text, accumulated as blocks are
+  appended).
 - `tests/` - integration tests split by topic:
   - `render.rs` - the renderer: one group of tests per block type
     (paragraphs, headings, lists, block quotes, code blocks, rules, tables,
     math, Mermaid) and per inline style (emphasis, strong, strikethrough,
     inline code, links, images), plus the Pango markup for table cells
+  - `links.rs` - link resolution (web, mail, local, relative, Markdown,
+    anchor, ignored schemes), heading slugs, `LinkRanges`, and the links
+    inside label text
   - `graphics.rs` - rasterizing, math and mhchem, Mermaid diagrams (several
     types, labels, scale, errors), filling in whole documents, that the
     showcase fixture renders, and that the root `showcase.md` renders with
@@ -315,6 +327,18 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   is ever dropped.
 - Images show as `[image: <alt text>]`; the image itself is not loaded.
 - Adjacent text with identical styles is merged into one span.
+- Links: a `Span` carries its destination, so the GUI makes the text
+  clickable without re-parsing. A single click opens it (web/`mailto:` and
+  non-Markdown local files via `GtkUriLauncher`, Markdown files in a new
+  viewer window, relative paths resolved against the document); a
+  `#fragment` scrolls to the matching heading, whose anchor is a
+  GitHub-style slug (duplicates get `-1`, `-2`, ...). Dangerous schemes
+  (`javascript:`, `data:`, ...) and empty destinations are ignored, and a
+  formula that is a link's only content is not clickable (it is drawn as
+  pixels). Hovering a link shows its raw destination in a tooltip: both the
+  text view and table-cell labels use `query-tooltip` (whose coordinates are
+  widget-space, the same as `dest_at`/`label_link_at`) and set plain tooltip
+  text, so destinations containing markup characters are safe.
 - Search matches the rendered document: the whole text buffer (including
   fallback sources), table-cell text, code-card text and the labels inside
   diagrams; formula source is not searchable (a rendered formula is
@@ -441,6 +465,14 @@ Things learned the hard way; add to this list when you learn another.
   byte ranges; `search::char_ranges` maps them. Pango `AttrList` indices
   (used to highlight table and code labels) are byte offsets into the
   label's text, so the byte ranges are used directly there.
+- `pango::Layout::xy_to_index` takes coordinates in **Pango units** (1/1024
+  px), not pixels: multiply widget coordinates by `pango::SCALE` before
+  hit-testing a label (see `label_link_at` in `main.rs`). Passing pixels
+  makes every hit land near the first character.
+- `Widget::query-tooltip` reports `x, y` in widget coordinates, and only
+  fires when `has_tooltip` is true. Link hover tooltips use it on both the
+  text view (`dest_at`) and the table-cell labels (`label_link_at`), with
+  `Tooltip::set_text` (plain text, so URLs with markup characters are safe).
 - Pango `AttrColor` channels are 16-bit (0-65535), unlike the 8-bit hex
   used by GDK/CSS; `layout::pango_channel` widens an 8-bit value by 257.
   Passing an 8-bit value straight through made the highlight background

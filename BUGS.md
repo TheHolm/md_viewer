@@ -44,6 +44,8 @@ Background on the rendering crates is in `NOTES.md`.
   label characters.
 - A search started while a document is still loading only covers the part
   already on the page; its results grow as blocks are appended.
+- A formula that is a link's only content is not clickable (it is drawn as
+  pixels, so there is no text to hit); the link still has the link style.
 
 ## Testing gaps
 
@@ -57,3 +59,9 @@ Background on the rendering crates is in `NOTES.md`.
   needs input events too, so the GUI tests only confirm the viewer starts
   and exits cleanly with it installed; the matching logic is fully tested
   and the interaction is checked by hand.
+- Clicking links (the view's click gesture, the pointer cursor, the hover
+  tooltip, table-cell link hit-testing, `GtkUriLauncher` and
+  cross-file/anchor scrolling) needs input events and a running desktop
+  session, so the GUI tests do not reach it; the resolution and range logic
+  is fully tested, and the interaction is checked by hand (or with `xdotool`
+  on Xvfb, see `NOTES.md`).
