@@ -2,9 +2,9 @@
 //! against a document, generating heading anchors, tracking clickable
 //! ranges, and the links inside label text.
 
-use md_viewer::links::{heading_slug, resolve_link, LinkRanges, Resolved};
-use md_viewer::{label_text, Inline, Style};
-use std::path::Path;
+use md_viewer::links::{heading_slug, resolve_image, resolve_link, LinkRanges, Resolved};
+use md_viewer::{label_text, ImageState, Inline, Style};
+use std::path::{Path, PathBuf};
 
 /// A document path the tests resolve links against.
 fn base() -> &'static Path {
@@ -197,5 +197,62 @@ fn label_text_links() {
                 dest: "v".to_string(),
             },
         ]
+    );
+}
+
+// --- resolve_image --------------------------------------------------------
+
+/// Relative and absolute paths, and `file:` URLs, become local files resolved
+/// against the document's folder.
+#[test]
+fn image_local_paths() {
+    assert_eq!(
+        resolve_image(base(), "pics/one.png"),
+        ImageState::Local(PathBuf::from("/home/user/docs/pics/one.png"))
+    );
+    assert_eq!(
+        resolve_image(base(), "/tmp/two.png"),
+        ImageState::Local(PathBuf::from("/tmp/two.png"))
+    );
+    assert_eq!(
+        resolve_image(base(), "file:///tmp/three.png"),
+        ImageState::Local(PathBuf::from("/tmp/three.png"))
+    );
+}
+
+/// Network destinations are remote: the viewer never loads them.
+#[test]
+fn image_remote() {
+    assert_eq!(
+        resolve_image(base(), "https://example.com/a.png"),
+        ImageState::Remote
+    );
+    assert_eq!(
+        resolve_image(base(), "http://example.com/a.png"),
+        ImageState::Remote
+    );
+    assert_eq!(
+        resolve_image(base(), "//example.com/a.png"),
+        ImageState::Remote
+    );
+}
+
+/// Other schemes and an empty source are unsupported, with a reason.
+#[test]
+fn image_unsupported() {
+    for src in ["data:image/png;base64,AA", "javascript:alert(1)", "   "] {
+        assert!(
+            matches!(resolve_image(base(), src), ImageState::Unsupported(_)),
+            "{src:?} should be unsupported"
+        );
+    }
+}
+
+/// A local destination is percent-decoded and a fragment is ignored.
+#[test]
+fn image_percent_decoding_and_fragment() {
+    assert_eq!(
+        resolve_image(base(), "my%20pic.png#part"),
+        ImageState::Local(PathBuf::from("/home/user/docs/my pic.png"))
     );
 }

@@ -8,6 +8,7 @@
 //! ([`heading_slug`]), and tracks the character ranges that are links
 //! ([`LinkRanges`]).
 
+use crate::ImageState;
 use std::path::{Path, PathBuf};
 use url::Url;
 
@@ -70,6 +71,42 @@ pub fn resolve_link(base: &Path, dest: &str) -> Resolved {
             }
         }
         _ => Resolved::Ignored,
+    }
+}
+
+/// Resolves `src`, a Markdown image destination, against `document` (the path
+/// of the document being viewed).
+///
+/// Only local files are ever loaded: a relative or absolute path (or a
+/// `file:` URL) becomes [`ImageState::Local`]; `http`/`https` (and a
+/// protocol-relative `//host/...`) become [`ImageState::Remote`], which the
+/// viewer does not support; any other scheme or an empty destination becomes
+/// [`ImageState::Unsupported`] with the reason to show.
+pub fn resolve_image(document: &Path, src: &str) -> ImageState {
+    let src = src.trim();
+    if src.is_empty() {
+        return ImageState::Unsupported("empty source".to_string());
+    }
+    if src.starts_with("//") {
+        return ImageState::Remote;
+    }
+    let Some(base) = file_url(document) else {
+        return ImageState::Unsupported("cannot resolve path".to_string());
+    };
+    let Ok(joined) = base.join(src) else {
+        return ImageState::Unsupported(format!("invalid destination: {src}"));
+    };
+    match joined.scheme() {
+        "http" | "https" => ImageState::Remote,
+        "file" => {
+            let mut joined = joined;
+            joined.set_fragment(None);
+            match joined.to_file_path() {
+                Ok(path) => ImageState::Local(path),
+                Err(()) => ImageState::Unsupported(format!("unsupported file URL: {src}")),
+            }
+        }
+        scheme => ImageState::Unsupported(format!("unsupported scheme: {scheme}")),
     }
 }
 

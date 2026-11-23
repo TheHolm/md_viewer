@@ -16,7 +16,19 @@ machine is now ~~a coffee machine~~ a modern art installation, and the
 kitchen smells of `burnt_ambition.log`.
 
 Further reading: the [incident tracker](https://example.com/incident/42) and
-the only surviving photo of the machine ![the machine, mid-explosion](machine.jpg).
+the only surviving witness ![a cat who saw everything](tests/fixtures/cat.svg).
+
+The aftermath, as the office webcam remembered it:
+
+![the kitchen, in its new modern-art form](tests/fixtures/cat.svg)
+
+The photographic evidence, for the insurance claim (images in table cells
+are shown as placeholders for now):
+
+| Exhibit | Picture |
+|---|---|
+| The valve | ![a valve, formerly attached](tests/fixtures/cat.svg) |
+| The manual | ![the manual, now mostly ash](tests/fixtures/cat.svg) |
 
 ### 1.1 Timeline of the morning
 

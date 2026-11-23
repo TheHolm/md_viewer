@@ -34,6 +34,10 @@ Raise them only when every target platform ships the newer version.
   Rust; used through its resvg-safe pipeline (labels as SVG text)
 - `resvg` (features `text`, `system-fonts`, `memmap-fonts`) - rasterizes
   every SVG; SVG text uses the system fonts
+- `image` (default features off; `png`, `jpeg`, `gif`, `webp`) - decodes
+  local image files for `![alt](path)`, pure Rust. Animated GIFs show only
+  their first frame; `.svg` image files are rasterized with the resvg path
+  instead
 - `regex` - the find bar's regular-expression mode, pure Rust
 - `url` - resolving and percent-decoding link destinations, pure Rust
 - `clap` - command line argument parsing (the `FILE` argument)
@@ -85,17 +89,21 @@ run there; runtime verification on a real FreeBSD system is a manual step.
     display math centred; tables are a `GtkGrid` of wrapping labels in a
     horizontal `GtkScrolledWindow`; code blocks are cards (`code_card`:
     language label, copy button, monospace selectable label in a horizontal
-    scroller); diagrams are a `GtkPicture` on a white card. Table and
+    scroller); diagrams are a `GtkPicture` on a white card. Images are a
+    `GtkPicture` registered in `Resizable` when standalone (fit to the view
+    width) or an `insert_paintable` inline (capped by the worker); a network,
+    unsupported or unreadable image becomes `[image: alt — reason]` text with
+    no `Slot`. Table and
     math-cell labels are plain text (`use_markup` off) styled with a single
     Pango attribute list built from `label_text`'s style runs (see
     `src/lib.rs`), never with markup. Every graphic on
-    the page has a `Slot` (its `ScaledTexture`, rise tag, diagram entry,
+    the page has a `Slot` (its `ScaledTexture`, rise tag, picture entry,
     buffer offset) so a re-render can replace it.
   - Anchored widgets only get their minimum size, so `Resizable` (run from
     a tick callback) sizes them from their content and the view width:
     tables at their natural width capped to the view (wider ones scroll),
-    code cards as wide as the view minus their indent, diagrams scaled down
-    to fit.
+    code cards as wide as the view minus their indent, diagrams and
+    standalone images scaled down to fit.
   - Zoom (`md_viewer::zoom`): `win.zoom-in`/`zoom-out`/`zoom-reset`
     (Ctrl+plus/=/minus/0 and keypad), Ctrl+scroll and a pinch
     (`GestureZoom`), all on the toolbar in the capture phase. The text size
@@ -138,25 +146,38 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   and `StyledRun`s so labels can be styled with Pango attributes instead of
   markup). `render` turns Markdown into a `Vec<Block>`:
   `Block::Text` (flowing `Inline`s: `Inline::Text(Span)` - text plus its
-  `Style`s and an optional link destination - and `Inline::Math(Math)`),
+  `Style`s and an optional link destination - `Inline::Math(Math)` and
+  `Inline::Image(ImageRef)`),
   `Block::Table(Table)` (per-column
   `Align`, header and rows of `Cell`s, i.e. `Vec<Inline>`) and
   `Block::Mermaid(Diagram)` and `Block::Code(CodeBlock)` (language from
   `code_language`, verbatim text, nesting `indent`; `clipboard_text` is what
-  the copy button copies). `Math` and `Diagram` carry an `image` that is
-  `None` after `render` and filled in by `graphics::render_document` or the
-  GUI's worker pool.
+  the copy button copies). `Math`, `Diagram` and `ImageRef` carry an `image`
+  that is `None` after `render` and filled in by `graphics::render_document`
+  or the GUI's worker pool. An `ImageRef` keeps its source as written and its
+  alt text, plus an `ImageState`: `Unresolved` (straight after `render`),
+  `Local(path)`, `Remote` (a network URL, never loaded) or
+  `Unsupported(reason)`. `resolve_images` (called by `open_document` and the
+  GUI, which know the document path) fills the state in with
+  `links::resolve_image`; `image_is_standalone(inlines, index)` says whether
+  an image is alone on its line (see the rendering-model note about merged
+  paragraphs). `ImageRef::placeholder` builds the `[image: alt — reason]`
+  text.
   `Style::tag_name` names each style's text tag; `Style::ALL` lists every
   style so all tags can be created up front. Private helpers (`Renderer`,
   `TableBuilder`, `push_inline`, `trailing_newlines`, `normalize`) have unit
   tests in the same file.
-- `src/graphics.rs` (`md_viewer::graphics`) - turning formulas and diagrams
-  into pixels: `math_svg`/`render_math` (mathra; math at `MATH_SCALE` =
+- `src/graphics.rs` (`md_viewer::graphics`) - turning formulas, diagrams and
+  images into pixels: `math_svg`/`render_math` (mathra; math at `MATH_SCALE` =
   1.21x the text size like KaTeX, in the text colour, with its depth below
   the baseline), `mermaid_svg`/`render_mermaid` (merman), `rasterize` (resvg
   into premultiplied RGBA `Image`s at a device scale; the system font
   database is loaded once and generic `sans-serif` is pointed at an
-  installed family, GNOME's Adwaita Sans first, see `pick_family`) and
+  installed family, GNOME's Adwaita Sans first, see `pick_family`),
+  `decode_image`/`load_image` for local image files (PNG/JPEG/GIF first
+  frame/WebP through the `image` crate, `.svg` through `rasterize`; straight
+  alpha is premultiplied, and the logical size grows with the zoom like math
+  and diagrams) and
   `render_document`, which fills in every graphic of a rendered document one
   after another. `rasterize` also collects every SVG text node into
   `Image::labels` (usvg expands `<use>`, so a diagram's labels are found at
@@ -165,13 +186,18 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   `zoom` times their natural size). Diagram labels are measured with the
   same font files resvg draws them with (merman's `native-fonts`,
   `native_fonts`/`font_files`; merman's built-in estimates if no font files
-  can be loaded). `Graphic` names one formula or diagram; `Cache` (one
+  can be loaded). `Graphic` names one formula, diagram or image; `Cache` (one
   shared instance, `Cache::shared`) keeps rendered formulas by source and
-  settings and laid-out diagram SVG by source, each map emptied when it
-  reaches its limit.
+  settings, laid-out diagram SVG by source, and decoded images by path and
+  settings, each map emptied when it reaches its limit. An image `Graphic`
+  carries an `inline` flag: inline images are capped to a few lines high
+  (`cap_inline`), standalone ones keep their natural size (the GUI then fits
+  them to the window like a diagram).
 - `src/progressive.rs` (`md_viewer::progressive`) - progressive, parallel
   loading: `for_each_graphic`/`jobs`/`place` number the graphics in
-  document order and store results; `Progress` decides which blocks may go
+  document order and store results (formulas everywhere, diagrams, and local
+  images in text; images in table cells and non-local images are skipped);
+  `Progress` decides which blocks may go
   on the page (strictly in order, each once complete) and what to re-render
   after a zoom (`reset_unshown`); `zoom_order`; `Phase` (FirstScreen,
   Background, Done); `Pool`, the worker threads (a shared queue taken from
@@ -195,9 +221,12 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   zero-width regex matches are skipped), `char_ranges` (byte to
   character-offset ranges for the text buffer) and the match navigation
   helpers (`next_index`, `first_at_or_after`).
-- `src/links.rs` (`md_viewer::links`) - clickable links, pure and tested:
+- `src/links.rs` (`md_viewer::links`) - clickable links and image
+  destinations, pure and tested:
   `resolve_link` (a destination resolved against the document into a web,
-  local-file, Markdown-file or same-document-anchor target), `heading_slug`
+  local-file, Markdown-file or same-document-anchor target), `resolve_image`
+  (`http`/`https` -> `Remote`, `file:`/paths -> `Local`, anything else ->
+  `Unsupported` with a reason), `heading_slug`
   (GitHub-style heading anchors; duplicate `-N` suffixes are added by the
   GUI, which sees headings in order), `file_uri`, and `LinkRanges` (the
   character ranges of the clickable text, accumulated as blocks are
@@ -206,18 +235,22 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   - `render.rs` - the renderer: one group of tests per block type
     (paragraphs, headings, lists, block quotes, code blocks, rules, tables,
     math, Mermaid) and per inline style (emphasis, strong, strikethrough,
-    inline code, links, images), plus the Pango markup for table cells
+    inline code, links, images), plus standalone-image detection, image
+    resolution, image placeholders and the Pango markup for table cells
   - `links.rs` - link resolution (web, mail, local, relative, Markdown,
-    anchor, ignored schemes), heading slugs, `LinkRanges`, and the links
-    inside label text
+    anchor, ignored schemes), image destination resolution (local, remote,
+    unsupported, percent-decoding), heading slugs, `LinkRanges`, and the
+    links inside label text
   - `graphics.rs` - rasterizing, math and mhchem, Mermaid diagrams (several
-    types, labels, scale, errors), filling in whole documents, that the
-    showcase fixture renders, and that the root `showcase.md` renders with
-    no fallbacks at all (every formula and diagram `Ok`)
+    types, labels, scale, errors), image decoding (PNG, JPEG, SVG,
+    premultiplication, zoom and the inline cap), filling in whole documents,
+    that the showcase fixture renders, and that the root `showcase.md`
+    renders with no fallbacks at all (every formula and diagram `Ok`)
   - `layout.rs` - the `md_viewer::layout` functions
   - `search.rs` - the find bar's matcher and navigation helpers (modes,
     smart case, ignore case, regex, Unicode folding)
-  - `progressive.rs` - numbering and placing graphics, `Progress`,
+  - `progressive.rs` - numbering and placing graphics (including images:
+    text-only, non-local skipped, standalone flag), `Progress`,
     `zoom_order`, `Phase`, worker counts and the `Pool` (delivers every
     result, stops when cancelled or dropped)
   - `zoom.rs` - zoom steps, clamping, scroll accumulation and the zoom CSS
@@ -234,8 +267,11 @@ run there; runtime verification on a real FreeBSD system is a manual step.
     their sizes (the symbolic one with fills only), and both the `.deb`
     assets and the FreeBSD staging in `release.yaml` install every file
   - `fixtures/showcase.md` - a terse document using every supported
-    feature plus one deliberately broken diagram; the tests' copy, with exact
+    feature (paragraph images inline and standalone, and an image in a table
+    cell) plus one deliberately broken diagram; the tests' copy, with exact
     expected counts (the human demo is the root `showcase.md`)
+  - `fixtures/cat.svg` - a small local image the showcase fixture references,
+    so the image path (resolve, decode, render) is exercised end to end
   - `fixtures/fallbacks.md` - formulas and diagrams that fail to render and
     math in aligned table cells, for the GUI's fallback paths
   - `document_io.rs` - reading a document from disk, including failure paths,
@@ -246,7 +282,8 @@ run there; runtime verification on a real FreeBSD system is a manual step.
 - `showcase.md` - the demo for humans (`cargo run -- showcase.md`): a
   humorous coffee-machine incident report using every supported feature -
   all heading levels, inline styles, nested lists and quotes, task lists,
-  code, three tables (aligned, wrapping, math and chemistry in cells),
+  code, four tables (aligned, wrapping, math, chemistry and image
+  placeholders in cells), paragraph images (inline and standalone),
   inline and display math including differential equations, mhchem, and
   flowchart, sequence, Gantt, pie, class and state diagrams. Everything in
   it must render (no fallbacks; `root_showcase_renders` enforces this);
@@ -325,7 +362,16 @@ run there; runtime verification on a real FreeBSD system is a manual step.
 - A formula or diagram that cannot be rendered is shown as its source in
   code style; display math and diagrams add a line with the reason. Nothing
   is ever dropped.
-- Images show as `[image: <alt text>]`; the image itself is not loaded.
+- Images: `![alt](path)` in a paragraph is loaded from a local file
+  (resolved against the document, `file:` URLs allowed) and drawn. An image
+  alone on its line is a standalone picture, scaled to the window width like
+  a diagram; one among text is an inline paintable capped to a few lines
+  high and sitting on the baseline. Raster formats go through the `image`
+  crate, `.svg` through resvg. Network destinations (`http`/`https`) are
+  never fetched - that is deliberately not supported and not planned - and
+  an empty source, unsupported scheme, missing file or unreadable format
+  shows `[image: <alt> — <reason>]`. Images in table cells are still
+  placeholders.
 - Adjacent text with identical styles is merged into one span.
 - Links: a `Span` carries its destination, so the GUI makes the text
   clickable without re-parsing. A single click opens it (web/`mailto:` and
@@ -494,6 +540,26 @@ Things learned the hard way; add to this list when you learn another.
 - A search started while a document is still loading only covers what is on
   the page so far; `append_ready` re-runs it as blocks arrive, so the count
   and marks grow until loading finishes.
+- Consecutive paragraphs are not separate `Block::Text`s: a blank line only
+  separates blocks when a table, diagram or code card sits between them, so
+  two paragraphs (and any images in them) are inlines of the same block.
+  Whether an image is "alone on its line" must therefore be decided from the
+  inlines around it (`image_is_standalone`), not from the block: looking back,
+  stop at the first newline (that is the start of the line); looking forward,
+  stop at the first newline. Stopping only when the whole inline list is
+  exhausted makes every image in a merged block look inline.
+- `image` crate pixels are straight (non-premultiplied) RGBA, but
+  `gdk::MemoryFormat::R8g8b8a8Premultiplied` is what `ScaledTexture` stores;
+  `graphics::premultiply` multiplies each channel by alpha first. Skipping it
+  makes transparent areas show as dark fringes.
+- Do not hold a `Cache` map's guard while calling `insert_bounded`: writing
+  `match lock(&map).get(&key) { ... insert_bounded(&map, ...) }` keeps the
+  scrutinee's guard alive for the whole `match` and deadlocks on the second
+  lock. Read `.cloned()` in its own statement first (the image cache does).
+- An image `Graphic`'s `inline` flag changes its sizing (inline is capped to
+  a few lines, standalone keeps its natural size and is fit to the window by
+  `Resizable`), so it is part of the job, not just the GUI: a zoom re-render
+  reproduces the same size class.
 
 ### Checking graphics visually
 

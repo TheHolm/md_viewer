@@ -2,8 +2,8 @@
 //! by block type and by inline style.
 
 use md_viewer::{
-    code_language, is_mermaid_info, label_text, render, Align, Block, Cell, CodeBlock, Diagram,
-    Inline, Math, Span, Style, Table, RULE_TEXT,
+    code_language, image_is_standalone, is_mermaid_info, label_text, render, resolve_images, Align,
+    Block, Cell, CodeBlock, Diagram, ImageRef, Inline, Math, Span, Style, Table, RULE_TEXT,
 };
 
 /// Renders `source` and flattens every text block into one list of spans,
@@ -19,7 +19,7 @@ fn r(source: &str) -> Vec<Span> {
         .flatten()
         .filter_map(|inline| match inline {
             Inline::Text(span) => Some(span),
-            Inline::Math(_) => None,
+            Inline::Math(_) | Inline::Image(_) => None,
         })
         .collect()
 }
@@ -516,7 +516,7 @@ fn table_cells_keep_inline_styles() {
 }
 
 /// A link in a cell shows its text with the link style (not its
-/// destination), and an image shows its placeholder.
+/// destination), and an image is an image element.
 #[test]
 fn table_cells_with_links_and_images() {
     let table = only_table("| a |\n|---|\n| [c](u) ![d](i) |");
@@ -525,7 +525,7 @@ fn table_cells_with_links_and_images() {
         vec![
             Inline::Text(link_span("c", &[Style::Link], "u")),
             Inline::Text(span(" ", &[])),
-            Inline::Text(span("[image: d]", &[Style::Image])),
+            Inline::Image(image("i", "d")),
         ]
     );
 }
@@ -674,28 +674,127 @@ fn link_destinations_do_not_merge_across_links() {
 
 // --- Images ---------------------------------------------------------------
 
-/// An image renders as an `[image: <alt text>]` placeholder.
+/// Builds an unresolved image, for exact-output assertions.
+fn image(src: &str, alt: &str) -> ImageRef {
+    ImageRef::new(src, alt)
+}
+
+/// An image renders as an image element carrying its source and alt text,
+/// not as text.
 #[test]
-fn image_placeholder() {
+fn image_carries_source_and_alt() {
     assert_eq!(
-        r("![a cat](cat.png)"),
-        vec![span("[image: a cat]", &[Style::Image])]
+        inlines("![a cat](cat.png)"),
+        vec![Inline::Image(image("cat.png", "a cat"))]
     );
 }
 
-/// An image without alt text still shows a placeholder.
+/// An image without alt text still carries an empty alt.
 #[test]
 fn image_without_alt() {
-    assert_eq!(plain_text(&r("![](cat.png)")), "[image: ]");
+    assert_eq!(
+        inlines("![](cat.png)"),
+        vec![Inline::Image(image("cat.png", ""))]
+    );
 }
 
-/// An image inside a link carries both styles.
+/// An image alone in a paragraph is standalone, so the GUI can scale it to
+/// the window width.
+#[test]
+fn image_alone_is_standalone() {
+    let blocks = render("![x](i.png)");
+    let inlines = match &blocks[0] {
+        Block::Text(inlines) => inlines,
+        other => panic!("expected a text block, got {other:?}"),
+    };
+    assert!(image_is_standalone(inlines, 0));
+}
+
+/// An image alone on its line is standalone even when a later paragraph
+/// shares the same text block (consecutive paragraphs stay one block).
+#[test]
+fn image_alone_before_text_is_standalone() {
+    let blocks = render("![x](i.png)\n\nnext paragraph");
+    let inlines = match &blocks[0] {
+        Block::Text(inlines) => inlines,
+        other => panic!("expected a text block, got {other:?}"),
+    };
+    let at = inlines
+        .iter()
+        .position(|inline| matches!(inline, Inline::Image(_)))
+        .unwrap();
+    assert!(image_is_standalone(inlines, at));
+}
+
+/// An image among text is inline, not standalone.
+#[test]
+fn image_with_text_is_inline() {
+    let blocks = render("see ![x](i.png) here");
+    let inlines = match &blocks[0] {
+        Block::Text(inlines) => inlines,
+        other => panic!("expected a text block, got {other:?}"),
+    };
+    let at = inlines
+        .iter()
+        .position(|inline| matches!(inline, Inline::Image(_)))
+        .unwrap();
+    assert!(!image_is_standalone(inlines, at));
+}
+
+/// An image inside a link is the link's content, so the bare destination is
+/// not shown as text.
 #[test]
 fn image_in_link() {
     assert_eq!(
-        styles_of(&r("[![x](i.png)](u)"), "[image: x]"),
-        vec![Style::Link, Style::Image]
+        inlines("[![x](i.png)](u)"),
+        vec![Inline::Image(image("i.png", "x"))]
     );
+}
+
+/// `placeholder` adds a reason to the `[image: …]` text, so the network case
+/// can say why nothing was loaded.
+#[test]
+fn image_placeholder_text() {
+    let image = ImageRef::new("x", "a cat");
+    assert_eq!(image.placeholder(None), "[image: a cat]");
+    assert_eq!(
+        image.placeholder(Some("network loading is not supported")),
+        "[image: a cat — network loading is not supported]"
+    );
+}
+
+/// `resolve_images` marks relative destinations local, resolves them against
+/// the document's folder, and flags network and other schemes as unsupported.
+#[test]
+fn resolves_image_destinations() {
+    let mut blocks = render("![a](one.png) ![b](https://x/y.png) ![c](data:x)");
+    resolve_images(&mut blocks, std::path::Path::new("/docs/notes.md"));
+    let images: Vec<&ImageRef> = inlines_of(&blocks)
+        .into_iter()
+        .filter_map(|inline| match inline {
+            Inline::Image(image) => Some(image),
+            _ => None,
+        })
+        .collect();
+    use md_viewer::ImageState;
+    assert_eq!(
+        images[0].state,
+        ImageState::Local(std::path::PathBuf::from("/docs/one.png"))
+    );
+    assert_eq!(images[1].state, ImageState::Remote);
+    assert!(matches!(images[2].state, ImageState::Unsupported(_)));
+}
+
+/// The inlines of `blocks` (all text blocks), by reference.
+fn inlines_of(blocks: &[Block]) -> Vec<&Inline> {
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            Block::Text(inlines) => Some(inlines),
+            _ => None,
+        })
+        .flatten()
+        .collect()
 }
 
 // --- Things shown as plain text ------------------------------------------
@@ -1071,6 +1170,20 @@ fn label_text_math_source() {
     );
 }
 
+/// An image in a label becomes its placeholder, since a label cannot show it.
+#[test]
+fn label_text_image_placeholder() {
+    let content = label_text(&[Inline::Image(image("i.png", "a cat"))]);
+    assert_eq!(content.text, "[image: a cat]");
+    assert_eq!(
+        content.runs,
+        vec![md_viewer::StyledRun {
+            range: 0..14,
+            styles: vec![Style::Image],
+        }]
+    );
+}
+
 /// Byte offsets stay correct across multi-byte characters.
 #[test]
 fn label_text_multibyte_offsets() {
@@ -1096,6 +1209,13 @@ fn pango_markup_rendered_math() {
     math.image = Some(Err("unused".to_string()));
     let markup = md_viewer::pango_markup(&[Inline::Math(math)]);
     assert!(markup.contains(">$$x$$</span>"), "{markup}");
+}
+
+/// An image in markup becomes its placeholder, since a label cannot show it.
+#[test]
+fn pango_markup_image_placeholder() {
+    let markup = md_viewer::pango_markup(&[Inline::Image(image("i.png", "cat"))]);
+    assert!(markup.contains("[image: cat]"), "{markup}");
 }
 
 /// An empty cell produces empty markup.

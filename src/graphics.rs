@@ -9,7 +9,7 @@
 use crate::Block;
 use resvg::{tiny_skia, usvg};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -368,7 +368,7 @@ pub fn render_mermaid(source: &str, settings: &RasterSettings) -> Rendered {
     rasterize_diagram(&mermaid_svg(source)?, settings)
 }
 
-/// One graphic to render: a formula or a diagram, by its source.
+/// One graphic to render: a formula, a diagram or an image.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Graphic {
     /// LaTeX math; `display` for `$$…$$`.
@@ -383,6 +383,107 @@ pub enum Graphic {
         /// The Mermaid source.
         source: String,
     },
+    /// A local image file.
+    Image {
+        /// The file to load.
+        path: PathBuf,
+        /// True when the image sits in the text (scaled to the line height)
+        /// rather than alone in its paragraph (scaled to the window width).
+        inline: bool,
+    },
+}
+
+/// The tallest an inline image is drawn, as a multiple of the body line
+/// height.
+const INLINE_IMAGE_MAX_LINES: f32 = 1.5;
+
+/// The widest an inline image is drawn, as a multiple of the body font size.
+const INLINE_IMAGE_MAX_EM: f32 = 12.0;
+
+/// Decodes the image file at `path` into premultiplied RGBA, with a logical
+/// size equal to its natural size at 100% zoom. SVG files are rasterized with
+/// [`rasterize`]; other files go through the `image` crate (PNG, JPEG, GIF -
+/// first frame only - and WebP).
+pub fn decode_image(path: &Path, settings: &RasterSettings) -> Rendered {
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read file: {e}"))?;
+    if is_svg_path(path) {
+        let svg = String::from_utf8(bytes).map_err(|e| format!("invalid SVG text: {e}"))?;
+        return rasterize(&svg, settings.font_px, settings.scale.max(1.0));
+    }
+    let decoded = image::load_from_memory(&bytes).map_err(|e| e.to_string())?;
+    let rgba = decoded.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    if width == 0 || height == 0 {
+        return Err("empty image".to_string());
+    }
+    Ok(Image {
+        width,
+        height,
+        scale: 1.0,
+        depth: 0.0,
+        pixels: premultiply(rgba.into_raw()),
+        labels: Vec::new(),
+    })
+}
+
+/// Loads the image file at `path` for display at the zoom in `settings`: its
+/// logical size grows with the zoom, like math and diagrams, so a re-render
+/// replaces the stretched picture with the right size.
+pub fn load_image(path: &Path, settings: &RasterSettings) -> Rendered {
+    decode_image(path, settings).map(|image| zoom_image(image, settings.zoom))
+}
+
+/// Multiplies every RGB channel by its alpha, for GDK's premultiplied format
+/// (the `image` crate returns straight alpha). Rounding matches resvg's own
+/// premultiplied output closely enough for the eye.
+fn premultiply(rgba: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(rgba.len());
+    for pixel in rgba.chunks_exact(4) {
+        let alpha = u32::from(pixel[3]);
+        for channel in &pixel[..3] {
+            out.push(((u32::from(*channel) * alpha + 127) / 255) as u8);
+        }
+        out.push(pixel[3]);
+    }
+    out
+}
+
+/// True if `path` names an SVG file by extension (case-insensitive).
+fn is_svg_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("svg"))
+}
+
+/// Scales an image's logical size by `zoom` (its pixels stay the same, so a
+/// raster image is upscaled when zoomed in).
+fn zoom_image(mut image: Image, zoom: f32) -> Image {
+    if zoom > 0.0 && (zoom - 1.0).abs() > f32::EPSILON {
+        image.scale /= zoom;
+    }
+    image
+}
+
+/// Shrinks `image` (keeping its aspect ratio) so an inline image does not
+/// dwarf the line it sits on: at most [`INLINE_IMAGE_MAX_LINES`] lines tall
+/// and [`INLINE_IMAGE_MAX_EM`] body-font widths wide. Smaller images are left
+/// alone.
+fn cap_inline(mut image: Image, settings: &RasterSettings) -> Image {
+    let line = settings.font_px * settings.zoom;
+    let max_height = line * INLINE_IMAGE_MAX_LINES;
+    let max_width = line * INLINE_IMAGE_MAX_EM;
+    let (width, height) = (image.logical_width(), image.logical_height());
+    let mut factor = 1.0_f32;
+    if height > max_height && height > 0.0 {
+        factor = factor.min(max_height / height);
+    }
+    if width > max_width && width > 0.0 {
+        factor = factor.min(max_width / width);
+    }
+    if factor < 1.0 {
+        image.scale /= factor;
+    }
+    image
 }
 
 /// What a cached formula is looked up by: source, display flag, settings.
@@ -393,6 +494,9 @@ const MATH_CACHE_LIMIT: usize = 4096;
 
 /// How many laid-out diagrams [`Cache`] keeps before it starts over.
 const DIAGRAM_CACHE_LIMIT: usize = 256;
+
+/// How many decoded images [`Cache`] keeps before it starts over.
+const IMAGE_CACHE_LIMIT: usize = 128;
 
 /// Remembers rendered formulas (by source and settings) and laid-out
 /// diagrams (by source), so a formula that appears many times is typeset
@@ -406,6 +510,8 @@ pub struct Cache {
     math: Mutex<HashMap<MathKey, Rendered>>,
     /// Laid-out diagram SVG (or the layout error) by source.
     diagrams: Mutex<HashMap<String, Result<Arc<String>, String>>>,
+    /// Decoded images by (path, device scale, body font size), at 100% zoom.
+    images: Mutex<HashMap<(PathBuf, u32, u32), Rendered>>,
     /// How many times a formula was typeset or a diagram laid out.
     misses: AtomicUsize,
 }
@@ -456,6 +562,31 @@ impl Cache {
                     }
                 };
                 rasterize_diagram(&svg?, settings)
+            }
+            Graphic::Image { path, inline } => {
+                let key = (
+                    path.clone(),
+                    settings.scale.to_bits(),
+                    settings.font_px.to_bits(),
+                );
+                let cached = lock(&self.images).get(&key).cloned();
+                let decoded = match cached {
+                    Some(found) => found,
+                    None => {
+                        self.misses.fetch_add(1, Ordering::Relaxed);
+                        let decoded = decode_image(path, settings);
+                        insert_bounded(&self.images, key, decoded.clone(), IMAGE_CACHE_LIMIT);
+                        decoded
+                    }
+                };
+                decoded.map(|image| {
+                    let image = zoom_image(image, settings.zoom);
+                    if *inline {
+                        cap_inline(image, settings)
+                    } else {
+                        image
+                    }
+                })
             }
         }
     }

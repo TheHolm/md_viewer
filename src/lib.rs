@@ -219,24 +219,134 @@ impl Math {
     }
 }
 
-/// One element of flowing text: a run of styled text or a formula.
+/// Where an image's destination points after it has been resolved against the
+/// document being viewed. Images are only ever loaded from local files:
+/// network access is deliberately not supported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageState {
+    /// Not resolved yet (straight after [`render`]); never loaded.
+    Unresolved,
+    /// A local file to load.
+    Local(std::path::PathBuf),
+    /// A network destination (`http`, `https`), which is not supported.
+    Remote,
+    /// An unsupported destination (an empty source, or a scheme such as
+    /// `data:`), with the reason to show instead of the image.
+    Unsupported(String),
+}
+
+/// An image: `![alt](path)`, shown in place of the Markdown.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageRef {
+    /// The destination as written in Markdown (a path or a URL), kept for the
+    /// placeholder and the tooltip.
+    pub src: String,
+    /// The alt text, shown when the image cannot be displayed.
+    pub alt: String,
+    /// The loaded image, filled in by [`graphics::render_document`] or the
+    /// GUI's worker pool; `None` straight after [`render`].
+    pub image: Option<Rendered>,
+    /// Where `src` points.
+    pub state: ImageState,
+}
+
+impl ImageRef {
+    /// Creates a not-yet-resolved image.
+    pub fn new(src: &str, alt: &str) -> Self {
+        ImageRef {
+            src: src.to_string(),
+            alt: alt.to_string(),
+            image: None,
+            state: ImageState::Unresolved,
+        }
+    }
+
+    /// The text shown in place of the image: `[image: <alt>]`, with `reason`
+    /// added when there is one (`[image: <alt> — <reason>]`).
+    pub fn placeholder(&self, reason: Option<&str>) -> String {
+        match reason {
+            Some(reason) if !reason.is_empty() => format!("[image: {} — {reason}]", self.alt),
+            _ => format!("[image: {}]", self.alt),
+        }
+    }
+}
+
+/// One element of flowing text: a run of styled text, a formula or an image.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Inline {
     /// Styled text.
     Text(Span),
     /// A formula.
     Math(Math),
+    /// An image.
+    Image(ImageRef),
 }
 
 impl Inline {
-    /// The text this inline element displays: a span's text, or a formula's
-    /// Markdown source.
+    /// The text this inline element displays: a span's text, a formula's
+    /// Markdown source, or an image's alt text.
     pub fn text(&self) -> String {
         match self {
             Inline::Text(span) => span.text.clone(),
             Inline::Math(math) => math.source(),
+            Inline::Image(image) => image.alt.clone(),
         }
     }
+}
+
+/// True if the inline at `index` in `inlines` is an image alone on its line:
+/// only whitespace and newlines separate it from the start and end of the
+/// line, so it can be shown on a line of its own, scaled to the window width,
+/// instead of inline with text.
+pub fn image_is_standalone(inlines: &[Inline], index: usize) -> bool {
+    let index = index.min(inlines.len());
+    // Look back: whitespace continues, a newline ends the line (and is fine),
+    // anything else is content on the same line.
+    let mut before_clear = true;
+    'before: for inline in inlines[..index].iter().rev() {
+        match inline {
+            Inline::Text(span) => {
+                for ch in span.text.chars().rev() {
+                    if ch == '\n' {
+                        break 'before;
+                    }
+                    if !ch.is_whitespace() {
+                        before_clear = false;
+                        break 'before;
+                    }
+                }
+            }
+            Inline::Math(_) | Inline::Image(_) => {
+                before_clear = false;
+                break 'before;
+            }
+        }
+    }
+    if !before_clear {
+        return false;
+    }
+    // Look forward the same way.
+    let mut after_clear = true;
+    'after: for inline in inlines[index.saturating_add(1).min(inlines.len())..].iter() {
+        match inline {
+            Inline::Text(span) => {
+                for ch in span.text.chars() {
+                    if ch == '\n' {
+                        break 'after;
+                    }
+                    if !ch.is_whitespace() {
+                        after_clear = false;
+                        break 'after;
+                    }
+                }
+            }
+            Inline::Math(_) | Inline::Image(_) => {
+                after_clear = false;
+                break 'after;
+            }
+        }
+    }
+    after_clear
 }
 
 /// The horizontal alignment of a table column.
@@ -406,6 +516,12 @@ pub fn pango_markup(inlines: &[Inline]) -> String {
                 styles: vec![Style::Code],
                 link: None,
             },
+            // A label cannot show the image; show its placeholder.
+            Inline::Image(image) => Span {
+                text: image.placeholder(None),
+                styles: vec![Style::Image],
+                link: None,
+            },
         };
         let text = escape_markup(&span.text);
         let attributes: Vec<String> = span.styles.iter().map(|s| markup_attributes(*s)).collect();
@@ -461,6 +577,8 @@ pub fn label_text(inlines: &[Inline]) -> LabelText {
         let (span_text, styles, link) = match inline {
             Inline::Text(span) => (span.text.clone(), span.styles.clone(), span.link.clone()),
             Inline::Math(math) => (math.source(), vec![Style::Code], None),
+            // A label cannot show the image; show its placeholder.
+            Inline::Image(image) => (image.placeholder(None), vec![Style::Image], None),
         };
         let start = text.len();
         text.push_str(&span_text);
@@ -510,8 +628,44 @@ pub fn read_document(path: &Path) -> io::Result<String> {
 }
 
 /// Reads the document at `path` and renders it, ready for display.
+///
+/// Image destinations are resolved against `path` (see [`resolve_images`]).
 pub fn open_document(path: &Path) -> io::Result<Vec<Block>> {
-    read_document(path).map(|text| render(&text))
+    let text = read_document(path)?;
+    let mut blocks = render(&text);
+    resolve_images(&mut blocks, path);
+    Ok(blocks)
+}
+
+/// Resolves every image destination in `blocks` against the document at
+/// `document`, so each one knows whether it is a local file, a network
+/// destination (not supported) or an unsupported scheme. Called after
+/// [`render`], which has no document path, and before the images are loaded.
+pub fn resolve_images(blocks: &mut [Block], document: &Path) {
+    for block in blocks {
+        match block {
+            Block::Text(inlines) => resolve_images_in(inlines, document),
+            Block::Table(table) => {
+                for cell in table
+                    .header
+                    .iter_mut()
+                    .chain(table.rows.iter_mut().flatten())
+                {
+                    resolve_images_in(cell, document);
+                }
+            }
+            Block::Mermaid(_) | Block::Code(_) => {}
+        }
+    }
+}
+
+/// Resolves the image destinations among `inlines` (see [`resolve_images`]).
+fn resolve_images_in(inlines: &mut [Inline], document: &Path) {
+    for inline in inlines {
+        if let Inline::Image(image) = inline {
+            image.state = links::resolve_image(document, &image.src);
+        }
+    }
 }
 
 /// Builds the user-facing message for a document that could not be opened.
@@ -633,6 +787,8 @@ struct Renderer {
     /// The destination of the link being rendered and whether any of its text
     /// has been written yet, if inside a link.
     link: Option<(String, bool)>,
+    /// The destination and alt text collected so far, if inside an image.
+    image: Option<(String, String)>,
     /// True right after display math, so the text that follows starts on a
     /// new line.
     after_display: bool,
@@ -737,9 +893,8 @@ impl Renderer {
                 self.style_stack.push(Style::Link);
                 self.link = Some((dest_url.to_string(), false));
             }
-            Tag::Image { .. } => {
-                self.style_stack.push(Style::Image);
-                self.text("[image: ");
+            Tag::Image { dest_url, .. } => {
+                self.image = Some((dest_url.to_string(), String::new()));
             }
             // Extensions that are not enabled; their content still arrives as
             // ordinary events and is shown as text.
@@ -816,8 +971,19 @@ impl Renderer {
                 self.style_stack.pop();
             }
             TagEnd::Image => {
-                self.text("]");
-                self.style_stack.pop();
+                if let Some((src, alt)) = self.image.take() {
+                    // An image is content: a link whose only content it is
+                    // must not show its bare destination.
+                    if let Some((_, has_text)) = self.link.as_mut() {
+                        *has_text = true;
+                    }
+                    let image = Inline::Image(ImageRef::new(&src, &alt));
+                    if let Some(cell) = self.table.as_mut().and_then(|t| t.current_cell.as_mut()) {
+                        cell.push(image);
+                    } else {
+                        self.push_inline_element(image);
+                    }
+                }
             }
             _ => {}
         }
@@ -846,6 +1012,16 @@ impl Renderer {
     /// Any non-empty text written while inside a link (wherever it is routed)
     /// marks the link as having text, so its destination is not shown.
     fn text(&mut self, text: &str) {
+        // Alt text is collected for the image instead of being written out.
+        if let Some((_, alt)) = self.image.as_mut() {
+            alt.push_str(text);
+            if let Some((_, has_text)) = self.link.as_mut() {
+                if !text.is_empty() {
+                    *has_text = true;
+                }
+            }
+            return;
+        }
         if let Some((_, has_text)) = self.link.as_mut() {
             if !text.is_empty() {
                 *has_text = true;

@@ -56,10 +56,18 @@ rules, and:
   `#fragment` links scroll to the matching heading. Hovering a link shows
   its destination in a tooltip. Unsafe schemes (`javascript:`, `data:`) are
   ignored.
+* **Local images**: `![alt](path)` in a paragraph is loaded from disk and
+  shown - alone on a line scaled to the window width, or inline with the
+  text at about the line height. Relative paths resolve against the
+  document. Network images (`http`/`https`) are **not supported, and never
+  will be**: the viewer deliberately loads nothing over the network. An
+  image that cannot be shown says why in its placeholder
+  (`[image: <alt> — <reason>]`).
 
 A formula or diagram that cannot be rendered is shown as its source, with
-the reason. Images are shown as `[image: <alt text>]` placeholders, and raw
-HTML is shown as plain text.
+the reason. An image that cannot be loaded (missing file, unreadable format
+or a network address) shows a `[image: <alt> — <reason>]` placeholder, and
+raw HTML is shown as plain text.
 
 `showcase.md` at the top of the repository shows every feature in one
 (slightly silly) document - an incident report about a coffee machine, with
@@ -161,7 +169,6 @@ DISPLAY=:77 GDK_BACKEND=x11 GSK_RENDERER=cairo cargo llvm-cov --tests
 
 Planned features. Known bugs are listed in `BUGS.md`.
 
-* Inline images.
 * Reload a document when it changes on disk.
 * An error popup instead of a message on STDERR for a bad `FILE` argument.
 * Remember the zoom level between runs.

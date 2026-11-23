@@ -40,6 +40,16 @@ Background on the rendering crates is in `NOTES.md`.
 - Search does not cover the source of a rendered formula (it is drawn as
   pixels); only the fallback source shown for a formula that could not be
   rendered is searchable.
+- Images in table cells are still shown as `[image: <alt>]` placeholders;
+  only images in paragraphs are drawn (for now).
+- Network images (`http`/`https`) are not supported, and that is not
+  planned: the viewer deliberately loads nothing over the network. Such an
+  image shows a placeholder saying so.
+- An animated GIF shows only its first frame.
+- Raster images embedded inside an SVG image file are not loaded (resvg is
+  built without raster image decoders); the SVG's own vector content is.
+- An image that is a link's only content is not clickable (it is a picture,
+  not text), like a formula that is a link's only content.
 - A match inside a diagram highlights the whole diagram card, not the exact
   label characters.
 - A search started while a document is still loading only covers the part
@@ -65,3 +75,8 @@ Background on the rendering crates is in `NOTES.md`.
   session, so the GUI tests do not reach it; the resolution and range logic
   is fully tested, and the interaction is checked by hand (or with `xdotool`
   on Xvfb, see `NOTES.md`).
+- How a loaded image is placed (standalone at the window width, inline at
+  the line height, and its place in a zoom re-render) needs a display and
+  input events, so the GUI tests only confirm the viewer starts and exits
+  cleanly with an image in the document; the decoding, sizing arithmetic and
+  resolution logic are tested, and the placement is checked by hand.

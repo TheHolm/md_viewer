@@ -6,6 +6,49 @@ changes** summary (what also appears in the GitHub Release body) and a
 added at the top. `scripts/extract-release-notes.sh` prints just one release's
 section for the GitHub Release body.
 
+## v0.7.0 — Local images
+
+### User-facing changes
+
+- Images referenced by `![alt](path)` in a paragraph are now loaded from
+  disk and shown: an image alone on its line is scaled to the window width,
+  one among text sits inline at about the line height. Relative paths resolve
+  against the document; PNG, JPEG, GIF (first frame), WebP and SVG files
+  work.
+- Images are local-only: a network image (`http`/`https`) is **not
+  supported and will not be** - the viewer loads nothing over the network -
+  and says so in its placeholder.
+- An image that cannot be shown (missing file, unreadable format, network
+  address) appears as `[image: <alt> — <reason>]` instead of being dropped.
+- Images scale with zoom like everything else, and a re-render sharpens the
+  pictures after the zoom settles.
+
+### Details
+
+- Version 0.6.0 → 0.7.0 (new feature).
+- The renderer no longer writes `[image: alt]` as text: it collects the alt
+  text while inside `Tag::Image` and emits `Inline::Image(ImageRef)`
+  (source, alt, `image`, `ImageState`). `Inline::text` is the alt text;
+  `label_text`/`pango_markup` still show the placeholder, since table cells
+  (and labels) cannot hold pictures yet.
+- New `md_viewer::links::resolve_image` resolves a destination into
+  `ImageState::Local(path)` / `Remote` / `Unsupported(reason)`; the new
+  `resolve_images` walks a rendered document and fills the states in, called
+  by `open_document` and the GUI (which know the document path).
+  `image_is_standalone(inlines, index)` decides, line by line within the
+  merged text block, whether the GUI should treat an image as a block.
+- New `md_viewer::graphics::decode_image`/`load_image` decode a file into
+  premultiplied RGBA with the pure-Rust `image` crate (new dependency:
+  `default-features = false`, `png`, `jpeg`, `gif`, `webp`); `.svg` files use
+  the existing resvg path. Logical size grows with zoom, like math and
+  diagrams. `Graphic::Image { path, inline }` joins the worker jobs; the
+  shared `Cache` also keeps decoded images by path and settings, and inline
+  images are capped to a few lines high.
+- The GUI inserts a standalone image as a `GtkPicture` sized to the view
+  (registered with `Resizable` alongside diagrams), an inline one as a
+  buffer paintable; network/unsupported/unreadable images are placeholder
+  text and add no slot. Images in table cells remain placeholders.
+
 ## v0.6.0 — Clickable links
 
 ### User-facing changes

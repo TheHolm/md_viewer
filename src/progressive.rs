@@ -13,29 +13,31 @@
 //! generation number and dropped.
 
 use crate::graphics::{Cache, Graphic, RasterSettings, Rendered};
-use crate::{Block, Inline};
+use crate::{Block, ImageState, Inline};
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Calls `visit` for every graphic in `blocks`, in document order (formulas
-/// in text, then in table cells row by row, and diagrams), with the index of
-/// the block it is in, what to render, and where its result goes.
+/// in text, then in table cells row by row, diagrams, and local images in
+/// text), with the index of the block it is in, what to render, and where its
+/// result goes. Images in table cells are not rendered (they stay
+/// placeholders), and neither are images that are not local files.
 pub fn for_each_graphic(
     blocks: &mut [Block],
     mut visit: impl FnMut(usize, Graphic, &mut Option<Rendered>),
 ) {
     for (index, block) in blocks.iter_mut().enumerate() {
         match block {
-            Block::Text(inlines) => visit_inlines(index, inlines, &mut visit),
+            Block::Text(inlines) => visit_inlines(index, inlines, true, &mut visit),
             Block::Table(table) => {
                 for cell in table
                     .header
                     .iter_mut()
                     .chain(table.rows.iter_mut().flatten())
                 {
-                    visit_inlines(index, cell, &mut visit);
+                    visit_inlines(index, cell, false, &mut visit);
                 }
             }
             Block::Mermaid(diagram) => {
@@ -49,19 +51,40 @@ pub fn for_each_graphic(
     }
 }
 
-/// Visits the formulas among `inlines` (see [`for_each_graphic`]).
+/// Visits the formulas among `inlines`, and - when `images` is true - the
+/// local images too (see [`for_each_graphic`]).
 fn visit_inlines(
     index: usize,
     inlines: &mut [Inline],
+    images: bool,
     visit: &mut impl FnMut(usize, Graphic, &mut Option<Rendered>),
 ) {
-    for inline in inlines.iter_mut() {
-        if let Inline::Math(math) = inline {
-            let graphic = Graphic::Math {
-                tex: math.tex.clone(),
-                display: math.display,
-            };
-            visit(index, graphic, &mut math.image);
+    let standalone: Vec<bool> = (0..inlines.len())
+        .map(|at| {
+            images
+                && matches!(inlines[at], Inline::Image(_))
+                && crate::image_is_standalone(inlines, at)
+        })
+        .collect();
+    for (at, inline) in inlines.iter_mut().enumerate() {
+        match inline {
+            Inline::Math(math) => {
+                let graphic = Graphic::Math {
+                    tex: math.tex.clone(),
+                    display: math.display,
+                };
+                visit(index, graphic, &mut math.image);
+            }
+            Inline::Image(image) if images => {
+                if let ImageState::Local(path) = &image.state {
+                    let graphic = Graphic::Image {
+                        path: path.clone(),
+                        inline: !standalone[at],
+                    };
+                    visit(index, graphic, &mut image.image);
+                }
+            }
+            _ => {}
         }
     }
 }

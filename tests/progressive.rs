@@ -9,6 +9,7 @@ use md_viewer::progressive::{
     SPINNER_DELAY_MS,
 };
 use md_viewer::{render, Block, Inline};
+use std::path::Path;
 use std::sync::mpsc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -30,6 +31,7 @@ fn summary(jobs: &[Job]) -> Vec<(usize, String)> {
                     format!("{tex}{}", if *display { "!" } else { "" })
                 }
                 Graphic::Diagram { .. } => "diagram".to_string(),
+                Graphic::Image { .. } => "image".to_string(),
             };
             (job.block, what)
         })
@@ -275,4 +277,73 @@ fn pool_without_jobs() {
         let _ = sender.lock().unwrap().send(id);
     });
     assert!(receiver.recv_timeout(Duration::from_secs(10)).is_err());
+}
+
+// --- Images ---------------------------------------------------------------
+
+/// A document with a standalone image, an inline image and an image in a
+/// table cell, next to plain text.
+const IMAGE_DOCUMENT: &str = "![a](one.png)\n\n\
+                              see ![b](two.png) here\n\n\
+                              | x |\n|---|\n| ![c](three.png) |";
+
+/// Local images in text become graphics (a standalone one is marked so it is
+/// sized to the window width); an image in a table cell does not, since table
+/// cells are not rendered yet.
+#[test]
+fn image_jobs_skip_table_cells() {
+    let mut blocks = render(IMAGE_DOCUMENT);
+    md_viewer::resolve_images(&mut blocks, Path::new("/docs/notes.md"));
+    let jobs = jobs(&mut blocks);
+    let flags: Vec<bool> = jobs
+        .iter()
+        .filter_map(|job| match &job.graphic {
+            Graphic::Image { inline, .. } => Some(*inline),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(flags, vec![false, true]);
+    let table = blocks
+        .iter()
+        .position(|block| matches!(block, Block::Table(_)))
+        .unwrap();
+    assert!(jobs.iter().all(|job| job.block != table));
+}
+
+/// A network image is never rendered (its placeholder is shown directly), so
+/// it creates no job and does not hold its block back.
+#[test]
+fn remote_images_are_not_rendered() {
+    let mut blocks = render("![a](https://example.com/a.png)");
+    md_viewer::resolve_images(&mut blocks, Path::new("/docs/notes.md"));
+    assert!(jobs(&mut blocks).is_empty());
+}
+
+/// A block waits for its image, like for a formula.
+#[test]
+fn progress_waits_for_images() {
+    let mut blocks = render("![a](one.png)");
+    md_viewer::resolve_images(&mut blocks, Path::new("/docs/notes.md"));
+    let jobs = jobs(&mut blocks);
+    assert_eq!(jobs.len(), 1);
+    let mut progress = Progress::new(blocks.len(), &jobs);
+    assert_eq!(progress.take_ready(), 0..0);
+    progress.complete(0);
+    assert_eq!(progress.take_ready(), 0..1);
+    assert!(progress.all_shown());
+}
+
+/// `place` stores an image result on the image element, in order.
+#[test]
+fn place_stores_image_result() {
+    let mut blocks = render("![a](one.png)");
+    md_viewer::resolve_images(&mut blocks, Path::new("/docs/notes.md"));
+    assert!(place(&mut blocks, 0, Err("broken".to_string())));
+    let Block::Text(inlines) = &blocks[0] else {
+        panic!("expected a text block");
+    };
+    let Inline::Image(image) = &inlines[0] else {
+        panic!("expected an image");
+    };
+    assert_eq!(image.image, Some(Err("broken".to_string())));
 }

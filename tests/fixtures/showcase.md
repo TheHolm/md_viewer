@@ -6,7 +6,9 @@ Every feature the viewer renders, in one document. Open it with
 ## Text
 
 Plain text with **strong**, *emphasis*, ~~strikethrough~~, `inline code`,
-a [link](https://example.com) and an image placeholder ![a cat](cat.png).
+a [link](https://example.com) and an image ![a cat](cat.svg).
+
+![a cat on a line of its own](cat.svg)
 
 > A block quote,
 > spanning two lines.
@@ -39,6 +41,10 @@ fn main() {
 |---|---|
 | Wrapping | A long cell wraps onto several lines instead of stretching the table beyond the width of the window. |
 | Math | $E = mc^2$ and $\ce{H2O}$ inside cells |
+
+| Cell image |
+|---|
+| ![a cat in a table cell](cat.svg) |
 
 ## Math
 

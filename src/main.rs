@@ -17,8 +17,8 @@ use md_viewer::progressive::{self, Job, Phase, Pool, Progress};
 use md_viewer::search::{self, Matcher, SearchMode};
 use md_viewer::zoom::{self, Zoom};
 use md_viewer::{
-    label_text, Align, Block, Diagram, Inline, LabelLink, LabelText, Math, Origin, Style,
-    StyledRun, Table, Target, APP_ID,
+    label_text, Align, Block, Diagram, ImageRef, ImageState, Inline, LabelLink, LabelText, Math,
+    Origin, Style, StyledRun, Table, Target, APP_ID,
 };
 use md_viewer::{layout, CodeBlock};
 use std::cell::{Cell, RefCell};
@@ -57,6 +57,10 @@ const POLL_MS: u64 = 16;
 /// How long after the last zoom step graphics are re-rendered, in
 /// milliseconds; until then they are shown stretched.
 const REZOOM_DELAY_MS: u64 = 150;
+
+/// What the placeholder for an image with a network destination says: the
+/// viewer never fetches anything, and that is not planned.
+const NETWORK_UNSUPPORTED: &str = "network loading is not supported";
 
 /// Styling for the widgets the document is built from (tables, code cards,
 /// diagrams, the loading cover). Colours derive from the theme's text
@@ -203,10 +207,10 @@ struct Resizable {
     /// The horizontal scrollers around tables, sized to the table's natural
     /// width but never wider than the view.
     tables: RefCell<Vec<gtk4::ScrolledWindow>>,
-    /// Diagram pictures with their natural logical size (at the current
-    /// zoom); scaled down (keeping the aspect ratio) when the view is
-    /// narrower.
-    diagrams: RefCell<Vec<(gtk4::Picture, f32, f32)>>,
+    /// Pictures (diagrams and standalone images) with their natural logical
+    /// size (at the current zoom); scaled down (keeping the aspect ratio) when
+    /// the view is narrower.
+    pictures: RefCell<Vec<(gtk4::Picture, f32, f32)>>,
     /// Code cards with their nesting depth, as wide as the view allows.
     codes: RefCell<Vec<(gtk4::Box, usize)>>,
 }
@@ -229,7 +233,7 @@ impl Resizable {
                 scroller.set_size_request(size.0, size.1);
             }
         }
-        for (picture, natural_width, natural_height) in self.diagrams.borrow().iter() {
+        for (picture, natural_width, natural_height) in self.pictures.borrow().iter() {
             let size = layout::diagram_size(*natural_width, *natural_height, width);
             if picture.size_request() != size {
                 picture.set_size_request(size.0, size.1);
@@ -251,8 +255,9 @@ struct Slot {
     texture: ScaledTexture,
     /// The tag lowering an inline formula onto the baseline, if any.
     rise: Option<gtk4::TextTag>,
-    /// The diagram's entry in [`Resizable::diagrams`], if it is a diagram.
-    diagram: Option<usize>,
+    /// The picture's entry in [`Resizable::pictures`], for a diagram or a
+    /// standalone image (which are sized to the view width).
+    picture: Option<usize>,
     /// The buffer offset the graphic (or its table) is at.
     offset: i32,
     /// How far the graphic reaches below the baseline, in pixels.
@@ -274,14 +279,14 @@ impl Slot {
         self.update_extras(width, height, resizable);
     }
 
-    /// Updates the baseline offset and the diagram's natural size after the
+    /// Updates the baseline offset and the picture's natural size after the
     /// picture changed size.
     fn update_extras(&self, width: f32, height: f32, resizable: &Resizable) {
         if let Some(rise) = &self.rise {
             rise.set_rise(layout::math_rise(self.depth.get(), pango::SCALE));
         }
-        if let Some(index) = self.diagram {
-            if let Some(entry) = resizable.diagrams.borrow_mut().get_mut(index) {
+        if let Some(index) = self.picture {
+            if let Some(entry) = resizable.pictures.borrow_mut().get_mut(index) {
                 entry.1 = width;
                 entry.2 = height;
             }
@@ -678,15 +683,15 @@ impl Session {
                     .collect::<Vec<_>>()
                     .join("\n");
                 self.add_diagram_entry(&card, labels, offset);
-                let mut diagrams = self.resizable.diagrams.borrow_mut();
+                let mut pictures = self.resizable.pictures.borrow_mut();
                 self.add_slot(Some(Slot {
                     texture,
                     rise: None,
-                    diagram: Some(diagrams.len()),
+                    picture: Some(pictures.len()),
                     offset,
                     depth: Cell::new(0.0),
                 }));
-                diagrams.push((picture, image.logical_width(), image.logical_height()));
+                pictures.push((picture, image.logical_width(), image.logical_height()));
             }
             failed => {
                 self.add_slot(None);
@@ -726,8 +731,16 @@ impl Session {
     }
 
     /// Inserts `inlines` at the end of `buffer`, tagging each with its styles.
+    /// An image alone in the block is shown as a picture scaled to the view
+    /// width; one among text is shown inline.
     fn insert_inlines(&self, buffer: &gtk4::TextBuffer, inlines: &[Inline]) {
-        for inline in inlines {
+        let standalone: Vec<bool> = (0..inlines.len())
+            .map(|at| {
+                matches!(inlines[at], Inline::Image(_))
+                    && md_viewer::image_is_standalone(inlines, at)
+            })
+            .collect();
+        for (at, inline) in inlines.iter().enumerate() {
             match inline {
                 Inline::Text(span) => {
                     let start = buffer.end_iter().offset();
@@ -740,6 +753,7 @@ impl Session {
                     }
                 }
                 Inline::Math(math) => self.insert_math(buffer, math),
+                Inline::Image(image) => self.insert_image(buffer, image, standalone[at]),
             }
         }
     }
@@ -766,7 +780,7 @@ impl Session {
                 self.add_slot(Some(Slot {
                     texture,
                     rise: Some(rise),
-                    diagram: None,
+                    picture: None,
                     offset: start,
                     depth: Cell::new(image.depth),
                 }));
@@ -787,6 +801,79 @@ impl Session {
                 } else {
                     insert_styled(buffer, &math.source(), &[Style::Code]);
                 }
+            }
+        }
+    }
+
+    /// Inserts an image at the end of `buffer`. A local image that loaded is
+    /// shown as a picture (standalone, scaled to the view width) or as an
+    /// inline paintable; anything else - a network destination, an unsupported
+    /// scheme, a missing or broken file - is shown as a placeholder saying
+    /// why. Images that are not local files are not rendered by the worker
+    /// pool, so they add no slot.
+    fn insert_image(&self, buffer: &gtk4::TextBuffer, image: &ImageRef, standalone: bool) {
+        match &image.state {
+            ImageState::Remote => {
+                insert_styled(
+                    buffer,
+                    &image.placeholder(Some(NETWORK_UNSUPPORTED)),
+                    &[Style::Image],
+                );
+                return;
+            }
+            ImageState::Unsupported(reason) => {
+                insert_styled(buffer, &image.placeholder(Some(reason)), &[Style::Image]);
+                return;
+            }
+            ImageState::Unresolved => {
+                insert_styled(
+                    buffer,
+                    &image.placeholder(Some("not resolved")),
+                    &[Style::Image],
+                );
+                return;
+            }
+            ImageState::Local(_) => {}
+        }
+        match &image.image {
+            Some(Ok(rendered)) => {
+                let texture = ScaledTexture::new(rendered);
+                if standalone {
+                    let picture = gtk4::Picture::for_paintable(&texture);
+                    picture.set_can_shrink(true);
+                    picture.set_content_fit(gtk4::ContentFit::Contain);
+                    let offset = buffer.end_iter().offset();
+                    let anchor = buffer.create_child_anchor(&mut buffer.end_iter());
+                    self.view.add_child_at_anchor(&picture, &anchor);
+                    let mut pictures = self.resizable.pictures.borrow_mut();
+                    let index = pictures.len();
+                    self.add_slot(Some(Slot {
+                        texture,
+                        rise: None,
+                        picture: Some(index),
+                        offset,
+                        depth: Cell::new(0.0),
+                    }));
+                    pictures.push((picture, rendered.logical_width(), rendered.logical_height()));
+                } else {
+                    let start = buffer.end_iter().offset();
+                    buffer.insert_paintable(&mut buffer.end_iter(), &texture);
+                    self.add_slot(Some(Slot {
+                        texture,
+                        rise: None,
+                        picture: None,
+                        offset: start,
+                        depth: Cell::new(0.0),
+                    }));
+                }
+            }
+            failed => {
+                self.add_slot(None);
+                let reason = match failed {
+                    Some(Err(reason)) => reason.as_str(),
+                    _ => "not rendered",
+                };
+                insert_styled(buffer, &image.placeholder(Some(reason)), &[Style::Image]);
             }
         }
     }
@@ -898,7 +985,7 @@ impl Session {
                     self.add_slot(Some(Slot {
                         texture,
                         rise: None,
-                        diagram: None,
+                        picture: None,
                         offset,
                         depth: Cell::new(image.depth),
                     }));
@@ -2320,7 +2407,11 @@ fn open_file_to(window: &Rc<DocWindow>, path: PathBuf, origin: Origin, fragment:
     glib::spawn_future_local(async move {
         let worker_path = path.clone();
         let parsed = gio::spawn_blocking(move || {
-            md_viewer::read_document(&worker_path).map(|text| md_viewer::render(&text))
+            md_viewer::read_document(&worker_path).map(|text| {
+                let mut blocks = md_viewer::render(&text);
+                md_viewer::resolve_images(&mut blocks, &worker_path);
+                blocks
+            })
         })
         .await;
         let blocks = match parsed {

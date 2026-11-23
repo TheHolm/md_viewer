@@ -2,10 +2,11 @@
 //! mhchem typesetting, rasterization, and filling a rendered document in.
 
 use md_viewer::graphics::{
-    hex_color, math_depth_em, math_svg, mermaid_svg, rasterize, render_document, render_math,
-    render_mermaid, RasterSettings, MATH_SCALE,
+    decode_image, hex_color, load_image, math_depth_em, math_svg, mermaid_svg, rasterize,
+    render_document, render_math, render_mermaid, Cache, Graphic, RasterSettings, MATH_SCALE,
 };
 use md_viewer::{render, Block, Inline, Math};
+use std::path::{Path, PathBuf};
 
 /// A 20x10 SVG with a red rectangle filling its left half.
 const HALF_RED: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10">
@@ -321,6 +322,148 @@ fn diagram_labels_are_extracted() {
         .is_empty());
 }
 
+// --- Images ---------------------------------------------------------------
+
+/// Writes a `width` x `height` image of one straight-alpha colour, picking
+/// the encoder from the file extension, and returns its path.
+fn write_image(dir: &Path, name: &str, width: u32, height: u32, rgba: [u8; 4]) -> PathBuf {
+    let path = dir.join(name);
+    let buffer = image::RgbaImage::from_pixel(width, height, image::Rgba(rgba));
+    if name.ends_with(".jpg") || name.ends_with(".jpeg") {
+        // JPEG has no alpha channel, so the encoder wants RGB.
+        image::DynamicImage::ImageRgba8(buffer)
+            .to_rgb8()
+            .save(&path)
+            .unwrap();
+    } else {
+        buffer.save(&path).unwrap();
+    }
+    path
+}
+
+/// A temporary directory for the image tests.
+fn temp_dir() -> tempfile::TempDir {
+    tempfile::tempdir().unwrap()
+}
+
+/// A PNG decodes to premultiplied RGBA at its natural size, fully opaque
+/// pixels unchanged.
+#[test]
+fn image_decode_png() {
+    let dir = temp_dir();
+    let path = write_image(dir.path(), "red.png", 3, 2, [255, 0, 0, 255]);
+    let image = decode_image(&path, &RasterSettings::default()).unwrap();
+    assert_eq!((image.width, image.height), (3, 2));
+    assert_eq!((image.logical_width(), image.logical_height()), (3.0, 2.0));
+    assert_eq!(pixel(&image, 0, 0), [255, 0, 0, 255]);
+    assert!(image.labels.is_empty());
+}
+
+/// Straight alpha is premultiplied: a half-transparent white becomes about
+/// half grey in every channel, keeping the alpha.
+#[test]
+fn image_decode_premultiplies() {
+    let dir = temp_dir();
+    let path = write_image(dir.path(), "half.png", 1, 1, [255, 255, 255, 128]);
+    let image = decode_image(&path, &RasterSettings::default()).unwrap();
+    let [red, green, blue, alpha] = pixel(&image, 0, 0);
+    assert_eq!(alpha, 128);
+    for channel in [red, green, blue] {
+        assert!((127..=129).contains(&channel), "{channel}");
+    }
+}
+
+/// A JPEG decodes too (the encoder is chosen by extension).
+#[test]
+fn image_decode_jpeg() {
+    let dir = temp_dir();
+    let path = write_image(dir.path(), "photo.jpg", 4, 4, [0, 0, 255, 255]);
+    let image = decode_image(&path, &RasterSettings::default()).unwrap();
+    assert_eq!((image.width, image.height), (4, 4));
+}
+
+/// An SVG file is rasterized with the SVG path, keeping its natural size.
+#[test]
+fn image_decode_svg() {
+    let dir = temp_dir();
+    let path = dir.path().join("half.svg");
+    std::fs::write(&path, HALF_RED).unwrap();
+    let image = decode_image(&path, &RasterSettings::default()).unwrap();
+    assert_eq!(
+        (image.logical_width(), image.logical_height()),
+        (20.0, 10.0)
+    );
+    assert!(has_ink(&image));
+    assert_eq!(pixel(&image, 2, 5), [255, 0, 0, 255]);
+}
+
+/// A missing or broken file is an error, not a panic.
+#[test]
+fn image_decode_errors() {
+    let error = decode_image(
+        Path::new("/definitely/not/here.png"),
+        &RasterSettings::default(),
+    )
+    .unwrap_err();
+    assert!(error.contains("cannot read"), "{error}");
+
+    let dir = temp_dir();
+    let path = dir.path().join("bad.png");
+    std::fs::write(&path, b"not an image").unwrap();
+    assert!(decode_image(&path, &RasterSettings::default()).is_err());
+}
+
+/// Loading at a zoom grows the logical size (the pixels stay the same), like
+/// math and diagrams.
+#[test]
+fn image_zoom_scales_logical_size() {
+    let dir = temp_dir();
+    let path = write_image(dir.path(), "dot.png", 4, 2, [0, 255, 0, 255]);
+    let settings = RasterSettings {
+        zoom: 2.0,
+        ..RasterSettings::default()
+    };
+    let image = load_image(&path, &settings).unwrap();
+    assert_eq!((image.logical_width(), image.logical_height()), (8.0, 4.0));
+    assert_eq!((image.width, image.height), (4, 2));
+}
+
+/// An inline image is capped to a few lines tall (keeping its aspect ratio),
+/// while the same image alone in a paragraph keeps its size.
+#[test]
+fn inline_image_is_capped() {
+    let dir = temp_dir();
+    let path = write_image(dir.path(), "wide.png", 1000, 10, [0, 0, 255, 255]);
+    let settings = RasterSettings::default();
+    let cache = Cache::shared();
+    let inline = cache
+        .render(
+            &Graphic::Image {
+                path: path.clone(),
+                inline: true,
+            },
+            &settings,
+        )
+        .unwrap();
+    let standalone = cache
+        .render(
+            &Graphic::Image {
+                path,
+                inline: false,
+            },
+            &settings,
+        )
+        .unwrap();
+    assert_eq!(standalone.logical_width(), 1000.0);
+    assert!(
+        inline.logical_width() <= 15.0 * 12.0 + 0.5,
+        "{}",
+        inline.logical_width()
+    );
+    let aspect = inline.logical_width() / inline.logical_height();
+    assert!((aspect - 100.0).abs() < 0.01, "{aspect}");
+}
+
 // --- Whole documents ------------------------------------------------------
 
 /// `render_document` renders every formula, in text and in table cells.
@@ -393,7 +536,7 @@ fn showcase_renders() {
         .iter()
         .filter(|block| matches!(block, Block::Table(_)))
         .count();
-    assert_eq!(tables, 2);
+    assert_eq!(tables, 3);
 }
 
 /// The human-facing showcase at the repository root (`showcase.md`, the demo
@@ -442,7 +585,7 @@ fn root_showcase_renders() {
         .iter()
         .filter(|block| matches!(block, Block::Table(_)))
         .count();
-    assert_eq!(tables, 3);
+    assert_eq!(tables, 4);
 }
 
 /// The fallbacks fixture (`tests/fixtures/fallbacks.md`, opened by the GUI
