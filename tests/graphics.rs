@@ -413,6 +413,120 @@ fn image_decode_errors() {
     assert!(decode_image(&path, &RasterSettings::default()).is_err());
 }
 
+/// Decoding at a device scale keeps the logical size but gives the texture
+/// more device pixels, so a raster image stays sharp on a HiDPI screen.
+#[test]
+fn image_decode_at_device_scale() {
+    let dir = temp_dir();
+    let path = write_image(dir.path(), "dot.png", 4, 2, [0, 255, 0, 255]);
+    let settings = RasterSettings {
+        scale: 2.0,
+        ..RasterSettings::default()
+    };
+    let image = decode_image(&path, &settings).unwrap();
+    assert_eq!((image.width, image.height), (8, 4));
+    assert_eq!(image.scale, 2.0);
+    assert_eq!((image.logical_width(), image.logical_height()), (4.0, 2.0));
+}
+
+/// Writes a `width` x `height` JPEG carrying an Exif orientation tag (6 means
+/// "rotate 90 degrees"), by splicing a minimal little-endian Exif APP1 segment
+/// after the file's SOI marker, and returns its path.
+fn write_jpeg_with_orientation(dir: &Path, name: &str, width: u32, height: u32) -> PathBuf {
+    let path = dir.join(name);
+    let buffer = image::RgbImage::from_pixel(width, height, image::Rgb([10, 20, 30]));
+    let mut jpeg = Vec::new();
+    image::DynamicImage::ImageRgb8(buffer)
+        .write_to(
+            &mut std::io::Cursor::new(&mut jpeg),
+            image::ImageFormat::Jpeg,
+        )
+        .unwrap();
+
+    // TIFF header (little-endian), one IFD entry: orientation (0x0112), SHORT,
+    // count 1, value 6.
+    let mut tiff = Vec::new();
+    tiff.extend_from_slice(b"II\x2a\x00");
+    tiff.extend_from_slice(&8u32.to_le_bytes());
+    tiff.extend_from_slice(&1u16.to_le_bytes());
+    tiff.extend_from_slice(&0x0112u16.to_le_bytes());
+    tiff.extend_from_slice(&3u16.to_le_bytes());
+    tiff.extend_from_slice(&1u32.to_le_bytes());
+    tiff.extend_from_slice(&6u16.to_le_bytes());
+    tiff.extend_from_slice(&0u16.to_le_bytes());
+    tiff.extend_from_slice(&0u32.to_le_bytes());
+    let mut app1 = Vec::new();
+    app1.extend_from_slice(&[0xFF, 0xE1]);
+    app1.extend_from_slice(&((2 + 6 + tiff.len()) as u16).to_be_bytes());
+    app1.extend_from_slice(b"Exif\x00\x00");
+    app1.extend_from_slice(&tiff);
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&jpeg[..2]);
+    out.extend_from_slice(&app1);
+    out.extend_from_slice(&jpeg[2..]);
+    std::fs::write(&path, out).unwrap();
+    path
+}
+
+/// The Exif orientation is applied: a 6x2 JPEG tagged "rotate 90" decodes to
+/// 2x6, so sideways photos come out upright.
+#[test]
+fn image_decode_applies_exif_orientation() {
+    let dir = temp_dir();
+    let path = write_jpeg_with_orientation(dir.path(), "rotated.jpg", 6, 2);
+    let image = decode_image(&path, &RasterSettings::default()).unwrap();
+    assert_eq!((image.width, image.height), (2, 6));
+    assert_eq!((image.logical_width(), image.logical_height()), (2.0, 6.0));
+}
+
+/// Encodes `data` as standard base64 (with padding), for `data:` URLs.
+fn base64(data: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let bytes = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let value = (u32::from(bytes[0]) << 16) | (u32::from(bytes[1]) << 8) | u32::from(bytes[2]);
+        out.push(ALPHABET[(value >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(value >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(value >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[value as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// A raster image embedded in an SVG (here a `data:` PNG) is drawn, now that
+/// resvg has raster image decoders.
+#[test]
+fn svg_embedded_raster_image() {
+    let mut png = Vec::new();
+    image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255]))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    let svg = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8">
+             <image x="2" y="2" width="4" height="4" href="data:image/png;base64,{}"/>
+           </svg>"#,
+        base64(&png)
+    );
+    let image = rasterize(&svg, 15.0, 1.0).unwrap();
+    assert_eq!((image.logical_width(), image.logical_height()), (8.0, 8.0));
+    assert_eq!(pixel(&image, 4, 4), [255, 0, 0, 255]);
+    assert_eq!(pixel(&image, 0, 0)[3], 0);
+}
+
 /// Loading at a zoom grows the logical size (the pixels stay the same), like
 /// math and diagrams.
 #[test]

@@ -46,8 +46,6 @@ Background on the rendering crates is in `NOTES.md`.
   planned: the viewer deliberately loads nothing over the network. Such an
   image shows a placeholder saying so.
 - An animated GIF shows only its first frame.
-- Raster images embedded inside an SVG image file are not loaded (resvg is
-  built without raster image decoders); the SVG's own vector content is.
 - An image that is a link's only content is not clickable (it is a picture,
   not text), like a formula that is a link's only content.
 - A match inside a diagram highlights the whole diagram card, not the exact

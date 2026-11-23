@@ -741,6 +741,52 @@ fn image_with_text_is_inline() {
     assert!(!image_is_standalone(inlines, at));
 }
 
+/// Whether the first image in `source` is standalone, per the GUI's line rule.
+fn first_image_standalone(source: &str) -> bool {
+    let blocks = render(source);
+    let inlines = match &blocks[0] {
+        Block::Text(inlines) => inlines,
+        other => panic!("expected a text block for {source:?}, got {other:?}"),
+    };
+    let at = inlines
+        .iter()
+        .position(|inline| matches!(inline, Inline::Image(_)))
+        .expect("no image in the rendered source");
+    image_is_standalone(inlines, at)
+}
+
+/// An image alone in a list item, after the bullet/number/task marker (and at
+/// any nesting depth), or alone in a block quote, is standalone.
+#[test]
+fn image_alone_in_list_item_is_standalone() {
+    for source in [
+        "- ![x](i.png)",
+        "1. ![x](i.png)",
+        "- [x] ![x](i.png)",
+        "- [ ] ![x](i.png)",
+        "10. [x] ![x](i.png)",
+        "- a\n    - ![x](i.png)",
+        "> ![x](i.png)",
+    ] {
+        assert!(first_image_standalone(source), "{source:?} is standalone");
+    }
+}
+
+/// Text after the marker keeps a list item's image inline.
+#[test]
+fn image_with_text_in_list_item_is_inline() {
+    for source in [
+        "- see ![x](i.png)",
+        "1. see ![x](i.png)",
+        "- [x] see ![x](i.png)",
+    ] {
+        assert!(
+            !first_image_standalone(source),
+            "{source:?} should stay inline"
+        );
+    }
+}
+
 /// An image inside a link is the link's content, so the bare destination is
 /// not shown as text.
 #[test]

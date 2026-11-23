@@ -32,8 +32,9 @@ Raise them only when every target platform ships the newer version.
   with its own bundled math font
 - `merman` (features `svg`, `all-diagrams`) - Mermaid diagrams to SVG, pure
   Rust; used through its resvg-safe pipeline (labels as SVG text)
-- `resvg` (features `text`, `system-fonts`, `memmap-fonts`) - rasterizes
-  every SVG; SVG text uses the system fonts
+- `resvg` (features `text`, `system-fonts`, `memmap-fonts`,
+  `raster-images`) - rasterizes every SVG; SVG text uses the system fonts,
+  and raster images embedded in an SVG are decoded too
 - `image` (default features off; `png`, `jpeg`, `gif`, `webp`) - decodes
   local image files for `![alt](path)`, pure Rust. Animated GIFs show only
   their first frame; `.svg` image files are rasterized with the resvg path
@@ -160,9 +161,9 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   `Unsupported(reason)`. `resolve_images` (called by `open_document` and the
   GUI, which know the document path) fills the state in with
   `links::resolve_image`; `image_is_standalone(inlines, index)` says whether
-  an image is alone on its line (see the rendering-model note about merged
-  paragraphs). `ImageRef::placeholder` builds the `[image: alt — reason]`
-  text.
+  an image is alone on its line, after any list marker (see the
+  rendering-model note about merged paragraphs). `ImageRef::placeholder`
+  builds the `[image: alt — reason]` text.
   `Style::tag_name` names each style's text tag; `Style::ALL` lists every
   style so all tags can be created up front. Private helpers (`Renderer`,
   `TableBuilder`, `push_inline`, `trailing_newlines`, `normalize`) have unit
@@ -175,9 +176,11 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   database is loaded once and generic `sans-serif` is pointed at an
   installed family, GNOME's Adwaita Sans first, see `pick_family`),
   `decode_image`/`load_image` for local image files (PNG/JPEG/GIF first
-  frame/WebP through the `image` crate, `.svg` through `rasterize`; straight
-  alpha is premultiplied, and the logical size grows with the zoom like math
-  and diagrams) and
+  frame/WebP through the `image` crate, `.svg` through `rasterize`; Exif
+  orientation is applied, straight alpha is premultiplied, and raster images
+  are decoded at the device scale with a Lanczos resize so they stay sharp on
+  HiDPI while keeping their logical size; the logical size grows with the
+  zoom like math and diagrams) and
   `render_document`, which fills in every graphic of a rendered document one
   after another. `rasterize` also collects every SVG text node into
   `Image::labels` (usvg expands `<use>`, so a diagram's labels are found at
@@ -235,15 +238,17 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   - `render.rs` - the renderer: one group of tests per block type
     (paragraphs, headings, lists, block quotes, code blocks, rules, tables,
     math, Mermaid) and per inline style (emphasis, strong, strikethrough,
-    inline code, links, images), plus standalone-image detection, image
-    resolution, image placeholders and the Pango markup for table cells
+    inline code, links, images), plus standalone-image detection (including
+    list items and block quotes), image resolution, image placeholders and
+    the Pango markup for table cells
   - `links.rs` - link resolution (web, mail, local, relative, Markdown,
     anchor, ignored schemes), image destination resolution (local, remote,
     unsupported, percent-decoding), heading slugs, `LinkRanges`, and the
     links inside label text
   - `graphics.rs` - rasterizing, math and mhchem, Mermaid diagrams (several
     types, labels, scale, errors), image decoding (PNG, JPEG, SVG,
-    premultiplication, zoom and the inline cap), filling in whole documents,
+    premultiplication, Exif orientation, device scale, zoom, the inline cap
+    and a raster image embedded in an SVG), filling in whole documents,
     that the showcase fixture renders, and that the root `showcase.md`
     renders with no fallbacks at all (every formula and diagram `Ok`)
   - `layout.rs` - the `md_viewer::layout` functions
@@ -364,10 +369,12 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   is ever dropped.
 - Images: `![alt](path)` in a paragraph is loaded from a local file
   (resolved against the document, `file:` URLs allowed) and drawn. An image
-  alone on its line is a standalone picture, scaled to the window width like
-  a diagram; one among text is an inline paintable capped to a few lines
-  high and sitting on the baseline. Raster formats go through the `image`
-  crate, `.svg` through resvg. Network destinations (`http`/`https`) are
+  alone on its line (or after a list marker) is a standalone picture, scaled
+  to the window width like a diagram; one among text is an inline paintable
+  capped to a few lines high and sitting on the baseline. Raster formats go
+  through the `image` crate (Exif orientation applied, decoded at the device
+  scale for HiDPI), `.svg` through resvg (including raster images embedded in
+  the SVG). Network destinations (`http`/`https`) are
   never fetched - that is deliberately not supported and not planned - and
   an empty source, unsupported scheme, missing file or unreadable format
   shows `[image: <alt> — <reason>]`. Images in table cells are still
@@ -547,7 +554,11 @@ Things learned the hard way; add to this list when you learn another.
   inlines around it (`image_is_standalone`), not from the block: looking back,
   stop at the first newline (that is the start of the line); looking forward,
   stop at the first newline. Stopping only when the whole inline list is
-  exhausted makes every image in a merged block look inline.
+  exhausted makes every image in a merged block look inline. The text before
+  the image on its line may be a list marker (`• `, `12. `, `[x] `/`[ ] `,
+  with nesting indentation), which `line_prefix_is_marker` accepts so an image
+  alone in a list item is standalone; a block quote adds no marker text, so
+  it already works.
 - `image` crate pixels are straight (non-premultiplied) RGBA, but
   `gdk::MemoryFormat::R8g8b8a8Premultiplied` is what `ScaledTexture` stores;
   `graphics::premultiply` multiplies each channel by alpha first. Skipping it

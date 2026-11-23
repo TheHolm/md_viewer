@@ -22,6 +22,10 @@ section for the GitHub Release body.
   address) appears as `[image: <alt> — <reason>]` instead of being dropped.
 - Images scale with zoom like everything else, and a re-render sharpens the
   pictures after the zoom settles.
+- Photos whose Exif data says which way is up (phones and cameras) are shown
+  upright, raster images stay sharp on HiDPI displays, an image alone in a
+  list item or block quote is scaled to the window width like any standalone
+  image, and raster images embedded in an SVG file are drawn.
 
 ### Details
 
@@ -36,11 +40,17 @@ section for the GitHub Release body.
   `resolve_images` walks a rendered document and fills the states in, called
   by `open_document` and the GUI (which know the document path).
   `image_is_standalone(inlines, index)` decides, line by line within the
-  merged text block, whether the GUI should treat an image as a block.
+  merged text block, whether the GUI should treat an image as a block,
+  accepting a leading list marker (`• `, `12. `, `[x] `/`[ ] `) so an image
+  alone in a list item counts.
 - New `md_viewer::graphics::decode_image`/`load_image` decode a file into
   premultiplied RGBA with the pure-Rust `image` crate (new dependency:
-  `default-features = false`, `png`, `jpeg`, `gif`, `webp`); `.svg` files use
-  the existing resvg path. Logical size grows with zoom, like math and
+  `default-features = false`, `png`, `jpeg`, `gif`, `webp`); the decoder's
+  Exif orientation is applied, and raster images are rendered at the device
+  scale (a Lanczos resize that keeps the logical size) so they stay sharp on
+  HiDPI. `.svg` files use the existing resvg path, with resvg's
+  `raster-images` feature enabled so raster images embedded in an SVG are
+  drawn. Logical size grows with zoom, like math and
   diagrams. `Graphic::Image { path, inline }` joins the worker jobs; the
   shared `Cache` also keeps decoded images by path and settings, and inline
   images are capped to a few lines high.

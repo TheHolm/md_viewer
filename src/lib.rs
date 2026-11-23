@@ -295,14 +295,15 @@ impl Inline {
 }
 
 /// True if the inline at `index` in `inlines` is an image alone on its line:
-/// only whitespace and newlines separate it from the start and end of the
-/// line, so it can be shown on a line of its own, scaled to the window width,
-/// instead of inline with text.
+/// only whitespace, and possibly the list marker that begins the line, share
+/// it, so it can be shown on a line of its own, scaled to the window width,
+/// instead of inline with text. A block quote adds no marker text, so an image
+/// alone in one is standalone too.
 pub fn image_is_standalone(inlines: &[Inline], index: usize) -> bool {
     let index = index.min(inlines.len());
-    // Look back: whitespace continues, a newline ends the line (and is fine),
-    // anything else is content on the same line.
-    let mut before_clear = true;
+    // Gather the text on the image's line before it. A newline ends the line;
+    // another formula or image on the line means it is not alone.
+    let mut prefix = String::new();
     'before: for inline in inlines[..index].iter().rev() {
         match inline {
             Inline::Text(span) => {
@@ -310,23 +311,18 @@ pub fn image_is_standalone(inlines: &[Inline], index: usize) -> bool {
                     if ch == '\n' {
                         break 'before;
                     }
-                    if !ch.is_whitespace() {
-                        before_clear = false;
-                        break 'before;
-                    }
+                    prefix.push(ch);
                 }
             }
-            Inline::Math(_) | Inline::Image(_) => {
-                before_clear = false;
-                break 'before;
-            }
+            Inline::Math(_) | Inline::Image(_) => return false,
         }
     }
-    if !before_clear {
+    let prefix: String = prefix.chars().rev().collect();
+    if !line_prefix_is_marker(&prefix) {
         return false;
     }
-    // Look forward the same way.
-    let mut after_clear = true;
+    // Look forward the same way: only whitespace up to the newline (anything
+    // after it is on the next line).
     'after: for inline in inlines[index.saturating_add(1).min(inlines.len())..].iter() {
         match inline {
             Inline::Text(span) => {
@@ -335,18 +331,47 @@ pub fn image_is_standalone(inlines: &[Inline], index: usize) -> bool {
                         break 'after;
                     }
                     if !ch.is_whitespace() {
-                        after_clear = false;
-                        break 'after;
+                        return false;
                     }
                 }
             }
-            Inline::Math(_) | Inline::Image(_) => {
-                after_clear = false;
-                break 'after;
-            }
+            Inline::Math(_) | Inline::Image(_) => return false,
         }
     }
-    after_clear
+    true
+}
+
+/// True if `prefix` (the text on an image's line before it) is empty or is
+/// only indentation and a list marker: a bullet (`•`), an ordered number
+/// (`12.`), and/or a task marker (`[x]`/`[ ]`), in any combination.
+fn line_prefix_is_marker(prefix: &str) -> bool {
+    let rest = prefix.trim_start();
+    if rest.is_empty() {
+        return true;
+    }
+    if let Some(after) = rest.strip_prefix('•') {
+        return marker_tail_is_empty(after.trim_start());
+    }
+    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    if digits > 0 && rest[digits..].starts_with('.') {
+        return marker_tail_is_empty(rest[digits + 1..].trim_start());
+    }
+    strip_task_marker(rest).is_some_and(|after| after.trim_start().is_empty())
+}
+
+/// True if `tail`, what follows a bullet or ordered marker, is empty or is a
+/// task marker followed by nothing.
+fn marker_tail_is_empty(tail: &str) -> bool {
+    match strip_task_marker(tail) {
+        Some(after) => after.trim_start().is_empty(),
+        None => tail.is_empty(),
+    }
+}
+
+/// Strips a leading task-list marker (`[x]` or `[ ]`) and returns the rest.
+fn strip_task_marker(text: &str) -> Option<&str> {
+    text.strip_prefix("[x]")
+        .or_else(|| text.strip_prefix("[ ]"))
 }
 
 /// The horizontal alignment of a table column.
@@ -1313,5 +1338,35 @@ mod tests {
         assert_eq!(Align::from(Alignment::Left), Align::Left);
         assert_eq!(Align::from(Alignment::Center), Align::Center);
         assert_eq!(Align::from(Alignment::Right), Align::Right);
+    }
+
+    /// `line_prefix_is_marker` accepts indentation and list markers in any
+    /// combination, and rejects real text.
+    #[test]
+    fn line_prefix_markers() {
+        for marker in [
+            "",
+            "   ",
+            "• ",
+            "        • ",
+            "1. ",
+            "   12. ",
+            "• [x] ",
+            "• [ ] ",
+            "3. [x] ",
+            "[x] ",
+            "[ ] ",
+        ] {
+            assert!(
+                line_prefix_is_marker(marker),
+                "{marker:?} should be a marker"
+            );
+        }
+        for text in ["see ", "• see ", "1. see ", "• [x] see ", "note ", "•[x]x"] {
+            assert!(
+                !line_prefix_is_marker(text),
+                "{text:?} should not be a marker"
+            );
+        }
     }
 }

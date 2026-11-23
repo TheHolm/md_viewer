@@ -7,6 +7,7 @@
 //! display, so it all runs on a worker thread and is covered by tests.
 
 use crate::Block;
+use image::ImageDecoder as _;
 use resvg::{tiny_skia, usvg};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -400,18 +401,43 @@ const INLINE_IMAGE_MAX_LINES: f32 = 1.5;
 /// The widest an inline image is drawn, as a multiple of the body font size.
 const INLINE_IMAGE_MAX_EM: f32 = 12.0;
 
-/// Decodes the image file at `path` into premultiplied RGBA, with a logical
-/// size equal to its natural size at 100% zoom. SVG files are rasterized with
-/// [`rasterize`]; other files go through the `image` crate (PNG, JPEG, GIF -
-/// first frame only - and WebP).
+/// Decodes the image file at `path` into premultiplied RGBA, honouring the
+/// file's Exif orientation and the device scale (so a HiDPI texture maps one
+/// texel to one device pixel and stays sharp). SVG files are rasterized with
+/// [`rasterize`] (which also draws raster images embedded in the SVG); other
+/// files go through the `image` crate (PNG, JPEG, GIF - first frame only - and
+/// WebP).
 pub fn decode_image(path: &Path, settings: &RasterSettings) -> Rendered {
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read file: {e}"))?;
     if is_svg_path(path) {
         let svg = String::from_utf8(bytes).map_err(|e| format!("invalid SVG text: {e}"))?;
         return rasterize(&svg, settings.font_px, settings.scale.max(1.0));
     }
-    let decoded = image::load_from_memory(&bytes).map_err(|e| e.to_string())?;
-    let rgba = decoded.to_rgba8();
+    let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?
+        .into_decoder()
+        .map_err(|e| e.to_string())?;
+    let orientation = decoder.orientation().map_err(|e| e.to_string())?;
+    let mut decoded = image::DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
+    decoded.apply_orientation(orientation);
+
+    // Render at the device scale, keeping the logical size at the file's
+    // natural size: `width / scale` stays the same, but the texture gains the
+    // device pixels a HiDPI screen draws 1:1.
+    let scale = settings.scale.max(1.0);
+    let rgba = if scale > 1.0 {
+        let width = (decoded.width() as f32 * scale).round().max(1.0) as u32;
+        let height = (decoded.height() as f32 * scale).round().max(1.0) as u32;
+        image::imageops::resize(
+            &decoded,
+            width,
+            height,
+            image::imageops::FilterType::Lanczos3,
+        )
+    } else {
+        decoded.to_rgba8()
+    };
     let (width, height) = rgba.dimensions();
     if width == 0 || height == 0 {
         return Err("empty image".to_string());
@@ -419,7 +445,7 @@ pub fn decode_image(path: &Path, settings: &RasterSettings) -> Rendered {
     Ok(Image {
         width,
         height,
-        scale: 1.0,
+        scale,
         depth: 0.0,
         pixels: premultiply(rgba.into_raw()),
         labels: Vec::new(),
