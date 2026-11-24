@@ -90,11 +90,16 @@ run there; runtime verification on a real FreeBSD system is a manual step.
     display math centred; tables are a `GtkGrid` of wrapping labels in a
     horizontal `GtkScrolledWindow`; code blocks are cards (`code_card`:
     language label, copy button, monospace selectable label in a horizontal
-    scroller); diagrams are a `GtkPicture` on a white card. Images are a
-    `GtkPicture` registered in `Resizable` when standalone (fit to the view
-    width) or an `insert_paintable` inline (capped by the worker); a network,
-    unsupported or unreadable image becomes `[image: alt — reason]` text with
-    no `Slot`. Table and
+    scroller); diagrams are a `GtkPicture` on a white card. A standalone
+    image is a `GtkPicture` in a `md-image` box (so a search match can
+    highlight it) registered in `Resizable` (fit to the view width); an
+    inline image is an `insert_paintable` (capped by the worker), and an image
+    in a table cell is an inline `GtkPicture` in the cell's row of labels and
+    pictures. A network, unsupported or unreadable image becomes
+    `[image: alt — reason]` text with no `Slot`. A picture that is a link's
+    content is clickable (a controller on its box; an inline one via a
+    `LinkRange` over its `U+FFFC`), and every picture's alt text is a search
+    entry (see the search bullet). Table and
     math-cell labels are plain text (`use_markup` off) styled with a single
     Pango attribute list built from `label_text`'s style runs (see
     `src/lib.rs`), never with markup. Every graphic on
@@ -124,12 +129,15 @@ run there; runtime verification on a real FreeBSD system is a manual step.
     search entry, count label, previous/next buttons and a mode button
     (smart case, ignore case, regex). A `Session` keeps a `Search`: the
     whole text buffer is one search source, and every table-cell label,
-    code-card label and diagram (its extracted labels joined) is a
-    `SearchEntry` registered as it is appended. Matches are highlighted
-    with text tags (buffer), a rebuilt Pango attribute list (labels, with
-    their base style runs plus the highlight ranges) or a CSS class
-    (diagram cards), the current match scrolls into view, and a narrow
-    `DrawingArea` over the scrollbar's right edge draws a mark per match.
+    code-card label, diagram (its extracted labels joined) and image (its alt
+    text) is a `SearchEntry` registered as it is appended. Matches are
+    highlighted with text tags (buffer), a rebuilt Pango attribute list
+    (labels, with their base style runs plus the highlight ranges), a CSS
+    class (diagram cards and standalone/table-cell image boxes) or nothing
+    visible (an inline image's alt text, whose picture is a paintable and
+    only counts and marks the scrollbar); the current match scrolls into
+    view, and a narrow `DrawingArea` over the scrollbar's right edge draws a
+    mark per match.
     `/`, `n`, `N` and Escape are a capture-phase key controller on the
     window that lets keys through while the search entry is focused.
     Searching re-runs as blocks are appended while loading.
@@ -155,8 +163,10 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   `code_language`, verbatim text, nesting `indent`; `clipboard_text` is what
   the copy button copies). `Math`, `Diagram` and `ImageRef` carry an `image`
   that is `None` after `render` and filled in by `graphics::render_document`
-  or the GUI's worker pool. An `ImageRef` keeps its source as written and its
-  alt text, plus an `ImageState`: `Unresolved` (straight after `render`),
+  or the GUI's worker pool. An `ImageRef` keeps its source as written, its
+  alt text and the link destination it is the content of (`link`, `None`
+  when it is not inside a link, used to make the picture clickable), plus an
+  `ImageState`: `Unresolved` (straight after `render`),
   `Local(path)`, `Remote` (a network URL, never loaded) or
   `Unsupported(reason)`. `resolve_images` (called by `open_document` and the
   GUI, which know the document path) fills the state in with
@@ -198,8 +208,10 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   them to the window like a diagram).
 - `src/progressive.rs` (`md_viewer::progressive`) - progressive, parallel
   loading: `for_each_graphic`/`jobs`/`place` number the graphics in
-  document order and store results (formulas everywhere, diagrams, and local
-  images in text; images in table cells and non-local images are skipped);
+  document order and store results (formulas and images everywhere, in text
+  and table cells, plus diagrams; non-local images are skipped; an image in a
+  table cell is always inline, one in a text block is standalone when alone
+  on its line);
   `Progress` decides which blocks may go
   on the page (strictly in order, each once complete) and what to re-render
   after a zoom (`reset_unshown`); `zoom_order`; `Phase` (FirstScreen,
@@ -377,8 +389,8 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   the SVG). Network destinations (`http`/`https`) are
   never fetched - that is deliberately not supported and not planned - and
   an empty source, unsupported scheme, missing file or unreadable format
-  shows `[image: <alt> — <reason>]`. Images in table cells are still
-  placeholders.
+  shows `[image: <alt> — <reason>]`. An image in a table cell is drawn inline
+  (at about the line height) in the cell's row of labels and pictures.
 - Adjacent text with identical styles is merged into one span.
 - Links: a `Span` carries its destination, so the GUI makes the text
   clickable without re-parsing. A single click opens it (web/`mailto:` and
@@ -388,15 +400,20 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   GitHub-style slug (duplicates get `-1`, `-2`, ...). Dangerous schemes
   (`javascript:`, `data:`, ...) and empty destinations are ignored, and a
   formula that is a link's only content is not clickable (it is drawn as
-  pixels). Hovering a link shows its raw destination in a tooltip: both the
+  pixels). An image that is a link's content *is* clickable: a standalone or
+  table-cell picture gets a click controller on its box, an inline one a
+  link range over its buffer character. Hovering a link shows its raw
+  destination in a tooltip: both the
   text view and table-cell labels use `query-tooltip` (whose coordinates are
   widget-space, the same as `dest_at`/`label_link_at`) and set plain tooltip
   text, so destinations containing markup characters are safe.
 - Search matches the rendered document: the whole text buffer (including
-  fallback sources), table-cell text, code-card text and the labels inside
-  diagrams; formula source is not searchable (a rendered formula is
-  pixels). Matches are found per source and kept in document order by
-  buffer offset; a diagram match highlights its whole card.
+  fallback sources), table-cell text, code-card text, the labels inside
+  diagrams and image alt text; formula source is not searchable (a rendered
+  formula is pixels). Matches are found per source and kept in document
+  order by buffer offset; a diagram match highlights its whole card, and an
+  image alt-text match highlights a standalone or table-cell picture's box
+  (an inline image's alt text only counts and marks the scrollbar).
 
 ## Versioning
 
@@ -571,6 +588,20 @@ Things learned the hard way; add to this list when you learn another.
   a few lines, standalone keeps its natural size and is fit to the window by
   `Resizable`), so it is part of the job, not just the GUI: a zoom re-render
   reproduces the same size class.
+- A standalone image is wrapped in a `md-image` box so a search match can
+  outline it with a CSS `box-shadow`; `Resizable` still sizes the inner
+  `GtkPicture` (the box sizes to it). Do not put a white card background on
+  it: photos are not diagrams.
+- An inline image is one `U+FFFC` buffer character, so a link over it is a
+  `CharacterRange` of `offset..offset+1` in `LinkRanges`; the text view's
+  `dest_at` then resolves a click on the picture. The picture itself is a
+  paintable, not a widget, so an alt-text search match can only be counted
+  and marked on the scrollbar, not visibly highlighted.
+- A table cell that contains a *local* image must use the rich (non-wrapping)
+  cell path even when the image failed to load: that image is a worker job, so
+  it needs its `Slot`, and skipping the path would shift every later slot off
+  its job id. A network or unsupported image has no job and can stay on the
+  plain wrapping-label path.
 
 ### Checking graphics visually
 

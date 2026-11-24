@@ -23,7 +23,9 @@ diagrams all grow, and the part you are reading stays in place.
 
 Find text with Ctrl+F or `/`: matches are highlighted in the text, tables
 and code, marked on the scrollbar, and a matching label inside a diagram
-highlights the whole diagram. Step through matches with Enter / `n` / `N`
+highlights the whole diagram. Image alt text is searchable too: a
+standalone or table-cell picture is outlined on a match. Step through
+matches with Enter / `n` / `N`
 (or Ctrl+G / Ctrl+Shift+G) and the up/down buttons in the find bar. Escape
 closes the bar but keeps the highlights so `n`/`N` still work; a second
 Escape clears the search. A button next to the search field switches
@@ -56,13 +58,14 @@ rules, and:
   `#fragment` links scroll to the matching heading. Hovering a link shows
   its destination in a tooltip. Unsafe schemes (`javascript:`, `data:`) are
   ignored.
-* **Local images**: `![alt](path)` in a paragraph is loaded from disk and
-  shown - alone on a line scaled to the window width, or inline with the
-  text at about the line height. Relative paths resolve against the
-  document. Network images (`http`/`https`) are **not supported, and never
-  will be**: the viewer deliberately loads nothing over the network. An
-  image that cannot be shown says why in its placeholder
-  (`[image: <alt> — <reason>]`).
+* **Local images**: `![alt](path)` is loaded from disk and shown - alone on
+  a line scaled to the window width, inline with the text at about the line
+  height, or inside a table cell. Relative paths resolve against the
+  document. An image that is a link's content is clickable, and an image's
+  alt text can be found with the search bar. Network images (`http`/`https`)
+  are **not supported, and never will be**: the viewer deliberately loads
+  nothing over the network. An image that cannot be shown says why in its
+  placeholder (`[image: <alt> — <reason>]`).
 
 A formula or diagram that cannot be rendered is shown as its source, with
 the reason. An image that cannot be loaded (missing file, unreadable format

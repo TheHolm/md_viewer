@@ -787,14 +787,17 @@ fn image_with_text_in_list_item_is_inline() {
     }
 }
 
-/// An image inside a link is the link's content, so the bare destination is
-/// not shown as text.
+/// An image inside a link is the link's content (so the bare destination is
+/// not shown as text) and carries the link so the picture is clickable.
 #[test]
 fn image_in_link() {
-    assert_eq!(
-        inlines("[![x](i.png)](u)"),
-        vec![Inline::Image(image("i.png", "x"))]
-    );
+    let rendered = inlines("[![x](i.png)](u)");
+    let Inline::Image(image) = &rendered[0] else {
+        panic!("expected an image");
+    };
+    assert_eq!(image.src, "i.png");
+    assert_eq!(image.alt, "x");
+    assert_eq!(image.link.as_deref(), Some("u"));
 }
 
 /// `placeholder` adds a reason to the `[image: …]` text, so the network case
@@ -1226,6 +1229,23 @@ fn label_text_image_placeholder() {
         vec![md_viewer::StyledRun {
             range: 0..14,
             styles: vec![Style::Image],
+        }]
+    );
+}
+
+/// An image placeholder in a label keeps the image's link, so a placeholder
+/// (a failed image that was inside a link) stays clickable.
+#[test]
+fn label_text_image_placeholder_link() {
+    let mut image = ImageRef::new("i.png", "a cat");
+    image.link = Some("https://example.com".to_string());
+    let content = label_text(&[Inline::Image(image)]);
+    assert_eq!(content.text, "[image: a cat]");
+    assert_eq!(
+        content.links,
+        vec![md_viewer::LabelLink {
+            range: 0..14,
+            dest: "https://example.com".to_string(),
         }]
     );
 }

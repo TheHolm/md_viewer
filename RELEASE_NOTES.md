@@ -10,11 +10,18 @@ section for the GitHub Release body.
 
 ### User-facing changes
 
-- Images referenced by `![alt](path)` in a paragraph are now loaded from
-  disk and shown: an image alone on its line is scaled to the window width,
-  one among text sits inline at about the line height. Relative paths resolve
+- Images referenced by `![alt](path)` in a paragraph or a table cell are now
+  loaded from disk and shown: an image alone on its line is scaled to the
+  window width, one among text sits inline at about the line height, and one
+  in a table cell is drawn inline in the cell. Relative paths resolve
   against the document; PNG, JPEG, GIF (first frame), WebP and SVG files
   work.
+- An image that is a link's content (`[![alt](path)](dest)`) is clickable: a
+  click opens the destination, with the pointer cursor and a tooltip, just
+  like link text.
+- An image's alt text is searchable: a match on a standalone or table-cell
+  picture outlines the picture, and one on an inline picture is counted and
+  marked on the scrollbar.
 - Images are local-only: a network image (`http`/`https`) is **not
   supported and will not be** - the viewer loads nothing over the network -
   and says so in its placeholder.
@@ -54,10 +61,19 @@ section for the GitHub Release body.
   diagrams. `Graphic::Image { path, inline }` joins the worker jobs; the
   shared `Cache` also keeps decoded images by path and settings, and inline
   images are capped to a few lines high.
-- The GUI inserts a standalone image as a `GtkPicture` sized to the view
-  (registered with `Resizable` alongside diagrams), an inline one as a
-  buffer paintable; network/unsupported/unreadable images are placeholder
-  text and add no slot. Images in table cells remain placeholders.
+- The renderer records an image's link destination (new `ImageRef.link`) when
+  the image is a link's content, and `label_text` keeps it on the placeholder
+  so even a failed image inside a link stays clickable.
+- The GUI inserts a standalone image as a `GtkPicture` in a `md-image` box
+  sized to the view (registered with `Resizable` alongside diagrams), an
+  inline one as a buffer paintable, and a table-cell image as a picture in
+  the cell's row of labels. Linked pictures get a click controller (or, for an
+  inline one, a `LinkRange` over its buffer character).
+  Network/unsupported/unreadable images are placeholder text and add no slot.
+- Images in table cells are rendered too (`progressive::for_each_graphic`
+  visits them as inline jobs). Every picture's alt text is a search entry;
+  standalone and table-cell pictures outline on a match, inline ones only
+  count and mark the scrollbar (a paintable is not a widget).
 
 ## v0.6.0 — Clickable links
 

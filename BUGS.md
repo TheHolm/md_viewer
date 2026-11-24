@@ -18,8 +18,8 @@ Background on the rendering crates is in `NOTES.md`.
 - Formulas are rendered once with the theme's text colour at load time;
   switching between light and dark while a document is open leaves them in
   the old colour.
-- Table cells containing math do not wrap (they are a row of labels and
-  pictures, not one wrapping label).
+- Table cells containing math or images do not wrap (they are a row of labels
+  and pictures, not one wrapping label).
 - A slow graphic holds back everything after it while a document loads
   (blocks are appended strictly in order, so nothing on the page moves);
   scrolling to the end of a loading document stops at what is there so far.
@@ -46,10 +46,11 @@ Background on the rendering crates is in `NOTES.md`.
   planned: the viewer deliberately loads nothing over the network. Such an
   image shows a placeholder saying so.
 - An animated GIF shows only its first frame.
-- An image that is a link's only content is not clickable (it is a picture,
-  not text), like a formula that is a link's only content.
 - A match inside a diagram highlights the whole diagram card, not the exact
-  label characters.
+  label characters. Likewise a match on a standalone or table-cell image's
+  alt text highlights the whole picture, and a match on an inline image's alt
+  text only counts and marks the scrollbar (an inline picture is a paintable,
+  not a widget, so there is nothing to highlight).
 - A search started while a document is still loading only covers the part
   already on the page; its results grow as blocks are appended.
 - A formula that is a link's only content is not clickable (it is drawn as
@@ -74,7 +75,9 @@ Background on the rendering crates is in `NOTES.md`.
   is fully tested, and the interaction is checked by hand (or with `xdotool`
   on Xvfb, see `NOTES.md`).
 - How a loaded image is placed (standalone at the window width, inline at
-  the line height, and its place in a zoom re-render) needs a display and
-  input events, so the GUI tests only confirm the viewer starts and exits
-  cleanly with an image in the document; the decoding, sizing arithmetic and
-  resolution logic are tested, and the placement is checked by hand.
+  the line height, in a table cell, and its place in a zoom re-render) needs
+  a display and input events, as do clicking a linked image and the
+  alt-text search highlight on pictures, so the GUI tests only confirm the
+  viewer starts and exits cleanly with images in the document (including a
+  table cell); the decoding, sizing arithmetic, resolution, link and
+  searchable-alt logic are tested, and the interaction is checked by hand.

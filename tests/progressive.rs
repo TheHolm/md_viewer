@@ -287,27 +287,32 @@ const IMAGE_DOCUMENT: &str = "![a](one.png)\n\n\
                               see ![b](two.png) here\n\n\
                               | x |\n|---|\n| ![c](three.png) |";
 
-/// Local images in text become graphics (a standalone one is marked so it is
-/// sized to the window width); an image in a table cell does not, since table
-/// cells are not rendered yet.
+/// Local images everywhere become graphics: a standalone one in text is
+/// marked so it is sized to the window width, while an inline one - in text
+/// or in a table cell - is not.
 #[test]
-fn image_jobs_skip_table_cells() {
+fn image_jobs_include_table_cells() {
     let mut blocks = render(IMAGE_DOCUMENT);
     md_viewer::resolve_images(&mut blocks, Path::new("/docs/notes.md"));
     let jobs = jobs(&mut blocks);
-    let flags: Vec<bool> = jobs
+    let images: Vec<(usize, bool)> = jobs
         .iter()
         .filter_map(|job| match &job.graphic {
-            Graphic::Image { inline, .. } => Some(*inline),
+            Graphic::Image { inline, .. } => Some((job.block, *inline)),
             _ => None,
         })
         .collect();
-    assert_eq!(flags, vec![false, true]);
+    assert_eq!(images.len(), 3);
+    // The standalone paragraph image is the only one not inline.
+    assert_eq!(
+        images.iter().map(|(_, inline)| *inline).collect::<Vec<_>>(),
+        vec![false, true, true]
+    );
     let table = blocks
         .iter()
         .position(|block| matches!(block, Block::Table(_)))
         .unwrap();
-    assert!(jobs.iter().all(|job| job.block != table));
+    assert_eq!(images.last().unwrap().0, table);
 }
 
 /// A network image is never rendered (its placeholder is shown directly), so

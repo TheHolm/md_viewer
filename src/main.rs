@@ -100,6 +100,12 @@ const CSS: &str = r#"
 .md-diagram.md-search-current {
   box-shadow: 0 0 0 3px alpha(#f08c00, 0.65);
 }
+.md-image.md-search-hit {
+  box-shadow: 0 0 0 2px alpha(#f5c211, 0.55);
+}
+.md-image.md-search-current {
+  box-shadow: 0 0 0 3px alpha(#f08c00, 0.65);
+}
 .md-code {
   background-color: alpha(currentColor, 0.06);
   border: 1px solid alpha(currentColor, 0.15);
@@ -319,6 +325,13 @@ enum SearchTarget {
     },
     /// A whole diagram card, marked by a CSS class.
     Diagram(gtk4::Box),
+    /// A whole image (a standalone paragraph picture or a table-cell picture)
+    /// in its box, marked by the same CSS class as a diagram.
+    Image(gtk4::Box),
+    /// Text with nothing on the page to highlight (an inline paragraph image,
+    /// which is a paintable, not a widget): a match still counts and gets a
+    /// scrollbar mark, but shows no highlight.
+    Unhighlighted,
 }
 
 /// One searchable piece of text, in document order.
@@ -806,31 +819,25 @@ impl Session {
     }
 
     /// Inserts an image at the end of `buffer`. A local image that loaded is
-    /// shown as a picture (standalone, scaled to the view width) or as an
-    /// inline paintable; anything else - a network destination, an unsupported
-    /// scheme, a missing or broken file - is shown as a placeholder saying
-    /// why. Images that are not local files are not rendered by the worker
-    /// pool, so they add no slot.
+    /// shown as a picture (standalone, scaled to the view width, in a box so
+    /// it can be highlighted) or as an inline paintable; anything else - a
+    /// network destination, an unsupported scheme, a missing or broken file -
+    /// is shown as a placeholder saying why. Images that are not local files
+    /// are not rendered by the worker pool, so they add no slot. A picture
+    /// whose image is part of a link is clickable, and every picture's alt
+    /// text is searchable.
     fn insert_image(&self, buffer: &gtk4::TextBuffer, image: &ImageRef, standalone: bool) {
         match &image.state {
             ImageState::Remote => {
-                insert_styled(
-                    buffer,
-                    &image.placeholder(Some(NETWORK_UNSUPPORTED)),
-                    &[Style::Image],
-                );
+                self.insert_image_placeholder(buffer, image, Some(NETWORK_UNSUPPORTED));
                 return;
             }
             ImageState::Unsupported(reason) => {
-                insert_styled(buffer, &image.placeholder(Some(reason)), &[Style::Image]);
+                self.insert_image_placeholder(buffer, image, Some(reason));
                 return;
             }
             ImageState::Unresolved => {
-                insert_styled(
-                    buffer,
-                    &image.placeholder(Some("not resolved")),
-                    &[Style::Image],
-                );
+                self.insert_image_placeholder(buffer, image, Some("not resolved"));
                 return;
             }
             ImageState::Local(_) => {}
@@ -842,9 +849,18 @@ impl Session {
                     let picture = gtk4::Picture::for_paintable(&texture);
                     picture.set_can_shrink(true);
                     picture.set_content_fit(gtk4::ContentFit::Contain);
+                    let card = gtk4::Box::builder()
+                        .css_classes(["md-image"])
+                        .halign(gtk4::Align::Start)
+                        .build();
+                    card.append(&picture);
                     let offset = buffer.end_iter().offset();
                     let anchor = buffer.create_child_anchor(&mut buffer.end_iter());
-                    self.view.add_child_at_anchor(&picture, &anchor);
+                    self.view.add_child_at_anchor(&card, &anchor);
+                    self.add_image_entry(&image.alt, offset, SearchTarget::Image(card.clone()));
+                    if let Some(dest) = &image.link {
+                        self.make_picture_clickable(&card, dest);
+                    }
                     let mut pictures = self.resizable.pictures.borrow_mut();
                     let index = pictures.len();
                     self.add_slot(Some(Slot {
@@ -858,6 +874,16 @@ impl Session {
                 } else {
                     let start = buffer.end_iter().offset();
                     buffer.insert_paintable(&mut buffer.end_iter(), &texture);
+                    // The picture is a single U+FFFC character in the buffer;
+                    // a link over it makes the text view open it on click.
+                    if let Some(dest) = &image.link {
+                        self.links.borrow_mut().push(
+                            start as usize,
+                            start as usize + 1,
+                            dest.clone(),
+                        );
+                    }
+                    self.add_image_entry(&image.alt, start, SearchTarget::Unhighlighted);
                     self.add_slot(Some(Slot {
                         texture,
                         rise: None,
@@ -873,8 +899,26 @@ impl Session {
                     Some(Err(reason)) => reason.as_str(),
                     _ => "not rendered",
                 };
-                insert_styled(buffer, &image.placeholder(Some(reason)), &[Style::Image]);
+                self.insert_image_placeholder(buffer, image, Some(reason));
             }
+        }
+    }
+
+    /// Inserts the `[image: <alt> — <reason>]` placeholder for `image` at the
+    /// end of `buffer`, clickable when the image is part of a link.
+    fn insert_image_placeholder(
+        &self,
+        buffer: &gtk4::TextBuffer,
+        image: &ImageRef,
+        reason: Option<&str>,
+    ) {
+        let start = buffer.end_iter().offset();
+        insert_styled(buffer, &image.placeholder(reason), &[Style::Image]);
+        if let Some(dest) = &image.link {
+            let end = buffer.end_iter().offset();
+            self.links
+                .borrow_mut()
+                .push(start as usize, end as usize, dest.clone());
         }
     }
 
@@ -910,10 +954,11 @@ impl Session {
         scroller
     }
 
-    /// Builds one table cell: a wrapping label showing the cell's styled
-    /// text as Pango markup, aligned according to the column's alignment.
-    /// Long cells wrap at about [`CELL_WRAP_CHARS`] characters instead of
-    /// widening the table.
+    /// Builds one table cell. A cell with only text (or only a network or
+    /// unsupported image) is a single wrapping label showing it as Pango
+    /// markup, aligned according to the column. A cell with formulas or local
+    /// images is a single non-wrapping row of labels and pictures (see
+    /// [`rich_cell_widget`]).
     fn cell_widget(
         &self,
         cell: &[Inline],
@@ -921,8 +966,15 @@ impl Session {
         classes: &[&str],
         offset: i32,
     ) -> gtk4::Widget {
-        if cell.iter().any(|inline| matches!(inline, Inline::Math(_))) {
-            return self.math_cell_widget(cell, alignment, classes, offset);
+        if cell.iter().any(|inline| match inline {
+            Inline::Math(_) => true,
+            // Only local images are graphics (they need slots for the worker
+            // results); a network or unsupported image is plain placeholder
+            // text and keeps the wrapping label path.
+            Inline::Image(image) => matches!(image.state, ImageState::Local(_)),
+            Inline::Text(_) => false,
+        }) {
+            return self.rich_cell_widget(cell, alignment, classes, offset);
         }
         let (halign, justify) = match alignment {
             Align::None | Align::Left => (gtk4::Align::Start, gtk4::Justification::Left),
@@ -951,10 +1003,11 @@ impl Session {
         frame.upcast()
     }
 
-    /// Builds a table cell containing formulas: a single (non-wrapping) row
-    /// of labels for the text and pictures for the formulas; formulas that
-    /// could not be rendered show their source.
-    fn math_cell_widget(
+    /// Builds a table cell that holds formulas or images: a single
+    /// (non-wrapping) row of labels for the text and pictures for the
+    /// formulas and images. Formulas and images that could not be rendered
+    /// show their source or a placeholder instead.
+    fn rich_cell_widget(
         &self,
         cell: &[Inline],
         alignment: Align,
@@ -990,26 +1043,72 @@ impl Session {
                         depth: Cell::new(image.depth),
                     }));
                 }
-                other => {
-                    if matches!(other, Inline::Math(_)) {
-                        self.add_slot(None);
+                // A formula that could not be rendered is a graphic (it has a
+                // job), so it needs a slot even though it shows its source.
+                Inline::Math(_) => {
+                    self.add_slot(None);
+                    row.append(&self.cell_label(inline, offset));
+                }
+                // A local image is a graphic: a picture if it loaded, a
+                // placeholder (with a slot) otherwise. A network or
+                // unsupported image is not rendered by the workers, so it gets
+                // no slot.
+                Inline::Image(image) => match (&image.state, &image.image) {
+                    (ImageState::Local(_), Some(Ok(rendered))) => {
+                        let texture = ScaledTexture::new(rendered);
+                        let picture = gtk4::Picture::for_paintable(&texture);
+                        picture.set_can_shrink(false);
+                        picture.set_valign(gtk4::Align::Center);
+                        let card = gtk4::Box::builder()
+                            .css_classes(["md-image"])
+                            .valign(gtk4::Align::Center)
+                            .build();
+                        card.append(&picture);
+                        row.append(&card);
+                        self.add_image_entry(&image.alt, offset, SearchTarget::Image(card.clone()));
+                        if let Some(dest) = &image.link {
+                            self.make_picture_clickable(&card, dest);
+                        }
+                        self.add_slot(Some(Slot {
+                            texture,
+                            rise: None,
+                            picture: None,
+                            offset,
+                            depth: Cell::new(0.0),
+                        }));
                     }
-                    let content = label_text(std::slice::from_ref(other));
-                    let label = gtk4::Label::builder()
-                        .label(&content.text)
-                        .selectable(true)
-                        .valign(gtk4::Align::Center)
-                        .build();
-                    set_base_attributes(&label, &content.runs);
-                    self.make_label_clickable(&label, &content);
-                    self.add_label_entry(&label, content, offset);
-                    row.append(&label);
+                    (ImageState::Local(_), _) => {
+                        self.add_slot(None);
+                        row.append(&self.cell_label(inline, offset));
+                    }
+                    _ => {
+                        row.append(&self.cell_label(inline, offset));
+                    }
+                },
+                _ => {
+                    row.append(&self.cell_label(inline, offset));
                 }
             }
         }
         let frame = gtk4::Box::builder().css_classes(classes.to_vec()).build();
         frame.append(&row);
         frame.upcast()
+    }
+
+    /// Builds a non-wrapping table label for one inline element (text, or the
+    /// source/placeholder of a formula or image), clickable and searchable
+    /// like any cell text.
+    fn cell_label(&self, inline: &Inline, offset: i32) -> gtk4::Label {
+        let content = label_text(std::slice::from_ref(inline));
+        let label = gtk4::Label::builder()
+            .label(&content.text)
+            .selectable(true)
+            .valign(gtk4::Align::Center)
+            .build();
+        set_base_attributes(&label, &content.runs);
+        self.make_label_clickable(&label, &content);
+        self.add_label_entry(&label, content, offset);
+        label
     }
 
     /// Shows the document at zoom `level`: pictures are stretched at once,
@@ -1098,6 +1197,25 @@ impl Session {
             offset,
             order,
             target: SearchTarget::Diagram(card.clone()),
+            highlighted: Cell::new(false),
+        });
+    }
+
+    /// Registers an image's `alt` text as searchable at buffer `offset`, with
+    /// `target` saying what to highlight (the picture's box, or nothing for an
+    /// inline picture). Empty alt text adds nothing.
+    fn add_image_entry(&self, alt: &str, offset: i32, target: SearchTarget) {
+        if alt.is_empty() {
+            return;
+        }
+        let mut search = self.search.borrow_mut();
+        let order = search.next_order;
+        search.next_order += 1;
+        search.entries.push(SearchEntry {
+            text: alt.to_string(),
+            offset,
+            order,
+            target,
             highlighted: Cell::new(false),
         });
     }
@@ -1244,6 +1362,34 @@ impl Session {
                 _ => false,
             }
         });
+    }
+
+    /// Makes a whole image `card` open `dest` when clicked, with a pointer
+    /// cursor and the raw destination as a tooltip, like a link in text. The
+    /// image is the link's content, so the whole picture is the target.
+    fn make_picture_clickable(&self, card: &gtk4::Box, dest: &str) {
+        let weak = self
+            .weak_self
+            .borrow()
+            .clone()
+            .expect("session weak handle set after construction");
+        let dest = dest.to_string();
+        let click = gtk4::GestureClick::new();
+        {
+            let weak = weak.clone();
+            let dest = dest.clone();
+            click.connect_released(move |gesture, _, _, _| {
+                if gesture.current_button() != gdk::BUTTON_PRIMARY {
+                    return;
+                }
+                if let Some(session) = weak.upgrade() {
+                    session.click_link(&dest);
+                }
+            });
+        }
+        card.add_controller(click);
+        card.set_cursor_from_name(Some("pointer"));
+        card.set_tooltip_text(Some(&dest));
     }
 
     /// Runs a search for `query` in `mode`, replacing the current one, and
@@ -1430,7 +1576,7 @@ impl Session {
                         entry.highlighted.set(true);
                     }
                 }
-                SearchTarget::Diagram(card) => {
+                SearchTarget::Diagram(card) | SearchTarget::Image(card) => {
                     card.remove_css_class("md-search-hit");
                     card.remove_css_class("md-search-current");
                     if !ranges.is_empty() {
@@ -1442,6 +1588,7 @@ impl Session {
                         });
                     }
                 }
+                SearchTarget::Unhighlighted => {}
             }
         }
     }

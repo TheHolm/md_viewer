@@ -20,24 +20,25 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Calls `visit` for every graphic in `blocks`, in document order (formulas
-/// in text, then in table cells row by row, diagrams, and local images in
-/// text), with the index of the block it is in, what to render, and where its
-/// result goes. Images in table cells are not rendered (they stay
-/// placeholders), and neither are images that are not local files.
+/// and local images in text, then formulas and images in table cells row by
+/// row, then diagrams), with the index of the block it is in, what to render,
+/// and where its result goes. Images that are not local files are skipped.
 pub fn for_each_graphic(
     blocks: &mut [Block],
     mut visit: impl FnMut(usize, Graphic, &mut Option<Rendered>),
 ) {
     for (index, block) in blocks.iter_mut().enumerate() {
         match block {
-            Block::Text(inlines) => visit_inlines(index, inlines, true, &mut visit),
+            Block::Text(inlines) => visit_inlines(index, inlines, true, true, &mut visit),
             Block::Table(table) => {
                 for cell in table
                     .header
                     .iter_mut()
                     .chain(table.rows.iter_mut().flatten())
                 {
-                    visit_inlines(index, cell, false, &mut visit);
+                    // A table cell is a single line, so its images are always
+                    // inline, never standalone.
+                    visit_inlines(index, cell, true, false, &mut visit);
                 }
             }
             Block::Mermaid(diagram) => {
@@ -52,16 +53,20 @@ pub fn for_each_graphic(
 }
 
 /// Visits the formulas among `inlines`, and - when `images` is true - the
-/// local images too (see [`for_each_graphic`]).
+/// local images too (see [`for_each_graphic`]). An image is marked standalone
+/// only when `allow_standalone` is true (text blocks) and it is alone on its
+/// line; images in table cells are always inline.
 fn visit_inlines(
     index: usize,
     inlines: &mut [Inline],
     images: bool,
+    allow_standalone: bool,
     visit: &mut impl FnMut(usize, Graphic, &mut Option<Rendered>),
 ) {
     let standalone: Vec<bool> = (0..inlines.len())
         .map(|at| {
-            images
+            allow_standalone
+                && images
                 && matches!(inlines[at], Inline::Image(_))
                 && crate::image_is_standalone(inlines, at)
         })

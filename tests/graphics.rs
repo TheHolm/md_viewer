@@ -5,7 +5,7 @@ use md_viewer::graphics::{
     decode_image, hex_color, load_image, math_depth_em, math_svg, mermaid_svg, rasterize,
     render_document, render_math, render_mermaid, Cache, Graphic, RasterSettings, MATH_SCALE,
 };
-use md_viewer::{render, Block, Inline, Math};
+use md_viewer::{render, Block, ImageRef, Inline, Math};
 use std::path::{Path, PathBuf};
 
 /// A 20x10 SVG with a red rectangle filling its left half.
@@ -39,6 +39,28 @@ fn formulas(blocks: &[Block]) -> Vec<&Math> {
         for inline in cells.into_iter().flatten() {
             if let Inline::Math(math) = inline {
                 found.push(math);
+            }
+        }
+    }
+    found
+}
+
+/// Every image in the rendered document, in order (in text and table cells).
+fn images(blocks: &[Block]) -> Vec<&ImageRef> {
+    let mut found = Vec::new();
+    for block in blocks {
+        let cells: Vec<&Vec<Inline>> = match block {
+            Block::Text(inlines) => vec![inlines],
+            Block::Table(table) => table
+                .header
+                .iter()
+                .chain(table.rows.iter().flatten())
+                .collect(),
+            Block::Mermaid(_) | Block::Code(_) => Vec::new(),
+        };
+        for inline in cells.into_iter().flatten() {
+            if let Inline::Image(image) = inline {
+                found.push(image);
             }
         }
     }
@@ -597,6 +619,23 @@ fn render_document_fills_in_formulas() {
     }
 }
 
+/// `render_document` renders local images, including one in a table cell.
+#[test]
+fn render_document_fills_in_cell_images() {
+    let cat = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cat.svg");
+    let source = format!("| image |\n|---|\n| ![cat]({}) |", cat.display());
+    let mut blocks = render(&source);
+    md_viewer::resolve_images(&mut blocks, std::path::Path::new("/nonexistent/doc.md"));
+    assert!(images(&blocks).iter().all(|image| image.image.is_none()));
+    render_document(&mut blocks, &RasterSettings::default());
+    let found = images(&blocks);
+    assert_eq!(found.len(), 1);
+    assert!(
+        matches!(&found[0].image, Some(Ok(image)) if image.width > 0),
+        "the table-cell image did not render"
+    );
+}
+
 /// `render_document` renders Mermaid diagrams, including failing ones.
 #[test]
 fn render_document_fills_in_diagrams() {
@@ -651,6 +690,15 @@ fn showcase_renders() {
         .filter(|block| matches!(block, Block::Table(_)))
         .count();
     assert_eq!(tables, 3);
+
+    let rendered = images(&blocks);
+    assert_eq!(rendered.len(), 3);
+    assert!(
+        rendered
+            .iter()
+            .all(|image| matches!(image.image, Some(Ok(_)))),
+        "an image did not render"
+    );
 }
 
 /// The human-facing showcase at the repository root (`showcase.md`, the demo

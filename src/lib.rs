@@ -248,16 +248,21 @@ pub struct ImageRef {
     pub image: Option<Rendered>,
     /// Where `src` points.
     pub state: ImageState,
+    /// The destination of the link the image is part of, if any (`[![alt](src)](dest)`).
+    /// Only used by the GUI to make the picture clickable; it does not affect
+    /// rendering.
+    pub link: Option<String>,
 }
 
 impl ImageRef {
-    /// Creates a not-yet-resolved image.
+    /// Creates a not-yet-resolved image, not inside a link.
     pub fn new(src: &str, alt: &str) -> Self {
         ImageRef {
             src: src.to_string(),
             alt: alt.to_string(),
             image: None,
             state: ImageState::Unresolved,
+            link: None,
         }
     }
 
@@ -602,8 +607,13 @@ pub fn label_text(inlines: &[Inline]) -> LabelText {
         let (span_text, styles, link) = match inline {
             Inline::Text(span) => (span.text.clone(), span.styles.clone(), span.link.clone()),
             Inline::Math(math) => (math.source(), vec![Style::Code], None),
-            // A label cannot show the image; show its placeholder.
-            Inline::Image(image) => (image.placeholder(None), vec![Style::Image], None),
+            // A label cannot show the image; show its placeholder, keeping any
+            // link so the placeholder stays clickable.
+            Inline::Image(image) => (
+                image.placeholder(None),
+                vec![Style::Image],
+                image.link.clone(),
+            ),
         };
         let start = text.len();
         text.push_str(&span_text);
@@ -998,11 +1008,15 @@ impl Renderer {
             TagEnd::Image => {
                 if let Some((src, alt)) = self.image.take() {
                     // An image is content: a link whose only content it is
-                    // must not show its bare destination.
+                    // must not show its bare destination. Keep the link on the
+                    // image so the picture stays clickable.
+                    let link = self.link.as_ref().map(|(dest, _)| dest.clone());
                     if let Some((_, has_text)) = self.link.as_mut() {
                         *has_text = true;
                     }
-                    let image = Inline::Image(ImageRef::new(&src, &alt));
+                    let mut image = ImageRef::new(&src, &alt);
+                    image.link = link;
+                    let image = Inline::Image(image);
                     if let Some(cell) = self.table.as_mut().and_then(|t| t.current_cell.as_mut()) {
                         cell.push(image);
                     } else {
