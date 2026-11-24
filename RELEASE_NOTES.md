@@ -40,8 +40,8 @@ section for the GitHub Release body.
 - The renderer no longer writes `[image: alt]` as text: it collects the alt
   text while inside `Tag::Image` and emits `Inline::Image(ImageRef)`
   (source, alt, `image`, `ImageState`). `Inline::text` is the alt text;
-  `label_text`/`pango_markup` still show the placeholder, since table cells
-  (and labels) cannot hold pictures yet.
+  `label_text`/`pango_markup` still show the placeholder, since a label
+  cannot hold a picture (table cells and the GUI draw images as pictures).
 - New `md_viewer::links::resolve_image` resolves a destination into
   `ImageState::Local(path)` / `Remote` / `Unsupported(reason)`; the new
   `resolve_images` walks a rendered document and fills the states in, called

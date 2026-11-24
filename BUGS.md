@@ -40,8 +40,6 @@ Background on the rendering crates is in `NOTES.md`.
 - Search does not cover the source of a rendered formula (it is drawn as
   pixels); only the fallback source shown for a formula that could not be
   rendered is searchable.
-- Images in table cells are still shown as `[image: <alt>]` placeholders;
-  only images in paragraphs are drawn (for now).
 - Network images (`http`/`https`) are not supported, and that is not
   planned: the viewer deliberately loads nothing over the network. Such an
   image shows a placeholder saying so.

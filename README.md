@@ -24,8 +24,9 @@ diagrams all grow, and the part you are reading stays in place.
 Find text with Ctrl+F or `/`: matches are highlighted in the text, tables
 and code, marked on the scrollbar, and a matching label inside a diagram
 highlights the whole diagram. Image alt text is searchable too: a
-standalone or table-cell picture is outlined on a match. Step through
-matches with Enter / `n` / `N`
+standalone or table-cell picture is outlined on a match, and an inline
+picture is counted and marked on the scrollbar (but not outlined, since it
+is drawn inline with the text). Step through matches with Enter / `n` / `N`
 (or Ctrl+G / Ctrl+Shift+G) and the up/down buttons in the find bar. Escape
 closes the bar but keeps the highlights so `n`/`N` still work; a second
 Escape clears the search. A button next to the search field switches
