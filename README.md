@@ -173,6 +173,13 @@ DISPLAY=:77 GDK_BACKEND=x11 GSK_RENDERER=cairo cargo llvm-cov --tests
 
 Planned features. Known bugs are listed in `BUGS.md`.
 
+* Automated interactive/GUI tests. Most of `main.rs` that needs input events
+  (the find bar, zoom, link clicks, the copy button, the file chooser and
+  error dialog) is only checked by hand today (see the testing gaps in
+  `BUGS.md`). The plan is an in-process GTK harness that registers an
+  `adw::Application`, opens a fixture, pumps the GLib main loop and drives
+  those paths by emitting signals, plus optional `xdotool` scripts on Xvfb
+  for the real event path.
 * Reload a document when it changes on disk.
 * An error popup instead of a message on STDERR for a bad `FILE` argument.
 * Remember the zoom level between runs.
