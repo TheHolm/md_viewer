@@ -546,6 +546,14 @@ Things learned the hard way; add to this list when you learn another.
   byte ranges; `search::char_ranges` maps them. Pango `AttrList` indices
   (used to highlight table and code labels) are byte offsets into the
   label's text, so the byte ranges are used directly there.
+- A focused `GtkSearchEntry` actually holds focus in its inner editable
+  `GtkText`, not in the entry widget itself, so comparing the focus widget
+  to the entry is always false and a window-level key handler steals the
+  keys typed into the find bar (0.7.0 could not type `n`/`N`). Test
+  structurally instead: the focus is the entry or a descendant of it
+  (`focus.is_ancestor(&entry)`). `Widget::has_focus` is not reliable here:
+  it requires the toplevel to have the *global* input focus, which is false
+  under Xvfb with no window manager.
 - `pango::Layout::xy_to_index` takes coordinates in **Pango units** (1/1024
   px), not pixels: multiply widget coordinates by `pango::SCALE` before
   hit-testing a label (see `label_link_at` in `main.rs`). Passing pixels

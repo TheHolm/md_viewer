@@ -6,6 +6,28 @@ changes** summary (what also appears in the GitHub Release body) and a
 added at the top. `scripts/extract-release-notes.sh` prints just one release's
 section for the GitHub Release body.
 
+## v0.7.1 — Fix typing in the find bar
+
+### User-facing changes
+
+- Typing in the find bar no longer triggers the viewer's search shortcuts.
+  Before, `n` and `N` stepped to the next/previous match instead of being
+  typed, and `/` and Escape were also caught by the window's shortcut
+  handler rather than handled by the text field.
+
+### Details
+
+- Version 0.7.0 → 0.7.1 (bugfix).
+- The window has a capture-phase `EventControllerKey` (`handle_key`) that
+  turns `/`, `n`, `N` and Escape into search actions, ignoring them while
+  the find bar is focused. It decided that by comparing the focused widget
+  to the `GtkSearchEntry` itself, but GTK focuses the entry's inner editable
+  text, so the comparison never matched and the handler swallowed those keys
+  while typing. The test now also accepts a focused widget that is a
+  descendant of the entry (the inner text). `GtkWidget::has_focus` was not
+  used because it depends on the toplevel holding global input focus, which
+  is not reliably the case (for example without a window manager).
+
 ## v0.7.0 — Local images
 
 ### User-facing changes

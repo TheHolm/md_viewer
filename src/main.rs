@@ -2109,8 +2109,10 @@ impl DocWindow {
     /// focused, so typing works normally): `/` opens the find bar, `n`/`N`
     /// step between matches, and Escape hides the bar or clears the search.
     fn handle_key(&self, keyval: gdk::Key, modifiers: gdk::ModifierType) -> glib::Propagation {
-        let in_entry = gtk4::prelude::RootExt::focus(&self.window)
-            .is_some_and(|focus| focus == self.search_entry.clone().upcast::<gtk4::Widget>());
+        let in_entry = gtk4::prelude::RootExt::focus(&self.window).is_some_and(|focus| {
+            focus == *self.search_entry.upcast_ref::<gtk4::Widget>()
+                || focus.is_ancestor(&self.search_entry)
+        });
         if in_entry
             || modifiers.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK)
         {
