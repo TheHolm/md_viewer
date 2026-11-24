@@ -26,7 +26,11 @@ and code, marked on the scrollbar, and a matching label inside a diagram
 highlights the whole diagram. Image alt text is searchable too: a
 standalone or table-cell picture is outlined on a match, and an inline
 picture is counted and marked on the scrollbar (but not outlined, since it
-is drawn inline with the text). Step through matches with Enter / `n` / `N`
+is drawn inline with the text). Search covers the whole document from the
+moment it opens, even the parts not yet rendered; while content is still
+being drawn (diagram labels and the sources of formulas that could not be
+rendered appear as they are drawn), the match count is followed by "…" until
+every result is in. Step through matches with Enter / `n` / `N`
 (or Ctrl+G / Ctrl+Shift+G) and the up/down buttons in the find bar. Escape
 closes the bar but keeps the highlights so `n`/`N` still work; a second
 Escape clears the search. A button next to the search field switches
@@ -34,9 +38,11 @@ between smart case (the default), ignore case and regular expressions.
 
 Large documents appear quickly: the first screen is shown as soon as it is
 ready (a spinner fills the window until then), and the rest is added below
-while a small spinner in the header bar turns. Formulas and diagrams are
-drawn on all CPU cores. Installed from a package, MD Viewer is also in the
-desktop's app grid and in "Open With" for Markdown files.
+while a small spinner in the header bar turns. Very large documents render
+only what is near the view: formulas and diagrams far below the window are
+drawn as you scroll to them instead of all at once. Formulas and diagrams
+are drawn on all CPU cores. Installed from a package, MD Viewer is also in
+the desktop's app grid and in "Open With" for Markdown files.
 
 The document is shown with headings, emphasis, strong text, strikethrough,
 inline code, block quotes, ordered/unordered and task lists, horizontal
@@ -183,6 +189,4 @@ Planned features. Known bugs are listed in `BUGS.md`.
 * Reload a document when it changes on disk.
 * An error popup instead of a message on STDERR for a bad `FILE` argument.
 * Remember the zoom level between runs.
-* For very large documents, render graphics far below the window only when
-  scrolled near (today everything is rendered, first screen first).
 * Package as Flatpak and publish on Flathub.

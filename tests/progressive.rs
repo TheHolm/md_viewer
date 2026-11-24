@@ -164,14 +164,35 @@ fn progress_reset_unshown() {
         progress.complete(id);
     }
     assert_eq!(progress.take_ready(), 0..1);
-    assert_eq!(progress.reset_unshown(), vec![2, 3, 4]);
+    assert_eq!(progress.reset_unshown(jobs.len()), vec![2, 3, 4]);
     progress.complete(2);
     // The diagram's earlier result was forgotten, so its block waits.
     assert_eq!(progress.take_ready(), 1..3);
     progress.complete(3);
     progress.complete(4);
     assert_eq!(progress.take_ready(), 3..7);
-    assert_eq!(progress.reset_unshown(), Vec::<usize>::new());
+    assert_eq!(progress.reset_unshown(jobs.len()), Vec::<usize>::new());
+}
+
+/// Only the graphics up to the frontier are re-rendered after a zoom: a
+/// graphic beyond it (even one with a rendered, but unshown, result) is left
+/// alone for lazy rendering.
+#[test]
+fn progress_reset_unshown_respects_frontier() {
+    let mut blocks = render(DOCUMENT);
+    let jobs = jobs(&mut blocks);
+    let mut progress = Progress::new(blocks.len(), &jobs);
+    for id in [0, 1, 3] {
+        progress.complete(id);
+    }
+    assert_eq!(progress.take_ready(), 0..1);
+    // The frontier stops before the diagram (graphic 3): only the table's
+    // formula (2) is within it, so only it is queued for re-rendering, even
+    // though the diagram also has an unshown result.
+    assert_eq!(progress.reset_unshown(3), vec![2]);
+    // A frontier covering the whole document reaches the diagram and the
+    // last formula too.
+    assert_eq!(progress.reset_unshown(jobs.len()), vec![2, 3, 4]);
 }
 
 /// Re-rendering after a zoom starts at the first visible graphic, then does
@@ -236,6 +257,39 @@ fn pool_delivers_every_result() {
     assert!(results.iter().all(|(_, rendered)| rendered.is_ok()));
     let direct = md_viewer::graphics::render_math("a", false, &settings).unwrap();
     assert_eq!(results[0].1.as_ref().unwrap(), &direct);
+}
+
+/// Jobs submitted in several batches are all rendered, in order, by workers
+/// that wait (rather than finish) between batches.
+#[test]
+fn pool_submit_batches_in_order() {
+    let mut blocks = render(DOCUMENT);
+    let jobs = jobs(&mut blocks);
+    let (sender, receiver) = mpsc::channel();
+    let sender = Mutex::new(sender);
+    let settings = RasterSettings::default();
+    let pool = Pool::start(Vec::new(), settings, 3, move |id, rendered| {
+        sender.lock().unwrap().send((id, rendered)).unwrap();
+    });
+    // Submit in two batches: the first is collected in full before the
+    // second is added, so the workers must stay alive while the queue is
+    // empty in between.
+    let split = jobs.len() / 2;
+    pool.submit(jobs[..split].to_vec());
+    let mut results = Vec::new();
+    for _ in 0..split {
+        results.push(receiver.recv_timeout(Duration::from_secs(60)).unwrap());
+    }
+    pool.submit(jobs[split..].to_vec());
+    for _ in split..jobs.len() {
+        results.push(receiver.recv_timeout(Duration::from_secs(60)).unwrap());
+    }
+    results.sort_by_key(|(id, _)| *id);
+    assert_eq!(
+        results.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        (0..jobs.len()).collect::<Vec<_>>()
+    );
+    assert!(results.iter().all(|(_, rendered)| rendered.is_ok()));
 }
 
 /// A cancelled (or dropped) pool stops: of many jobs, far from all are

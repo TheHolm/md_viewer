@@ -14,7 +14,7 @@ use gtk4::{gdk, gio, glib, pango};
 use md_viewer::graphics::{Image, RasterSettings, Rendered};
 use md_viewer::links::{self, LinkRanges, Resolved};
 use md_viewer::progressive::{self, Job, Phase, Pool, Progress};
-use md_viewer::search::{self, Matcher, SearchMode};
+use md_viewer::search::{self, Matcher, SearchMode, Unit};
 use md_viewer::zoom::{self, Zoom};
 use md_viewer::{
     label_text, Align, Block, Diagram, ImageRef, ImageState, Inline, LabelLink, LabelText, Math,
@@ -312,6 +312,9 @@ struct SearchSummary {
     current: usize,
     /// True when the query could not be matched (an invalid regex).
     error: bool,
+    /// True while content that could still add matches (diagram labels, or
+    /// blocks not yet rendered) is still being drawn.
+    pending: bool,
 }
 
 /// Where a match can be highlighted.
@@ -369,6 +372,9 @@ enum MatchTarget {
         entry: usize,
         range: std::ops::Range<usize>,
     },
+    /// Text in a block not on the page yet (searched from the parsed
+    /// document, so it counts before it is rendered).
+    Block { block: usize },
 }
 
 /// The state of the find bar for one session.
@@ -384,6 +390,9 @@ struct Search {
     error: bool,
     /// Every searchable widget on the page, in document order.
     entries: Vec<SearchEntry>,
+    /// The render-independent text of the whole parsed document, in document
+    /// order, so matches in blocks not yet rendered are found too.
+    units: Vec<Unit>,
     /// Every match, sorted by document position.
     matches: Vec<SearchMatch>,
     /// The index in `matches` of the current match, if any.
@@ -428,6 +437,13 @@ struct Session {
     generation: Cell<u64>,
     /// How many graphics of the current run have not arrived yet.
     outstanding: Cell<usize>,
+    /// How many graphics (a prefix of [`Session::jobs`], in document order)
+    /// have been submitted for the current run. Graphics beyond it are left
+    /// unrendered until the user scrolls near them.
+    frontier: Cell<usize>,
+    /// How many worker threads the pool is started with (one per CPU, capped
+    /// at the number of graphics); kept for re-creating the pool.
+    threads: usize,
     /// The settings of the current run.
     settings: Cell<RasterSettings>,
     /// The zoom the pictures on the page are currently sized for.
@@ -458,6 +474,9 @@ struct Session {
     /// An anchor requested before its heading was appended; scrolled to as
     /// soon as the heading appears.
     pending_anchor: RefCell<Option<String>>,
+    /// A block (searched before it was rendered) to scroll to once it is on
+    /// the page.
+    pending_scroll: RefCell<Option<usize>>,
     /// Opens a resolved link that is not a same-document anchor (the window
     /// launches external links and opens linked Markdown documents).
     open_link: Box<dyn Fn(Resolved)>,
@@ -468,36 +487,105 @@ struct Session {
 
 impl Session {
     /// Starts showing `blocks` with graphics rendered with `settings`: the
-    /// workers start, and blocks are appended as they complete.
+    /// first batch of graphics is submitted, and blocks are appended as they
+    /// complete (more graphics are submitted as the user scrolls near the
+    /// end of what is rendered, see [`Session::advance_frontier`]).
     fn start(self: &Rc<Self>, settings: RasterSettings) {
         self.settings.set(settings);
         self.shown_zoom.set(settings.zoom);
-        let jobs = self.jobs.clone();
-        self.run(jobs, settings);
+        self.frontier.set(0);
+        self.generation.set(self.generation.get() + 1);
+        self.outstanding.set(0);
+        self.pool.replace(None);
         self.append_ready();
         self.update_status();
+        self.advance_frontier();
     }
 
-    /// Starts a new rendering run over `jobs` with `settings`, replacing the
-    /// current one.
-    fn run(self: &Rc<Self>, jobs: Vec<Job>, settings: RasterSettings) {
-        let generation = self.generation.get() + 1;
-        self.generation.set(generation);
-        self.outstanding.set(jobs.len());
-        let sender = Mutex::new(self.sender.lock().expect("sender").clone());
-        let threads = progressive::worker_count(
-            std::thread::available_parallelism().map_or(1, usize::from),
-            jobs.len(),
-        );
-        let pool = (!jobs.is_empty()).then(|| {
-            Pool::start(jobs, settings, threads, move |id, rendered| {
+    /// Submits `jobs` to the worker pool (creating the pool if this run has
+    /// none yet), counting them as outstanding and collecting their results.
+    fn submit_batch(self: &Rc<Self>, jobs: Vec<Job>) {
+        if jobs.is_empty() {
+            return;
+        }
+        self.outstanding.set(self.outstanding.get() + jobs.len());
+        if self.pool.borrow().is_none() {
+            let generation = self.generation.get();
+            let settings = self.settings.get();
+            let threads = self.threads;
+            let sender = Mutex::new(self.sender.lock().expect("sender").clone());
+            let pool = Pool::start(jobs, settings, threads, move |id, rendered| {
                 if let Ok(sender) = sender.lock() {
                     let _ = sender.send((generation, id, rendered));
                 }
-            })
-        });
-        self.pool.replace(pool);
+            });
+            self.pool.replace(Some(pool));
+        } else if let Some(pool) = self.pool.borrow().as_ref() {
+            pool.submit(jobs);
+        }
         self.poll_regularly();
+    }
+
+    /// Submits the next batch of graphics when the rendered content is too
+    /// short for the view: either nothing has been submitted yet, or the
+    /// bottom of the rendered content is closer than
+    /// [`layout::FRONTIER_LOOKAHEAD`] window heights below the viewport.
+    fn advance_frontier(self: &Rc<Self>) {
+        if self.rezoom.borrow().is_some() || self.frontier.get() >= self.jobs.len() {
+            return;
+        }
+        if !self.need_more() {
+            return;
+        }
+        self.submit_next_batch();
+    }
+
+    /// Submits the next [`layout::FRONTIER_BATCH`] graphics, whatever the
+    /// view, advancing the frontier.
+    fn submit_next_batch(self: &Rc<Self>) {
+        if self.frontier.get() >= self.jobs.len() {
+            return;
+        }
+        let start = self.frontier.get();
+        let end = (start + layout::FRONTIER_BATCH).min(self.jobs.len());
+        let jobs = self.jobs[start..end].to_vec();
+        self.frontier.set(end);
+        self.submit_batch(jobs);
+    }
+
+    /// Renders up to and including `block`, so a search match there can be
+    /// shown (see [`Session::scroll_current`]).
+    fn render_to(self: &Rc<Self>, block: usize) {
+        if self.rezoom.borrow().is_some() {
+            return;
+        }
+        while self.frontier.get() < self.jobs.len() {
+            if self.frontier.get() > 0 && self.jobs[self.frontier.get() - 1].block >= block {
+                break;
+            }
+            self.submit_next_batch();
+        }
+    }
+
+    /// True when more graphics should be rendered: the first batch has not
+    /// been submitted yet, or the rendered content is not yet
+    /// [`layout::FRONTIER_LOOKAHEAD`] window heights past the bottom of the
+    /// viewport.
+    fn need_more(&self) -> bool {
+        if self.frontier.get() == 0 {
+            return true;
+        }
+        let adjustment = self.scrolled.vadjustment();
+        let page = adjustment.page_size();
+        let viewport_bottom = adjustment.value() + page;
+        let (top, height) = self.view.line_yrange(&self.view.buffer().end_iter());
+        let content_bottom = f64::from(top + height);
+        layout::needs_more(
+            content_bottom,
+            viewport_bottom,
+            page,
+            layout::FRONTIER_LOOKAHEAD,
+        )
     }
 
     /// Collects results every [`POLL_MS`] until nothing is outstanding.
@@ -520,19 +608,16 @@ impl Session {
         });
     }
 
-    /// True while graphics are being rendered, a re-render is waiting, or
-    /// blocks are still to be shown.
+    /// True while graphics are being rendered or a re-render is waiting.
     fn busy(&self) -> bool {
-        self.outstanding.get() > 0
-            || self.rezoom.borrow().is_some()
-            || !self.progress.borrow().all_shown()
-            || self.phase.get() != Phase::Done
+        self.outstanding.get() > 0 || self.rezoom.borrow().is_some()
     }
 
     /// Takes every result that has arrived: graphics on the page get their
     /// new picture, the others are stored with their block; then appends
-    /// the blocks that became complete.
-    fn poll(&self) {
+    /// the blocks that became complete and, if the page is still too short,
+    /// submits more graphics.
+    fn poll(self: &Rc<Self>) {
         while let Ok((generation, id, rendered)) = self.receiver.try_recv() {
             if generation != self.generation.get() {
                 continue;
@@ -553,6 +638,7 @@ impl Session {
         }
         self.append_ready();
         self.update_status();
+        self.advance_frontier();
     }
 
     /// Appends every block that is complete and follows the ones shown.
@@ -562,7 +648,13 @@ impl Session {
             return;
         }
         for index in ready {
+            let offset = self.view.buffer().end_iter().offset();
             self.insert_block(index);
+            if self.pending_scroll.borrow().as_ref() == Some(&index) {
+                self.pending_scroll.replace(None);
+                let mut iter = self.view.buffer().iter_at_offset(offset);
+                self.view.scroll_to_iter(&mut iter, 0.15, true, 0.0, 0.3);
+            }
         }
         self.resizable.update(self.view.width());
         self.refresh_search();
@@ -584,9 +676,8 @@ impl Session {
             self.cover_spinner.set_visible(false);
         }
         self.phase.set(phase);
-        let loading = phase == Phase::Background
-            || (phase == Phase::Done
-                && (self.outstanding.get() > 0 || self.rezoom.borrow().is_some()));
+        let loading = phase != Phase::FirstScreen
+            && (self.outstanding.get() > 0 || self.rezoom.borrow().is_some());
         self.header_spinner.set_visible(loading);
     }
 
@@ -1141,13 +1232,17 @@ impl Session {
         self.poll_regularly();
     }
 
-    /// Re-renders every graphic at the current zoom: the visible ones
-    /// first, then those not on the page yet, then those above the window.
+    /// Re-renders the graphics of the current run at the new zoom: the ones
+    /// already submitted (those on the page plus those waiting below it), in
+    /// the order visible first, then below, then above the window. Graphics
+    /// beyond the frontier are left for later, rendered lazily when scrolled
+    /// near.
     fn rerender(self: &Rc<Self>) {
         let mut settings = self.settings.get();
         settings.zoom = self.shown_zoom.get();
         self.settings.set(settings);
-        let unshown = self.progress.borrow_mut().reset_unshown();
+        let frontier = self.frontier.get();
+        let unshown = self.progress.borrow_mut().reset_unshown(frontier);
         let shown: Vec<(usize, i32)> = self
             .slots
             .borrow()
@@ -1157,7 +1252,10 @@ impl Session {
             .collect();
         let order = progressive::zoom_order(&shown, self.first_visible_offset(), &unshown);
         let jobs = order.into_iter().map(|id| self.jobs[id].clone()).collect();
-        self.run(jobs, settings);
+        self.generation.set(self.generation.get() + 1);
+        self.outstanding.set(0);
+        self.pool.replace(None);
+        self.submit_batch(jobs);
         self.update_status();
     }
 
@@ -1394,7 +1492,7 @@ impl Session {
 
     /// Runs a search for `query` in `mode`, replacing the current one, and
     /// reports the outcome to the window.
-    fn search(&self, query: &str, mode: SearchMode) -> SearchSummary {
+    fn search(self: &Rc<Self>, query: &str, mode: SearchMode) -> SearchSummary {
         {
             let mut search = self.search.borrow_mut();
             search.query = query.to_string();
@@ -1425,7 +1523,7 @@ impl Session {
     }
 
     /// Steps the current match forward or backward, wrapping around.
-    fn navigate(&self, forward: bool) -> SearchSummary {
+    fn navigate(self: &Rc<Self>, forward: bool) -> SearchSummary {
         {
             let mut search = self.search.borrow_mut();
             search.current = search::next_index(search.current, search.matches.len(), forward);
@@ -1484,7 +1582,9 @@ impl Session {
         (self.search_changed)(summary);
     }
 
-    /// Fills `search.matches` from the whole text buffer and every entry.
+    /// Fills `search.matches` from the whole text buffer, every indexed
+    /// entry, and the parsed text of blocks not on the page yet (so a search
+    /// covers the whole document while it is still being rendered).
     fn collect_matches(&self) {
         let buffer = self.view.buffer();
         let text = searchable_text(&buffer);
@@ -1519,6 +1619,21 @@ impl Session {
             }
         }
         search.matches.extend(entry_matches);
+        // The blocks not on the page yet: their text is searched from the
+        // parsed document, and every such match sorts after the rendered
+        // ones (a sentinel offset), ordered by block.
+        let shown = self.progress.borrow().shown();
+        let mut block_matches = Vec::new();
+        for unit in search.units.iter().filter(|unit| unit.block >= shown) {
+            for _ in matcher.find(&unit.text) {
+                block_matches.push(SearchMatch {
+                    offset: i32::MAX,
+                    order: unit.block,
+                    target: MatchTarget::Block { block: unit.block },
+                });
+            }
+        }
+        search.matches.extend(block_matches);
         search.matches.sort_by_key(|m| (m.offset, m.order));
     }
 
@@ -1561,6 +1676,9 @@ impl Session {
                 MatchTarget::Entry { entry, range } => {
                     grouped[*entry].push((range.clone(), Some(index) == current));
                 }
+                // A match in a block not on the page yet has nothing to
+                // highlight until the block is rendered.
+                MatchTarget::Block { .. } => {}
             }
         }
         for (entry, ranges) in search.entries.iter().zip(grouped) {
@@ -1593,8 +1711,10 @@ impl Session {
         }
     }
 
-    /// Scrolls the current match into view, a little below the top.
-    fn scroll_current(&self) {
+    /// Scrolls the current match into view, a little below the top. A match
+    /// in a block not on the page yet first renders up to that block and is
+    /// scrolled to once it is appended.
+    fn scroll_current(self: &Rc<Self>) {
         let search = self.search.borrow();
         let Some(current) = search.current else {
             return;
@@ -1602,6 +1722,13 @@ impl Session {
         let Some(m) = search.matches.get(current) else {
             return;
         };
+        if let MatchTarget::Block { block } = &m.target {
+            let block = *block;
+            drop(search);
+            self.render_to(block);
+            *self.pending_scroll.borrow_mut() = Some(block);
+            return;
+        }
         let offset = m.offset;
         drop(search);
         let mut iter = self.view.buffer().iter_at_offset(offset);
@@ -1615,6 +1742,7 @@ impl Session {
             total: search.matches.len(),
             current: search.current.map_or(0, |current| current + 1),
             error: search.error,
+            pending: !self.progress.borrow().all_shown(),
         }
     }
 
@@ -1633,6 +1761,12 @@ impl Session {
         let current = search.current;
         let mark_height = layout::SEARCH_MARK_HEIGHT;
         for (index, m) in search.matches.iter().enumerate() {
+            // A match in a block not rendered yet has no position on the
+            // page, so it gets no mark (the "…" in the find bar says more
+            // results are still coming).
+            if matches!(m.target, MatchTarget::Block { .. }) {
+                continue;
+            }
             let iter = buffer.iter_at_offset(m.offset);
             let (top, line_height) = self.view.line_yrange(&iter);
             let centre = f64::from(top) + f64::from(line_height) / 2.0;
@@ -2177,7 +2311,9 @@ impl DocWindow {
         }
     }
 
-    /// Updates the find bar's count and buttons from a search outcome.
+    /// Updates the find bar's count and buttons from a search outcome. While
+    /// more content is still being rendered (the `pending` flag), the count
+    /// is followed by "…" so the user knows more results may appear.
     fn show_search_summary(&self, summary: SearchSummary) {
         if summary.error {
             self.search_entry.add_css_class("error");
@@ -2190,6 +2326,8 @@ impl DocWindow {
         if summary.total == 0 {
             let text = if self.search_entry.text().is_empty() {
                 ""
+            } else if summary.pending {
+                "Searching…"
             } else {
                 "No results"
             };
@@ -2198,8 +2336,12 @@ impl DocWindow {
             self.search_next.set_sensitive(false);
             return;
         }
-        self.search_status
-            .set_label(&format!("{} of {}", summary.current, summary.total));
+        let text = if summary.pending {
+            format!("{} of {} …", summary.current, summary.total)
+        } else {
+            format!("{} of {}", summary.current, summary.total)
+        };
+        self.search_status.set_label(&text);
         self.search_prev.set_sensitive(true);
         self.search_next.set_sensitive(true);
     }
@@ -2271,6 +2413,11 @@ impl DocWindow {
         self.document.replace(Some(path.to_path_buf()));
 
         let jobs = progressive::jobs(&mut blocks);
+        let threads = progressive::worker_count(
+            std::thread::available_parallelism().map_or(1, usize::from),
+            jobs.len(),
+        );
+        let units = search::document_units(&blocks);
         let (sender, receiver) = mpsc::channel();
         let search_changed = {
             let window = Rc::downgrade(self);
@@ -2304,6 +2451,8 @@ impl DocWindow {
             pool: RefCell::new(None),
             generation: Cell::new(0),
             outstanding: Cell::new(0),
+            frontier: Cell::new(0),
+            threads,
             settings: Cell::new(RasterSettings::default()),
             shown_zoom: Cell::new(1.0),
             rezoom: RefCell::new(None),
@@ -2311,13 +2460,17 @@ impl DocWindow {
             receiver,
             sender: Mutex::new(sender),
             polling: Cell::new(false),
-            search: RefCell::new(Search::default()),
+            search: RefCell::new(Search {
+                units,
+                ..Search::default()
+            }),
             marks,
             search_changed,
             document: path.to_path_buf(),
             links: RefCell::new(LinkRanges::default()),
             anchors: RefCell::new(HashMap::new()),
             pending_anchor: RefCell::new(None),
+            pending_scroll: RefCell::new(None),
             open_link,
             weak_self: RefCell::new(None),
         });
@@ -2386,6 +2539,7 @@ impl DocWindow {
             session.scrolled.vadjustment().connect_changed(move |_| {
                 if let Some(session) = weak.upgrade() {
                     session.marks.queue_draw();
+                    session.advance_frontier();
                 }
             });
         }
