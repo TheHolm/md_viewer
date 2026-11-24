@@ -33,6 +33,9 @@ asks to commit" rule below, which exists partly for this reason.
   in the library
 - The viewer never modifies the documents it opens
 - Commits include a detailed description of what changed and why
+- Only changes that leave the built binaries untouched (documentation and
+  tests) may be committed directly to `master`; anything that affects the
+  code or the built program is done on a branch, never on `master`
 - Change the version only as described under "Versioning" in `NOTES.md`
   (`VERSION` first, then the copy in `Cargo.toml`)
 - Add a `## vX.Y.Z` entry to `RELEASE_NOTES.md` for each release (the release
