@@ -2,7 +2,7 @@
 //! against a document, generating heading anchors, tracking clickable
 //! ranges, and the links inside label text.
 
-use md_viewer::links::{heading_slug, resolve_image, resolve_link, LinkRanges, Resolved};
+use md_viewer::links::{file_uri, heading_slug, resolve_image, resolve_link, LinkRanges, Resolved};
 use md_viewer::{label_text, ImageState, Inline, Style};
 use std::path::{Path, PathBuf};
 
@@ -40,6 +40,11 @@ fn ignored_destinations() {
     );
     assert_eq!(
         resolve_link(base(), "ftp://example.com/x"),
+        Resolved::Ignored
+    );
+    // A `file:` URL naming a remote host has no local path to open.
+    assert_eq!(
+        resolve_link(base(), "file://server/share/x.md"),
         Resolved::Ignored
     );
 }
@@ -134,6 +139,15 @@ fn slug_unicode_and_separators() {
 fn slug_empty() {
     assert_eq!(heading_slug("!!!"), "");
     assert_eq!(heading_slug("   "), "");
+}
+
+/// A trailing hyphen (from a literal `-` or trailing whitespace) is dropped,
+/// so a slug never ends in one.
+#[test]
+fn slug_drops_trailing_hyphen() {
+    assert_eq!(heading_slug("foo-"), "foo");
+    assert_eq!(heading_slug("a - "), "a");
+    assert_eq!(heading_slug("Hello World-"), "hello-world");
 }
 
 // --- LinkRanges -----------------------------------------------------------
@@ -246,6 +260,11 @@ fn image_unsupported() {
             "{src:?} should be unsupported"
         );
     }
+    // A `file:` URL naming a remote host has no local path to read.
+    match resolve_image(base(), "file://server/share/x.png") {
+        ImageState::Unsupported(reason) => assert!(reason.contains("file URL"), "{reason}"),
+        other => panic!("expected unsupported, got {other:?}"),
+    }
 }
 
 /// A local destination is percent-decoded and a fragment is ignored.
@@ -255,4 +274,18 @@ fn image_percent_decoding_and_fragment() {
         resolve_image(base(), "my%20pic.png#part"),
         ImageState::Local(PathBuf::from("/home/user/docs/my pic.png"))
     );
+}
+
+// --- file_uri -------------------------------------------------------------
+
+/// `file_uri` turns an absolute path into a `file:` URI the desktop handler
+/// can take, and returns `None` for a path that cannot be made absolute
+/// (here the empty path).
+#[test]
+fn file_uri_for_absolute_path() {
+    assert_eq!(
+        file_uri(Path::new("/tmp/three.png")),
+        Some("file:///tmp/three.png".to_string())
+    );
+    assert_eq!(file_uri(Path::new("")), None);
 }

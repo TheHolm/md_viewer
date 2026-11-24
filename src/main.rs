@@ -2986,13 +2986,36 @@ mod tests {
         assert!(strings.contains(&(pango::AttrType::Family, 3, 6)));
     }
 
-    /// The text searched for the buffer keeps character indexes aligned with
-    /// buffer offsets (an embedded child anchor becomes U+FFFC via `slice`),
-    /// and replacing a plain-text label's attributes drops its previous
-    /// highlights. Both need GTK, so they share one test (GTK is not
-    /// thread-safe) that is skipped when GTK cannot initialize.
+    /// Every visual style produces Pango attributes over its range, so each
+    /// arm of `insert_style_attributes` is exercised (headings and strong
+    /// share the bold arm, code and code blocks the monospace arm, quote and
+    /// image the muted italic arm, and rules the muted foreground arm).
     #[test]
-    fn gtk_search_support() {
+    fn label_attributes_cover_every_style() {
+        for style in Style::ALL {
+            let runs = vec![StyledRun {
+                range: 0..2,
+                styles: vec![style],
+            }];
+            let list = label_attributes(&runs, &[]);
+            let mut count = 0;
+            for attrs in list.iterator() {
+                count += attrs.into_iter().count();
+            }
+            assert!(count > 0, "{style:?} produced no attributes");
+        }
+    }
+
+    /// Checks that build GTK widgets or need a display run together in this
+    /// one test (GTK is not thread-safe), skipped when GTK cannot
+    /// initialize: the text searched for the buffer keeps character indexes
+    /// aligned with buffer offsets (an embedded child anchor becomes U+FFFC
+    /// via `slice`), replacing a plain-text label's attributes drops its
+    /// previous highlights, every style gets a text tag, code cards show
+    /// their code and language, a scaled texture stretches its logical size,
+    /// and a label's link hit-testing finds the destination under a point.
+    #[test]
+    fn gtk_helpers() {
         if !gtk_ready() {
             return;
         }
@@ -3036,5 +3059,72 @@ mod tests {
         let ranges = background_ranges(&label);
         assert!(!ranges.contains(&(0, 1)), "{ranges:?}");
         assert!(ranges.contains(&(6, 12)), "{ranges:?}");
+
+        // Every style, plus display math and the two search tags, is
+        // registered; a heading's tag carries its name.
+        let table = gtk4::TextTagTable::new();
+        create_tags(&table);
+        for style in Style::ALL {
+            assert!(table.lookup(style.tag_name()).is_some(), "{style:?}");
+        }
+        assert!(table.lookup(DISPLAY_MATH_TAG).is_some());
+        assert!(table.lookup(SEARCH_MATCH_TAG).is_some());
+        assert!(table.lookup(SEARCH_CURRENT_TAG).is_some());
+        assert_eq!(tag_for(Style::Heading(1)).name().as_deref(), Some("h1"));
+        assert_eq!(tag_for(Style::Code).name().as_deref(), Some("code"));
+
+        // A code card shows the code verbatim in its text label and names the
+        // language in its header.
+        let code = CodeBlock {
+            language: Some("rust".to_string()),
+            text: "fn main() {}".to_string(),
+            indent: 0,
+        };
+        let (card, code_label) = code_card(&code);
+        assert_eq!(code_label.text().as_str(), "fn main() {}");
+        let header = card.first_child().expect("card starts with its header");
+        let language = header
+            .first_child()
+            .expect("header starts with the language");
+        assert_eq!(
+            language
+                .downcast::<gtk4::Label>()
+                .expect("language label")
+                .text()
+                .as_str(),
+            "rust"
+        );
+
+        // Stretching a scaled texture scales its logical size.
+        let image = Image {
+            width: 40,
+            height: 20,
+            scale: 2.0,
+            depth: 0.0,
+            pixels: vec![0; 40 * 20 * 4],
+            labels: Vec::new(),
+        };
+        let texture = ScaledTexture::new(&image);
+        assert_eq!(texture.scale_size(2.0), (40.0, 20.0));
+
+        // A click inside the first characters finds a link covering them; a
+        // point in a gap or with no links finds nothing.
+        let link_label = gtk4::Label::new(Some("Alice coffee"));
+        let (_, height) = link_label.layout().pixel_size();
+        let y = f64::from(height) / 2.0;
+        let links = vec![LabelLink {
+            range: 0..5,
+            dest: "u".to_string(),
+        }];
+        assert_eq!(
+            label_link_at(&link_label, &links, 0.5, y),
+            Some("u".to_string())
+        );
+        let gap = vec![LabelLink {
+            range: 10..20,
+            dest: "v".to_string(),
+        }];
+        assert_eq!(label_link_at(&link_label, &gap, 0.5, y), None);
+        assert_eq!(label_link_at(&link_label, &[], 0.5, y), None);
     }
 }

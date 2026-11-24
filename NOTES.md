@@ -251,11 +251,13 @@ run there; runtime verification on a real FreeBSD system is a manual step.
     (paragraphs, headings, lists, block quotes, code blocks, rules, tables,
     math, Mermaid) and per inline style (emphasis, strong, strikethrough,
     inline code, links, images), plus standalone-image detection (including
-    list items and block quotes), image resolution, image placeholders and
+    list items, block quotes, a formula or image next to the image, and
+    trailing text), image resolution, image placeholders and
     the Pango markup for table cells
   - `links.rs` - link resolution (web, mail, local, relative, Markdown,
-    anchor, ignored schemes), image destination resolution (local, remote,
-    unsupported, percent-decoding), heading slugs, `LinkRanges`, and the
+    anchor, ignored schemes, a `file:` URL with a host), image destination
+    resolution (local, remote, unsupported, percent-decoding), heading slugs
+    (including dropping a trailing hyphen), `file_uri`, `LinkRanges`, and the
     links inside label text
   - `graphics.rs` - rasterizing, math and mhchem, Mermaid diagrams (several
     types, labels, scale, errors), image decoding (PNG, JPEG, SVG,
@@ -441,10 +443,19 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   the `cargo-llvm-cov` subcommand). Run it with a display so the GUI is
   covered too; headless, e.g. `Xvfb :77 & DISPLAY=:77 GDK_BACKEND=x11
   GSK_RENDERER=cairo cargo llvm-cov --tests`. With a display line coverage
-  is about 94% (the library about 99%); the remaining lines are the file
-  chooser and error dialog paths in `main.rs`, which need user interaction,
-  and defensive branches that cannot be reached with the enabled parser
-  options
+  is about 80%: the library (`lib.rs`, `graphics.rs`, `links.rs`,
+  `progressive.rs`, `search.rs`, `zoom.rs`, `layout.rs`) is about 98-100%,
+  and `main.rs` is about 64%. The library's few uncovered lines are
+  defensive branches that cannot be reached (no fonts installed, a `file:`
+  URL with a host, parser events for extensions that are not enabled, and
+  `Option` arms that cannot be `None`). Almost all of `main.rs`'s remainder
+  is interactive GUI wiring that needs input events or a live window - the
+  file chooser and error dialogs, click/zoom/search gestures, hover
+  tooltips, and placing loaded images - so it is checked by hand (or with
+  `xdotool` on Xvfb, see below). The display-independent helpers
+  (`label_attributes` and friends) and the GTK-helper checks (`tag_for`/
+  `create_tags`, `code_card`, `ScaledTexture::scale_size`,
+  `label_link_at`) are unit-tested in `main.rs`'s test module
 - Debian package: `cargo deb` (requires the `cargo-deb` subcommand)
 - FreeBSD package: cross-build with `cargo build --release --target
   x86_64-unknown-freebsd` against a FreeBSD sysroot, then

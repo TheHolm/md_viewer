@@ -79,3 +79,9 @@ Background on the rendering crates is in `NOTES.md`.
   viewer starts and exits cleanly with images in the document (including a
   table cell); the decoding, sizing arithmetic, resolution, link and
   searchable-alt logic are tested, and the interaction is checked by hand.
+  The pure/layout helpers around pictures are unit-tested in `main.rs`
+  (text tags, code cards, `ScaledTexture::scale_size`, label link
+  hit-testing), but the placement itself (`insert_image`,
+  `make_picture_clickable`, `rich_cell_widget`) is only smoke-tested: the
+  viewer opens a document with images and exits cleanly, without the
+  placement being asserted.

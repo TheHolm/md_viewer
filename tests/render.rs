@@ -787,6 +787,41 @@ fn image_with_text_in_list_item_is_inline() {
     }
 }
 
+/// Whether the image at `ordinal` (0-based, among images in the rendered
+/// source) is standalone.
+fn nth_image_standalone(source: &str, ordinal: usize) -> bool {
+    let inlines = inlines(source);
+    let at = inlines
+        .iter()
+        .enumerate()
+        .filter(|(_, inline)| matches!(inline, Inline::Image(_)))
+        .nth(ordinal)
+        .map(|(index, _)| index)
+        .expect("not enough images in the rendered source");
+    image_is_standalone(&inlines, at)
+}
+
+/// A formula or another image sharing the image's line makes it inline, not
+/// standalone, whether it comes before or after.
+#[test]
+fn image_next_to_math_or_image_is_inline() {
+    // A formula before the image (its only other line content).
+    assert!(!first_image_standalone("$x$ ![a](i.png)"));
+    // A formula after the image.
+    assert!(!first_image_standalone("![a](i.png) $x$"));
+    // Another image before the second one, and after the first.
+    assert!(!nth_image_standalone("![a](i.png) ![b](j.png)", 1));
+    assert!(!nth_image_standalone("![a](i.png) ![b](j.png)", 0));
+}
+
+/// Non-whitespace text after the image keeps it inline even with nothing
+/// before it on the line (the standalone check looks both ways).
+#[test]
+fn image_with_trailing_text_is_inline() {
+    assert!(!first_image_standalone("![a](i.png)x"));
+    assert!(!first_image_standalone("![a](i.png) trailing"));
+}
+
 /// An image inside a link is the link's content (so the bare destination is
 /// not shown as text) and carries the link so the picture is clickable.
 #[test]
