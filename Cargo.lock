@@ -1277,7 +1277,7 @@ dependencies = [
 
 [[package]]
 name = "md_viewer"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "clap",
  "glib-unix",
@@ -1286,6 +1286,7 @@ dependencies = [
  "libadwaita",
  "mathra",
  "merman",
+ "percent-encoding",
  "pulldown-cmark",
  "regex",
  "resvg",

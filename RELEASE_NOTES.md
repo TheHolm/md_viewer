@@ -6,6 +6,70 @@ changes** summary (what also appears in the GitHub Release body) and a
 added at the top. `scripts/extract-release-notes.sh` prints just one release's
 section for the GitHub Release body.
 
+## v0.8.1 — Heading links and a size limit for graphics
+
+### User-facing changes
+
+- Links to headings (`[Usage](#usage)`, a table of contents,
+  `other.md#section`) now work for every heading. Before, only a heading
+  that happened to sit alone between two tables, code blocks or diagrams
+  could be linked to; most such links did nothing. Headings with non-ASCII
+  text (`#über-uns`) can be linked too.
+- Very large graphics no longer crash the viewer or eat gigabytes of
+  memory. Nothing is drawn larger than ten screens: an image, SVG, formula
+  or diagram too large even at 100% shows "too large" with its size in its
+  place (also for inline formulas, which now say why they could not be
+  drawn), and a small PNG that claims a huge size is refused without being
+  decoded.
+- A document with a very large picture limits how far it can be zoomed in:
+  the zoom stops where the picture reaches the limit, and if such a picture
+  appears while you are zoomed in further, the window zooms out to it.
+- The header bar shows the zoom percentage whenever it is not 100%
+  ("(max)" at the largest zoom allowed); click it to reset to 100%.
+- Raster images are no longer enlarged on HiDPI screens (that added no
+  detail but multiplied their memory), and a large image used inline in the
+  text keeps only the pixels it is drawn with.
+
+### Details
+
+- Version 0.8.0 → 0.8.1 (bug fixes).
+- Heading anchors were computed per text block: a block holds many
+  headings, paragraphs and lists, so the one anchor registered was the slug
+  of the whole block's text. `links::heading_starts` now finds each heading
+  in a block (a run of spans with the same `Style::Heading`, plus adjacent
+  formulas and images), the GUI registers each at the buffer offset of its
+  first character, and `links::Anchors` (moved out of `main.rs`, tested)
+  adds the `-1`, `-2` suffixes. `resolve_link` percent-decodes fragments
+  (the URL parser encodes non-ASCII), using the `percent-encoding` crate
+  that `url` already depended on.
+- `graphics::zoom_limit` checks a graphic's size at 100% against
+  `RasterSettings::max_px` (ten times the window's monitor in device
+  pixels, `max_px_for`; `FALLBACK_MAX_PX` without a monitor) before any
+  pixmap is allocated, in floating point (a huge SVG size used to wrap to a
+  "no area" error). `rasterize` (SVG files, formulas, diagrams) refuses or
+  caps at `Image::max_zoom`; `decode_image` checks the oriented size from
+  the file header and sets `image::Limits` as a backstop, and no longer
+  resizes for the device scale (the slow Lanczos resize over the whole
+  file is gone; the texture is the file's pixels at scale 1). `cap_inline`
+  resamples a shrunk inline image to its drawn size (at least 32 pixels on
+  its shorter side). The settings key of both caches includes the limit.
+- `Zoom` has a ceiling (`set_ceiling`, `max`, `at_max`) that all zoom
+  changes are clamped to, and `scroll` stops at the ends instead of
+  stepping once per accumulated click. The session lowers its zoom limit as
+  graphics arrive (`note_limit`, also counting the largest heading via
+  `layout::text_zoom_limit`) and reports it after each poll; the window
+  then clamps its zoom, zooming out if needed. `Zoom::indicator` gives the
+  header bar text.
+- `Math::failure_note` gives the note after a formula's source, now also
+  for inline math.
+- Tests: heading detection and anchors (several headings per block,
+  duplicates, markup, formulas, lists and quotes), fragment decoding, the
+  size limit (oversized SVG, formula, diagram and PNG, a PNG bomb, Exif
+  orientation, zoom stopping at the limit, the cache per limit, inline
+  shrinking, no HiDPI enlargement), the zoom ceiling and indicator, a GUI
+  session test of the anchors and of the zoom ceiling, and a CLI smoke test
+  opening oversized graphics.
+
 ## v0.8.0 — Lazy rendering and complete search
 
 ### User-facing changes

@@ -4,7 +4,8 @@
 use md_viewer::layout::{
     align_fraction, available_width, cell_classes, color_channel, diagram_size, font_size_px,
     heading_scale, math_rise, needs_more, pango_channel, pango_color, percent_alpha, table_size,
-    DIAGRAM_PADDING, DOCUMENT_MARGIN, FRONTIER_LOOKAHEAD, MIN_DIAGRAM_WIDTH, MIN_TABLE_WIDTH,
+    text_zoom_limit, DIAGRAM_PADDING, DOCUMENT_MARGIN, FRONTIER_LOOKAHEAD, MIN_DIAGRAM_WIDTH,
+    MIN_TABLE_WIDTH,
 };
 use md_viewer::Align;
 
@@ -271,4 +272,17 @@ fn search_mark_positions() {
     // A track shorter than the mark just pins the mark to the top.
     assert_eq!(search_mark_y(1.0, 2.0, mark), 0.0);
     assert_eq!(search_mark_y(0.0, 0.0, mark), 0.0);
+}
+
+/// Text obeys the graphics size limit too: the zoom limit is how many times
+/// a level 1 heading line (twice the body size, 1.5 lines) fits the limit's
+/// height, in device pixels; never below 1.0, and infinite for no text.
+#[test]
+fn text_zoom_limit_from_largest_heading() {
+    // 15 px body: a 45 px heading line; 10,800 / 45 = 240.
+    assert!((text_zoom_limit(15.0, 1.0, [19_200, 10_800]) - 240.0).abs() < 1e-9);
+    assert!((text_zoom_limit(15.0, 2.0, [19_200, 10_800]) - 120.0).abs() < 1e-9);
+    assert_eq!(text_zoom_limit(15.0, 1.0, [10, 10]), 1.0);
+    assert_eq!(text_zoom_limit(0.0, 1.0, [10, 10]), f64::INFINITY);
+    assert_eq!(text_zoom_limit(f32::NAN, 1.0, [10, 10]), f64::INFINITY);
 }

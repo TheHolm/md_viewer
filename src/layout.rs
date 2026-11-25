@@ -238,3 +238,20 @@ pub fn cell_classes(row: usize, column: usize, columns: usize, rows: usize) -> V
     }
     classes
 }
+
+/// How tall a line of text is, as a multiple of its font size (generous:
+/// Pango's line height for common fonts is about 1.2).
+const LINE_HEIGHT_FACTOR: f64 = 1.5;
+
+/// The largest zoom at which the document's largest text (a level 1
+/// heading, `base_px` at 100%) stays within `max_px` (device pixels) at
+/// device `scale`: text obeys the same size limit as graphics. Never less
+/// than 1.0; infinite for an empty size.
+pub fn text_zoom_limit(base_px: f32, scale: f32, max_px: [u32; 2]) -> f64 {
+    let line =
+        f64::from(base_px) * heading_scale(1) * LINE_HEIGHT_FACTOR * f64::from(scale.max(1.0));
+    if !(line.is_finite() && line > 0.0) {
+        return f64::INFINITY;
+    }
+    (f64::from(max_px[1]) / line).max(1.0)
+}

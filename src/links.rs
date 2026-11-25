@@ -4,11 +4,13 @@
 //! The renderer keeps each link's destination on its [`Span`](crate::Span)
 //! (`span.link`); the GUI turns those into clickable text. This module
 //! resolves a destination against the document being viewed
-//! ([`resolve_link`]), generates the anchor a heading links to
-//! ([`heading_slug`]), and tracks the character ranges that are links
-//! ([`LinkRanges`]).
+//! ([`resolve_link`]), finds the headings of a text block
+//! ([`heading_starts`]), generates the anchor a heading links to
+//! ([`heading_slug`], [`Anchors`]), and tracks the character ranges that are
+//! links ([`LinkRanges`]).
 
-use crate::ImageState;
+use crate::{ImageState, Inline, Style};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use url::Url;
 
@@ -47,7 +49,7 @@ pub fn resolve_link(base: &Path, dest: &str) -> Resolved {
     let Ok(joined) = base_url.join(dest) else {
         return Resolved::Ignored;
     };
-    let fragment = joined.fragment().map(str::to_string);
+    let fragment = joined.fragment().map(decode_fragment);
     match joined.scheme() {
         "http" | "https" | "mailto" => Resolved::Web(joined.to_string()),
         "file" => {
@@ -108,6 +110,16 @@ pub fn resolve_image(document: &Path, src: &str) -> ImageState {
         }
         scheme => ImageState::Unsupported(format!("unsupported scheme: {scheme}")),
     }
+}
+
+/// Percent-decodes a URL `fragment` back to the text it was written as: the
+/// URL parser encodes non-ASCII characters and spaces (`#über` becomes
+/// `#%C3%BCber`), while heading anchors are plain Unicode. Invalid UTF-8
+/// after decoding is replaced rather than rejected.
+fn decode_fragment(fragment: &str) -> String {
+    percent_encoding::percent_decode_str(fragment)
+        .decode_utf8_lossy()
+        .into_owned()
 }
 
 /// Whether two paths name the same file, compared lexically after making
@@ -173,6 +185,109 @@ pub fn heading_slug(text: &str) -> String {
         slug.pop();
     }
     slug
+}
+
+/// The headings in a text block's `inlines`: for each, the index of its
+/// first inline and its text (what [`heading_slug`] is computed from).
+///
+/// A text block holds many paragraphs, lists and headings in a row, so a
+/// heading is a run of text spans carrying a [`Style::Heading`] of the same
+/// level. Formulas and images carry no styles; one next to heading text (at
+/// its start, inside it or at its end) belongs to the heading, but a heading
+/// needs at least one span of heading text. Any other text (the blank lines
+/// between blocks, a paragraph, a list marker) ends a heading.
+pub fn heading_starts(inlines: &[Inline]) -> Vec<(usize, String)> {
+    /// A heading being gathered: its first inline, text so far, and level
+    /// (`None` while only formulas or images have been seen).
+    struct Run {
+        start: usize,
+        text: String,
+        level: Option<u8>,
+    }
+    let mut headings = Vec::new();
+    let mut run: Option<Run> = None;
+    let finish = |run: Option<Run>, headings: &mut Vec<(usize, String)>| {
+        if let Some(run) = run.filter(|run| run.level.is_some()) {
+            headings.push((run.start, run.text));
+        }
+    };
+    for (index, inline) in inlines.iter().enumerate() {
+        match inline {
+            Inline::Text(span) => match heading_level(&span.styles) {
+                Some(level) => {
+                    let continues = run
+                        .as_ref()
+                        .is_some_and(|run| run.level.is_none_or(|l| l == level));
+                    if !continues {
+                        finish(run.take(), &mut headings);
+                        run = Some(Run {
+                            start: index,
+                            text: String::new(),
+                            level: None,
+                        });
+                    }
+                    let current = run.as_mut().expect("run was just started");
+                    current.level = Some(level);
+                    current.text.push_str(&span.text);
+                }
+                None => finish(run.take(), &mut headings),
+            },
+            Inline::Math(_) | Inline::Image(_) => {
+                let current = run.get_or_insert_with(|| Run {
+                    start: index,
+                    text: String::new(),
+                    level: None,
+                });
+                current.text.push_str(&inline.text());
+            }
+        }
+    }
+    finish(run, &mut headings);
+    headings
+}
+
+/// The heading level among `styles`, if the text is part of a heading.
+fn heading_level(styles: &[Style]) -> Option<u8> {
+    styles.iter().find_map(|style| match style {
+        Style::Heading(level) => Some(*level),
+        _ => None,
+    })
+}
+
+/// The headings of a document, by anchor, as they are appended to the page.
+///
+/// Each heading gets the anchor [`heading_slug`] gives its text; a repeated
+/// anchor gets `-1`, `-2`, ... appended in document order, like GitHub.
+/// `offset` is wherever the caller wants to scroll to (the GUI uses the
+/// heading's first buffer character).
+#[derive(Debug, Default)]
+pub struct Anchors {
+    offsets: HashMap<String, i32>,
+}
+
+impl Anchors {
+    /// Registers a heading with `text` at `offset`, returning its anchor, or
+    /// `None` if the text has no anchor (it is only punctuation or spaces).
+    pub fn register(&mut self, text: &str, offset: i32) -> Option<String> {
+        let base = heading_slug(text);
+        if base.is_empty() {
+            return None;
+        }
+        let mut slug = base.clone();
+        let mut n = 1;
+        while self.offsets.contains_key(&slug) {
+            slug = format!("{base}-{n}");
+            n += 1;
+        }
+        self.offsets.insert(slug.clone(), offset);
+        Some(slug)
+    }
+
+    /// The offset of the heading `fragment` names (a decoded link fragment,
+    /// as [`resolve_link`] returns it), if it has been registered.
+    pub fn lookup(&self, fragment: &str) -> Option<i32> {
+        self.offsets.get(fragment).copied()
+    }
 }
 
 /// A clickable range of the document's text, in character offsets.

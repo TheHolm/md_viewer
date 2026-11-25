@@ -11,8 +11,8 @@ use adw::prelude::*;
 use clap::Parser;
 use gtk4::glib::translate::IntoGlib;
 use gtk4::{gdk, gio, glib, pango};
-use md_viewer::graphics::{Image, RasterSettings, Rendered};
-use md_viewer::links::{self, LinkRanges, Resolved};
+use md_viewer::graphics::{self, Image, RasterSettings, Rendered};
+use md_viewer::links::{self, Anchors, LinkRanges, Resolved};
 use md_viewer::progressive::{self, Job, Phase, Pool, Progress};
 use md_viewer::search::{self, Matcher, SearchMode, Unit};
 use md_viewer::zoom::{self, Zoom};
@@ -22,7 +22,6 @@ use md_viewer::{
 };
 use md_viewer::{layout, CodeBlock};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::{mpsc, Mutex};
@@ -470,10 +469,17 @@ struct Session {
     /// The clickable ranges of the text buffer, in character offsets.
     links: RefCell<LinkRanges>,
     /// Each heading's anchor and the buffer offset of its first character.
-    anchors: RefCell<HashMap<String, i32>>,
+    anchors: RefCell<Anchors>,
     /// An anchor requested before its heading was appended; scrolled to as
     /// soon as the heading appears.
     pending_anchor: RefCell<Option<String>>,
+    /// The largest zoom every graphic shown so far can be drawn at (see
+    /// `Image::max_zoom`); infinite until one is shown.
+    zoom_limit: Cell<f64>,
+    /// True when `zoom_limit` was lowered and the window has not been told.
+    limit_dirty: Cell<bool>,
+    /// Tells the window the document's new zoom limit.
+    limit_changed: Box<dyn Fn(f64)>,
     /// A block (searched before it was rendered) to scroll to once it is on
     /// the page.
     pending_scroll: RefCell<Option<usize>>,
@@ -492,6 +498,11 @@ impl Session {
     /// end of what is rendered, see [`Session::advance_frontier`]).
     fn start(self: &Rc<Self>, settings: RasterSettings) {
         self.settings.set(settings);
+        let text_limit = layout::text_zoom_limit(settings.font_px, settings.scale, settings.max_px);
+        if text_limit < self.zoom_limit.get() {
+            self.zoom_limit.set(text_limit);
+        }
+        self.limit_dirty.set(true);
         self.shown_zoom.set(settings.zoom);
         self.frontier.set(0);
         self.generation.set(self.generation.get() + 1);
@@ -500,6 +511,7 @@ impl Session {
         self.append_ready();
         self.update_status();
         self.advance_frontier();
+        self.report_limit();
     }
 
     /// Submits `jobs` to the worker pool (creating the pool if this run has
@@ -626,6 +638,7 @@ impl Session {
                 .set(self.outstanding.get().saturating_sub(1));
             if self.progress.borrow().is_shown(id) {
                 if let (Ok(image), Some(Some(slot))) = (&rendered, self.slots.borrow().get(id)) {
+                    self.note_limit(image);
                     slot.apply(image, &self.resizable);
                     if self.anchor.borrow().is_some() {
                         self.hold_anchor();
@@ -639,6 +652,7 @@ impl Session {
         self.append_ready();
         self.update_status();
         self.advance_frontier();
+        self.report_limit();
     }
 
     /// Appends every block that is complete and follows the ones shown.
@@ -728,6 +742,32 @@ impl Session {
         }
     }
 
+    /// Records where the next graphic, rendered as `image`, is shown, and
+    /// lowers the document's zoom limit to the image's.
+    fn add_graphic(&self, image: &Image, slot: Slot) {
+        self.note_limit(image);
+        self.add_slot(Some(slot));
+    }
+
+    /// Lowers the document's zoom limit to `image`'s, if that is lower; the
+    /// window hears of it from [`Session::report_limit`].
+    fn note_limit(&self, image: &Image) {
+        let limit = f64::from(image.max_zoom);
+        if limit < self.zoom_limit.get() {
+            self.zoom_limit.set(limit);
+            self.limit_dirty.set(true);
+        }
+    }
+
+    /// Tells the window the document's zoom limit if it changed since the
+    /// last report. Called once nothing on the page is borrowed (the window
+    /// may zoom out at once, which re-renders and restretches the graphics).
+    fn report_limit(&self) {
+        if self.limit_dirty.replace(false) {
+            (self.limit_changed)(self.zoom_limit.get());
+        }
+    }
+
     /// Records where the next graphic is shown (`None` if it is shown as
     /// its source).
     fn add_slot(&self, slot: Option<Slot>) {
@@ -744,8 +784,6 @@ impl Session {
         let buffer = self.view.buffer();
         match &blocks[index] {
             Block::Text(inlines) => {
-                let offset = buffer.end_iter().offset();
-                self.record_heading(inlines, offset);
                 self.insert_inlines(&buffer, inlines);
             }
             Block::Table(table) => {
@@ -788,13 +826,16 @@ impl Session {
                     .join("\n");
                 self.add_diagram_entry(&card, labels, offset);
                 let mut pictures = self.resizable.pictures.borrow_mut();
-                self.add_slot(Some(Slot {
-                    texture,
-                    rise: None,
-                    picture: Some(pictures.len()),
-                    offset,
-                    depth: Cell::new(0.0),
-                }));
+                self.add_graphic(
+                    image,
+                    Slot {
+                        texture,
+                        rise: None,
+                        picture: Some(pictures.len()),
+                        offset,
+                        depth: Cell::new(0.0),
+                    },
+                );
                 pictures.push((picture, image.logical_width(), image.logical_height()));
             }
             failed => {
@@ -844,7 +885,11 @@ impl Session {
                     && md_viewer::image_is_standalone(inlines, at)
             })
             .collect();
+        let mut headings = links::heading_starts(inlines).into_iter().peekable();
         for (at, inline) in inlines.iter().enumerate() {
+            if let Some((_, text)) = headings.next_if(|(start, _)| *start == at) {
+                self.record_heading(&text, buffer.end_iter().offset());
+            }
             match inline {
                 Inline::Text(span) => {
                     let start = buffer.end_iter().offset();
@@ -865,7 +910,7 @@ impl Session {
     /// Inserts a rendered formula at the end of `buffer`: inline math is
     /// lowered so its baseline lines up with the text, display math is
     /// centred. A formula that could not be rendered is shown as its source
-    /// in code style, display math with a note saying why.
+    /// in code style, followed by a note saying why (`Math::failure_note`).
     fn insert_math(&self, buffer: &gtk4::TextBuffer, math: &Math) {
         match &math.image {
             Some(Ok(image)) => {
@@ -881,13 +926,16 @@ impl Session {
                 if math.display {
                     buffer.apply_tag_by_name(DISPLAY_MATH_TAG, &range.0, &range.1);
                 }
-                self.add_slot(Some(Slot {
-                    texture,
-                    rise: Some(rise),
-                    picture: None,
-                    offset: start,
-                    depth: Cell::new(image.depth),
-                }));
+                self.add_graphic(
+                    image,
+                    Slot {
+                        texture,
+                        rise: Some(rise),
+                        picture: None,
+                        offset: start,
+                        depth: Cell::new(image.depth),
+                    },
+                );
             }
             failed => {
                 self.add_slot(None);
@@ -895,16 +943,13 @@ impl Session {
                     Some(Err(reason)) => reason.as_str(),
                     _ => "not rendered",
                 };
-                if math.display {
-                    insert_styled(buffer, &math.source(), &[Style::CodeBlock]);
-                    insert_styled(
-                        buffer,
-                        &format!("\n⚠ formula could not be rendered: {reason}"),
-                        &[Style::Image],
-                    );
+                let style = if math.display {
+                    Style::CodeBlock
                 } else {
-                    insert_styled(buffer, &math.source(), &[Style::Code]);
-                }
+                    Style::Code
+                };
+                insert_styled(buffer, &math.source(), &[style]);
+                insert_styled(buffer, &math.failure_note(reason), &[Style::Image]);
             }
         }
     }
@@ -954,13 +999,16 @@ impl Session {
                     }
                     let mut pictures = self.resizable.pictures.borrow_mut();
                     let index = pictures.len();
-                    self.add_slot(Some(Slot {
-                        texture,
-                        rise: None,
-                        picture: Some(index),
-                        offset,
-                        depth: Cell::new(0.0),
-                    }));
+                    self.add_graphic(
+                        rendered,
+                        Slot {
+                            texture,
+                            rise: None,
+                            picture: Some(index),
+                            offset,
+                            depth: Cell::new(0.0),
+                        },
+                    );
                     pictures.push((picture, rendered.logical_width(), rendered.logical_height()));
                 } else {
                     let start = buffer.end_iter().offset();
@@ -975,13 +1023,16 @@ impl Session {
                         );
                     }
                     self.add_image_entry(&image.alt, start, SearchTarget::Unhighlighted);
-                    self.add_slot(Some(Slot {
-                        texture,
-                        rise: None,
-                        picture: None,
-                        offset: start,
-                        depth: Cell::new(0.0),
-                    }));
+                    self.add_graphic(
+                        rendered,
+                        Slot {
+                            texture,
+                            rise: None,
+                            picture: None,
+                            offset: start,
+                            depth: Cell::new(0.0),
+                        },
+                    );
                 }
             }
             failed => {
@@ -1126,13 +1177,16 @@ impl Session {
                     picture.set_can_shrink(false);
                     picture.set_valign(gtk4::Align::Center);
                     row.append(&picture);
-                    self.add_slot(Some(Slot {
-                        texture,
-                        rise: None,
-                        picture: None,
-                        offset,
-                        depth: Cell::new(image.depth),
-                    }));
+                    self.add_graphic(
+                        image,
+                        Slot {
+                            texture,
+                            rise: None,
+                            picture: None,
+                            offset,
+                            depth: Cell::new(image.depth),
+                        },
+                    );
                 }
                 // A formula that could not be rendered is a graphic (it has a
                 // job), so it needs a slot even though it shows its source.
@@ -1160,13 +1214,16 @@ impl Session {
                         if let Some(dest) = &image.link {
                             self.make_picture_clickable(&card, dest);
                         }
-                        self.add_slot(Some(Slot {
-                            texture,
-                            rise: None,
-                            picture: None,
-                            offset,
-                            depth: Cell::new(0.0),
-                        }));
+                        self.add_graphic(
+                            rendered,
+                            Slot {
+                                texture,
+                                rise: None,
+                                picture: None,
+                                offset,
+                                depth: Cell::new(0.0),
+                            },
+                        );
                     }
                     (ImageState::Local(_), _) => {
                         self.add_slot(None);
@@ -1240,6 +1297,8 @@ impl Session {
     fn rerender(self: &Rc<Self>) {
         let mut settings = self.settings.get();
         settings.zoom = self.shown_zoom.get();
+        // The window may have moved to another monitor since.
+        settings.max_px = screen_max_px(&self.view);
         self.settings.set(settings);
         let frontier = self.frontier.get();
         let unshown = self.progress.borrow_mut().reset_unshown(frontier);
@@ -1318,35 +1377,12 @@ impl Session {
         });
     }
 
-    /// Registers the heading of `inlines` (a text block that carries a
-    /// heading style) under its anchor slug at buffer `offset`, scrolled to
-    /// if a pending anchor names it.
-    fn record_heading(&self, inlines: &[Inline], offset: i32) {
-        let is_heading = inlines.iter().any(|inline| {
-            matches!(inline, Inline::Text(span) if span.styles.iter().any(|s| matches!(s, Style::Heading(_))))
-        });
-        if !is_heading {
+    /// Registers a heading with `text`, starting at buffer `offset`, under
+    /// its anchor; scrolls to it if a pending anchor names it.
+    fn record_heading(&self, text: &str, offset: i32) {
+        let Some(slug) = self.anchors.borrow_mut().register(text, offset) else {
             return;
-        }
-        let base = links::heading_slug(&inlines.iter().map(Inline::text).collect::<String>());
-        if base.is_empty() {
-            return;
-        }
-        let mut anchors = self.anchors.borrow_mut();
-        let slug = if anchors.contains_key(&base) {
-            let mut n = 1;
-            loop {
-                let candidate = format!("{base}-{n}");
-                if !anchors.contains_key(&candidate) {
-                    break candidate;
-                }
-                n += 1;
-            }
-        } else {
-            base
         };
-        anchors.insert(slug.clone(), offset);
-        drop(anchors);
         if self.pending_anchor.borrow().as_deref() == Some(slug.as_str()) {
             self.pending_anchor.borrow_mut().take();
             let mut iter = self.view.buffer().iter_at_offset(offset);
@@ -1397,9 +1433,8 @@ impl Session {
     /// Scrolls to the heading named `fragment`, or remembers it to scroll to
     /// when that heading is appended.
     fn scroll_to_anchor(&self, fragment: &str) {
-        let anchors = self.anchors.borrow();
-        if let Some(&offset) = anchors.get(fragment) {
-            drop(anchors);
+        let offset = self.anchors.borrow().lookup(fragment);
+        if let Some(offset) = offset {
             let mut iter = self.view.buffer().iter_at_offset(offset);
             self.view.scroll_to_iter(&mut iter, 0.15, true, 0.0, 0.3);
         } else {
@@ -1885,6 +1920,9 @@ struct DocWindow {
     toolbar: adw::ToolbarView,
     /// The header bar spinner, shown while a document is still loading.
     spinner: adw::Spinner,
+    /// The header bar's zoom percentage (hidden at 100%); clicking it resets
+    /// the zoom.
+    zoom_indicator: gtk4::Button,
     /// The document shown, or `None` while the window shows the start page.
     document: RefCell<Option<PathBuf>>,
     /// The document being shown, if any.
@@ -1928,9 +1966,16 @@ impl DocWindow {
             .width_request(16)
             .height_request(16)
             .build();
+        let zoom_indicator = gtk4::Button::builder()
+            .tooltip_text("Reset Zoom (Ctrl+0)")
+            .action_name("win.zoom-reset")
+            .css_classes(["flat"])
+            .visible(false)
+            .build();
         let header = adw::HeaderBar::new();
         header.pack_start(&open_button);
         header.pack_end(&spinner);
+        header.pack_end(&zoom_indicator);
         let toolbar = adw::ToolbarView::new();
         toolbar.add_top_bar(&header);
         toolbar.set_content(Some(&start_page()));
@@ -1997,6 +2042,7 @@ impl DocWindow {
             window,
             toolbar,
             spinner,
+            zoom_indicator,
             document: RefCell::new(None),
             session: RefCell::new(None),
             zoom: Cell::new(Zoom::default()),
@@ -2213,11 +2259,12 @@ impl DocWindow {
     /// of the window in place.
     fn change_zoom(&self, change: impl FnOnce(&mut Zoom) -> bool) {
         let mut zoom = self.zoom.get();
-        if !change(&mut zoom) {
-            self.zoom.set(zoom);
+        let changed = change(&mut zoom);
+        self.zoom.set(zoom);
+        self.update_zoom_indicator();
+        if !changed {
             return;
         }
-        self.zoom.set(zoom);
         let session = self.session.borrow().clone();
         if let Some(session) = &session {
             session.hold_anchor();
@@ -2226,6 +2273,24 @@ impl DocWindow {
             .load_from_string(&zoom::css(&self.zoom_class, self.base_px, zoom.level()));
         if let Some(session) = session {
             session.zoom_to(zoom.level() as f32);
+        }
+    }
+
+    /// Lowers the zoom ceiling to `limit`, the largest zoom the document's
+    /// graphics allow; if the window is zoomed in further, it zooms out to
+    /// the ceiling (keeping the line at the top of the window in place).
+    fn limit_zoom(&self, limit: f64) {
+        self.change_zoom(|zoom| zoom.set_ceiling(limit));
+    }
+
+    /// Shows the zoom percentage in the header bar, or hides it at 100%.
+    fn update_zoom_indicator(&self) {
+        match self.zoom.get().indicator() {
+            Some(text) => {
+                self.zoom_indicator.set_label(&text);
+                self.zoom_indicator.set_visible(true);
+            }
+            None => self.zoom_indicator.set_visible(false),
         }
     }
 
@@ -2354,6 +2419,11 @@ impl DocWindow {
         if let Some(old) = self.session.take() {
             old.pool.replace(None);
         }
+        // The new document sets its own ceiling as its graphics arrive.
+        let mut zoom = self.zoom.get();
+        zoom.set_ceiling(f64::INFINITY);
+        self.zoom.set(zoom);
+        self.update_zoom_indicator();
         self.search_bar.set_search_mode(false);
         let view = gtk4::TextView::builder()
             .editable(false)
@@ -2435,6 +2505,14 @@ impl DocWindow {
                 }
             })
         };
+        let limit_changed = {
+            let window = Rc::downgrade(self);
+            Box::new(move |limit| {
+                if let Some(window) = window.upgrade() {
+                    window.limit_zoom(limit);
+                }
+            })
+        };
         let session = Rc::new(Session {
             view,
             scrolled,
@@ -2468,8 +2546,11 @@ impl DocWindow {
             search_changed,
             document: path.to_path_buf(),
             links: RefCell::new(LinkRanges::default()),
-            anchors: RefCell::new(HashMap::new()),
+            anchors: RefCell::new(Anchors::default()),
             pending_anchor: RefCell::new(None),
+            zoom_limit: Cell::new(f64::INFINITY),
+            limit_dirty: Cell::new(false),
+            limit_changed,
             pending_scroll: RefCell::new(None),
             open_link,
             weak_self: RefCell::new(None),
@@ -2578,6 +2659,7 @@ impl DocWindow {
                 channel(color.blue()),
             ],
             zoom: self.zoom.get().level() as f32,
+            max_px: screen_max_px(view),
         }
     }
 
@@ -2754,6 +2836,26 @@ fn label_link_at(label: &gtk4::Label, links: &[LabelLink], x: f64, y: f64) -> Op
         .iter()
         .find(|link| link.range.contains(&(index as usize)))
         .map(|link| link.dest.clone())
+}
+
+/// The size limit for graphics shown in `widget`: [`graphics::SCREEN_MULTIPLE`]
+/// times the monitor its window is on, in device pixels, or
+/// [`graphics::FALLBACK_MAX_PX`] before the window is on a monitor.
+fn screen_max_px(widget: &impl IsA<gtk4::Widget>) -> [u32; 2] {
+    let monitor = widget
+        .native()
+        .and_then(|native| native.surface())
+        .and_then(|surface| {
+            let display = surface.display();
+            display.monitor_at_surface(&surface)
+        });
+    match monitor {
+        Some(monitor) => {
+            let geometry = monitor.geometry();
+            graphics::max_px_for(geometry.width(), geometry.height(), widget.scale_factor())
+        }
+        None => graphics::FALLBACK_MAX_PX,
+    }
 }
 
 /// Inserts `text` at the end of `buffer` with the tags for `styles`.
@@ -3259,6 +3361,7 @@ mod tests {
             depth: 0.0,
             pixels: vec![0; 40 * 20 * 4],
             labels: Vec::new(),
+            max_zoom: 1.0,
         };
         let texture = ScaledTexture::new(&image);
         assert_eq!(texture.scale_size(2.0), (40.0, 20.0));
@@ -3282,5 +3385,105 @@ mod tests {
         }];
         assert_eq!(label_link_at(&link_label, &gap, 0.5, y), None);
         assert_eq!(label_link_at(&link_label, &[], 0.5, y), None);
+
+        session_checks();
+    }
+
+    /// Checks on a real window and document session (part of
+    /// [`gtk_helpers`], which owns the GTK thread): every heading of a text
+    /// block is registered at the buffer offset of its own first character,
+    /// with repeats suffixed, so `#fragment` links find each of them; an
+    /// anchor requested before its heading is appended is remembered.
+    fn session_checks() {
+        adw::init().expect("libadwaita initializes once GTK does");
+        let app = adw::Application::builder()
+            .application_id("io.github.TheHolm.md_viewer.Tests")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gio::Cancellable>)
+            .expect("the test application registers");
+        let window = DocWindow::new(&app);
+        let markdown = "# Intro\n\nSome text.\n\n## Usage\n\n- item\n\n## Usage\n\n## Über uns\n";
+        let session =
+            window.show_document(Path::new("/doc/readme.md"), md_viewer::render(markdown));
+        session.start(RasterSettings::default());
+        let buffer = session.view.buffer();
+        let text_at = |fragment: &str| {
+            let offset = session.anchors.borrow().lookup(fragment)?;
+            let start = buffer.iter_at_offset(offset);
+            let mut end = start;
+            end.forward_to_line_end();
+            Some(buffer.text(&start, &end, false).to_string())
+        };
+        assert_eq!(text_at("intro").as_deref(), Some("Intro"));
+        assert_eq!(text_at("usage").as_deref(), Some("Usage"));
+        assert_eq!(text_at("usage-1").as_deref(), Some("Usage"));
+        assert_eq!(text_at("über-uns").as_deref(), Some("Über uns"));
+        let first = session.anchors.borrow().lookup("usage");
+        let second = session.anchors.borrow().lookup("usage-1");
+        assert!(first < second, "{first:?} {second:?}");
+        // A clicked fragment is resolved, decoded and found.
+        session.click_link("#%C3%BCber-uns");
+        assert!(session.pending_anchor.borrow().is_none());
+        // An unknown one is kept pending.
+        session.click_link("#later");
+        assert_eq!(session.pending_anchor.borrow().as_deref(), Some("later"));
+        window.window.close();
+        size_limit_checks(&app);
+    }
+
+    /// Checks of the graphics size limit on a real window (part of
+    /// [`gtk_helpers`]): an image and an inline formula too large at 100%
+    /// show why in their place; a window zoomed in further than a wide
+    /// picture allows zooms out to the picture's limit once it arrives, and
+    /// the header bar shows the zoom with "(max)".
+    fn size_limit_checks(app: &adw::Application) {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let svg = |name: &str, width: u32| {
+            let path = dir.path().join(name);
+            let svg = format!(
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"10\"/>"
+            );
+            std::fs::write(&path, svg).expect("write SVG");
+            path
+        };
+        // Ten 1920 px screens are 19,200 px: this one allows 150%.
+        svg("wide.svg", 12_800);
+        svg("huge.svg", 30_000);
+        let document = dir.path().join("doc.md");
+        let markdown = "![wide](wide.svg)\n\n![huge](huge.svg)\n\nA $\\rule{100000em}{1em}$ b\n";
+        let window = DocWindow::new(app);
+        window.change_zoom(|zoom| zoom.set(2.0));
+        let mut blocks = md_viewer::render(markdown);
+        md_viewer::resolve_images(&mut blocks, &document);
+        let session = window.show_document(&document, blocks);
+        session.start(RasterSettings {
+            zoom: 2.0,
+            ..RasterSettings::default()
+        });
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !(session.progress.borrow().all_shown() && session.outstanding.get() == 0) {
+            assert!(std::time::Instant::now() < deadline, "the document loads");
+            context.iteration(false);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let buffer = session.view.buffer();
+        let text = searchable_text(&buffer);
+        assert!(text.contains("[image: huge — too large"), "{text}");
+        assert!(
+            text.contains("$\\rule{100000em}{1em}$ ⚠ too large"),
+            "{text}"
+        );
+        assert!((window.zoom.get().level() - 1.5).abs() < 1e-3);
+        assert!((window.zoom.get().max() - 1.5).abs() < 1e-3);
+        assert!(window.zoom_indicator.is_visible());
+        assert_eq!(window.zoom_indicator.label().as_deref(), Some("150% (max)"));
+        // Zooming in further is refused; back at 100% the indicator hides.
+        window.change_zoom(Zoom::zoom_in);
+        assert!((window.zoom.get().level() - 1.5).abs() < 1e-3);
+        window.change_zoom(Zoom::reset);
+        assert!(!window.zoom_indicator.is_visible());
+        window.window.close();
     }
 }

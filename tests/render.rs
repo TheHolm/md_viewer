@@ -1064,6 +1064,21 @@ fn math_source() {
     assert_eq!(Math::new("x", true).source(), "$$x$$");
 }
 
+/// A formula that could not be rendered says why after its source: on a
+/// line of its own under display math, briefly on the same line after
+/// inline math.
+#[test]
+fn math_failure_note() {
+    assert_eq!(
+        Math::new("x", true).failure_note("too large"),
+        "\n⚠ formula could not be rendered: too large"
+    );
+    assert_eq!(
+        Math::new("x", false).failure_note("too large"),
+        " ⚠ too large"
+    );
+}
+
 /// In Pango markup (table cells) a formula is shown as its source, in code
 /// style.
 #[test]

@@ -2,8 +2,9 @@
 //! mhchem typesetting, rasterization, and filling a rendered document in.
 
 use md_viewer::graphics::{
-    decode_image, hex_color, load_image, math_depth_em, math_svg, mermaid_svg, rasterize,
-    render_document, render_math, render_mermaid, Cache, Graphic, RasterSettings, MATH_SCALE,
+    decode_image, hex_color, load_image, math_depth_em, math_svg, max_px_for, mermaid_svg,
+    rasterize, render_document, render_math, render_mermaid, zoom_limit, Cache, Graphic,
+    RasterSettings, FALLBACK_MAX_PX, MATH_SCALE, SCREEN_MULTIPLE,
 };
 use md_viewer::{render, Block, ImageRef, Inline, Math};
 use std::path::{Path, PathBuf};
@@ -435,10 +436,12 @@ fn image_decode_errors() {
     assert!(decode_image(&path, &RasterSettings::default()).is_err());
 }
 
-/// Decoding at a device scale keeps the logical size but gives the texture
-/// more device pixels, so a raster image stays sharp on a HiDPI screen.
+/// A raster image is never enlarged for a HiDPI screen (that adds no
+/// detail and multiplies the memory): at device scale 2 it keeps the file's
+/// own pixels and its logical size is still its size in pixels; the screen
+/// scales it when drawing.
 #[test]
-fn image_decode_at_device_scale() {
+fn image_decode_at_device_scale_keeps_file_pixels() {
     let dir = temp_dir();
     let path = write_image(dir.path(), "dot.png", 4, 2, [0, 255, 0, 255]);
     let settings = RasterSettings {
@@ -446,9 +449,10 @@ fn image_decode_at_device_scale() {
         ..RasterSettings::default()
     };
     let image = decode_image(&path, &settings).unwrap();
-    assert_eq!((image.width, image.height), (8, 4));
-    assert_eq!(image.scale, 2.0);
+    assert_eq!((image.width, image.height), (4, 2));
+    assert_eq!(image.scale, 1.0);
     assert_eq!((image.logical_width(), image.logical_height()), (4.0, 2.0));
+    assert_eq!(image.pixels.len(), 4 * 2 * 4);
 }
 
 /// Writes a `width` x `height` JPEG carrying an Exif orientation tag (6 means
@@ -598,6 +602,303 @@ fn inline_image_is_capped() {
     );
     let aspect = inline.logical_width() / inline.logical_height();
     assert!((aspect - 100.0).abs() < 0.01, "{aspect}");
+}
+
+// --- Size limit -----------------------------------------------------------
+
+/// Settings with a graphics size limit of `max_px` (otherwise the defaults).
+fn limited(max_px: [u32; 2]) -> RasterSettings {
+    RasterSettings {
+        max_px,
+        ..RasterSettings::default()
+    }
+}
+
+/// Asserts that `result` failed because the graphic is too large.
+fn assert_too_large<T: std::fmt::Debug>(result: Result<T, String>) {
+    match result {
+        Err(reason) => assert!(reason.starts_with("too large"), "{reason}"),
+        Ok(found) => panic!("expected a size error, got {found:?}"),
+    }
+}
+
+/// The limit is ten screens in device pixels; an unknown or invalid screen
+/// gives the fallback (ten 1920x1080 screens), and huge values saturate.
+#[test]
+fn max_px_is_ten_screens() {
+    assert_eq!(SCREEN_MULTIPLE, 10);
+    assert_eq!(max_px_for(1920, 1080, 1), [19_200, 10_800]);
+    assert_eq!(max_px_for(1920, 1080, 2), [38_400, 21_600]);
+    assert_eq!(FALLBACK_MAX_PX, [19_200, 10_800]);
+    for (width, height, scale) in [(0, 1080, 1), (1920, 0, 1), (1920, 1080, 0), (-5, 10, 1)] {
+        assert_eq!(max_px_for(width, height, scale), FALLBACK_MAX_PX);
+    }
+    assert_eq!(max_px_for(i32::MAX, 1, i32::MAX), [u32::MAX, u32::MAX]);
+}
+
+/// `zoom_limit` is how far a graphic can be zoomed before reaching the
+/// limit on either side; one exactly at the limit fits (limit 1.0); one past
+/// it, or with a size that is not a number, is too large; one with no area
+/// is an error of its own. The limit is never below 1.0.
+#[test]
+fn zoom_limit_checks_both_sides() {
+    let max = [1000, 500];
+    assert_eq!(zoom_limit(100.0, 100.0, max), Ok(5.0));
+    assert_eq!(zoom_limit(10.0, 250.0, max), Ok(2.0));
+    assert_eq!(zoom_limit(1000.0, 500.0, max), Ok(1.0));
+    assert_too_large(zoom_limit(1001.0, 10.0, max));
+    assert_too_large(zoom_limit(10.0, 501.0, max));
+    for bad in [f32::NAN, f32::INFINITY, 1e30] {
+        assert_too_large(zoom_limit(bad, 10.0, max));
+    }
+    let message = zoom_limit(1e30, 10.0, max).unwrap_err();
+    assert_eq!(message, "too large (huge x 10 px, limit 1000 x 500)");
+    assert_eq!(
+        zoom_limit(1001.0, 10.0, max).unwrap_err(),
+        "too large (1001 x 10 px, limit 1000 x 500)"
+    );
+    let empty = zoom_limit(0.0, 10.0, max).unwrap_err();
+    assert!(empty.contains("no area"), "{empty}");
+}
+
+/// An SVG larger than the limit is refused before anything is allocated,
+/// with a size error (a huge size used to wrap round to a "no area" error);
+/// one that fits draws normally and knows how far it can be zoomed.
+#[test]
+fn oversized_svg_is_refused() {
+    let svg = |width: &str| {
+        format!("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"10\"/>")
+    };
+    assert_too_large(rasterize(&svg("20000"), 15.0, 1.0));
+    assert_too_large(rasterize(&svg("1e30"), 15.0, 1.0));
+    // At device scale 2, 10,000 logical pixels are 20,000 device pixels.
+    assert_too_large(rasterize(&svg("10000"), 15.0, 2.0));
+    let fits = rasterize(&svg("1920"), 15.0, 1.0).unwrap();
+    assert_eq!(fits.width, 1920);
+    assert!((fits.max_zoom - 10.0).abs() < 1e-4, "{}", fits.max_zoom);
+}
+
+/// A formula too large at 100% shows its error instead of allocating
+/// gigabytes (a `\rule` can be made any size).
+#[test]
+fn oversized_formula_is_refused() {
+    let settings = RasterSettings::default();
+    assert_too_large(render_math(r"\rule{100000em}{1em}", false, &settings));
+    assert_too_large(render_math(r"\rule{1em}{100000em}", true, &settings));
+    assert!(render_math(r"\rule{10em}{1em}", false, &settings).is_ok());
+}
+
+/// A formula zoomed past its limit is drawn at the limit, not larger: its
+/// pixels stay within the limit and its size on screen is that of the
+/// limit's zoom, so it never grows past ten screens; below the limit
+/// nothing changes.
+#[test]
+fn zoomed_formula_stops_at_the_limit() {
+    let tex = r"\rule{40em}{1em}";
+    let natural = render_math(tex, false, &RasterSettings::default()).unwrap();
+    let max = [natural.width * 2, 10_000];
+    let at = |zoom: f32| {
+        render_math(
+            tex,
+            false,
+            &RasterSettings {
+                zoom,
+                ..limited(max)
+            },
+        )
+        .unwrap()
+    };
+    let capped = at(3.0);
+    assert!(capped.width <= max[0], "{} > {}", capped.width, max[0]);
+    assert!((capped.max_zoom - 2.0).abs() < 0.02, "{}", capped.max_zoom);
+    // Drawn as large as the limit allows (rounding aside), and no larger.
+    let width = capped.logical_width();
+    assert!(
+        width <= max[0] as f32 && width >= max[0] as f32 - 3.0,
+        "{width}"
+    );
+    let below = at(1.5);
+    assert!((below.logical_width() - natural.logical_width() * 1.5).abs() <= 2.0);
+}
+
+/// A diagram zoomed past its limit is likewise drawn at its limit.
+#[test]
+fn zoomed_diagram_stops_at_the_limit() {
+    let diagram = Graphic::Diagram {
+        source: "graph LR; A-->B-->C".to_string(),
+    };
+    let cache = Cache::default();
+    let natural = cache.render(&diagram, &RasterSettings::default()).unwrap();
+    let max = [natural.width * 3 / 2, 10_000];
+    let zoomed = RasterSettings {
+        zoom: 3.0,
+        ..limited(max)
+    };
+    let capped = cache.render(&diagram, &zoomed).unwrap();
+    assert!(capped.width <= max[0], "{} > {}", capped.width, max[0]);
+    assert!((capped.max_zoom - 1.5).abs() < 0.02, "{}", capped.max_zoom);
+    assert!((capped.logical_width() - natural.logical_width() * 1.5).abs() <= 2.0);
+    // Too large even at 100%: refused.
+    assert_too_large(cache.render(&diagram, &limited([natural.width / 2, 10_000])));
+}
+
+/// An SVG file or raster image is never shown larger than its limit
+/// either: zooming past it stops growing its logical size.
+#[test]
+fn zoomed_image_stops_at_the_limit() {
+    let dir = temp_dir();
+    let png = write_image(dir.path(), "wide.png", 100, 10, [0, 0, 255, 255]);
+    let svg = dir.path().join("wide.svg");
+    std::fs::write(
+        &svg,
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"10\"/>",
+    )
+    .unwrap();
+    for path in [png, svg] {
+        let settings = RasterSettings {
+            zoom: 3.0,
+            ..limited([200, 10_000])
+        };
+        let image = load_image(&path, &settings).unwrap();
+        assert_eq!(image.width, 100, "{path:?}");
+        assert!((image.max_zoom - 2.0).abs() < 1e-4, "{path:?}");
+        assert!((image.logical_width() - 200.0).abs() < 1e-3, "{path:?}");
+    }
+}
+
+/// A PNG file whose size is over the limit is refused, including when the
+/// device scale makes it so.
+#[test]
+fn oversized_png_is_refused() {
+    let dir = temp_dir();
+    let wide = write_image(dir.path(), "wide.png", 20_000, 1, [0, 0, 0, 255]);
+    assert_too_large(decode_image(&wide, &RasterSettings::default()));
+    let half = write_image(dir.path(), "half.png", 10_000, 1, [0, 0, 0, 255]);
+    assert!(decode_image(&half, &RasterSettings::default()).is_ok());
+    let hidpi = RasterSettings {
+        scale: 2.0,
+        ..RasterSettings::default()
+    };
+    assert_too_large(decode_image(&half, &hidpi));
+}
+
+/// CRC-32 (as PNG chunks use) of `bytes`.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+/// A decompression bomb is refused from its header alone: a tiny PNG whose
+/// header claims 100,000 x 100,000 pixels (and has no pixel data at all)
+/// gets the size error, so its pixels are never decoded or allocated.
+#[test]
+fn png_bomb_is_refused_from_its_header() {
+    let dir = temp_dir();
+    let path = write_image(dir.path(), "bomb.png", 1, 1, [0, 0, 0, 255]);
+    let mut png = std::fs::read(&path).unwrap();
+    // The IHDR chunk follows the 8-byte signature: length, type, width,
+    // height, five more bytes, CRC. Claim a huge size; the pixel data stays
+    // that of one pixel.
+    png[16..20].copy_from_slice(&100_000u32.to_be_bytes());
+    png[20..24].copy_from_slice(&100_000u32.to_be_bytes());
+    let crc = crc32(&png[12..29]);
+    png[29..33].copy_from_slice(&crc.to_be_bytes());
+    std::fs::write(&path, &png).unwrap();
+    assert_too_large(decode_image(&path, &RasterSettings::default()));
+}
+
+/// The limit applies to the picture as shown: a sideways photo (Exif
+/// "rotate 90") is checked upright.
+#[test]
+fn image_limit_uses_the_oriented_size() {
+    let dir = temp_dir();
+    let path = write_jpeg_with_orientation(dir.path(), "tall.jpg", 80, 40);
+    // Upright it is 40 wide and 80 tall.
+    assert!(decode_image(&path, &limited([50, 100])).is_ok());
+    assert_too_large(decode_image(&path, &limited([100, 50])));
+}
+
+/// The cache keeps results per limit, so a picture refused under one limit
+/// is not refused under a larger one.
+#[test]
+fn image_cache_is_per_limit() {
+    let dir = temp_dir();
+    let path = write_image(dir.path(), "dot.png", 300, 10, [0, 255, 0, 255]);
+    let graphic = Graphic::Image {
+        path,
+        inline: false,
+    };
+    let cache = Cache::default();
+    assert_too_large(cache.render(&graphic, &limited([200, 200])));
+    assert!(cache.render(&graphic, &limited([400, 400])).is_ok());
+}
+
+/// A large image used inline keeps only the pixels it is drawn with (its
+/// capped size at the device scale), not the whole file, and its aspect
+/// ratio; its zoom limit grows as it shrank.
+#[test]
+fn inline_image_keeps_only_drawn_pixels() {
+    let dir = temp_dir();
+    let path = write_image(dir.path(), "photo.png", 2000, 1000, [200, 100, 0, 255]);
+    let cache = Cache::default();
+    for scale in [1.0, 2.0] {
+        let settings = RasterSettings {
+            scale,
+            ..RasterSettings::default()
+        };
+        let standalone = cache
+            .render(
+                &Graphic::Image {
+                    path: path.clone(),
+                    inline: false,
+                },
+                &settings,
+            )
+            .unwrap();
+        let inline = cache
+            .render(
+                &Graphic::Image {
+                    path: path.clone(),
+                    inline: true,
+                },
+                &settings,
+            )
+            .unwrap();
+        // 1.5 lines of 15 px: 22.5 px tall, 45 px wide.
+        assert!(
+            (inline.logical_height() - 22.5).abs() < 0.5,
+            "{}",
+            inline.logical_height()
+        );
+        assert!(
+            (inline.logical_width() - 45.0).abs() < 0.5,
+            "{}",
+            inline.logical_width()
+        );
+        // At least 32 texels on the shorter side, else the drawn size.
+        let expected_height = (22.5 * scale).max(32.0);
+        assert!(
+            (inline.height as f32 - expected_height).abs() <= 1.0,
+            "scale {scale}: {}x{}",
+            inline.width,
+            inline.height
+        );
+        assert_eq!(
+            inline.pixels.len(),
+            (inline.width * inline.height * 4) as usize
+        );
+        assert!(inline.max_zoom > standalone.max_zoom * 40.0);
+    }
 }
 
 // --- Whole documents ------------------------------------------------------

@@ -217,6 +217,17 @@ impl Math {
         let fence = if self.display { "$$" } else { "$" };
         format!("{fence}{}{fence}", self.tex)
     }
+
+    /// The note shown after the source of a formula that could not be
+    /// rendered, saying why: on a line of its own under display math, a
+    /// short one on the same line after inline math.
+    pub fn failure_note(&self, reason: &str) -> String {
+        if self.display {
+            format!("\n⚠ formula could not be rendered: {reason}")
+        } else {
+            format!(" ⚠ {reason}")
+        }
+    }
 }
 
 /// Where an image's destination points after it has been resolved against the

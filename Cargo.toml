@@ -3,7 +3,7 @@ name = "md_viewer"
 # Copy of the VERSION file, which is the single source of the version. Cargo
 # needs a literal value here; `cargo test` (tests/version.rs) and the release
 # pipeline (scripts/check-version.sh) fail if the two ever differ.
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 rust-version = "1.98"
 description = "Simple GTK4/libadwaita Markdown viewer"
@@ -34,6 +34,9 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 regex = "1"
 # Resolving and percent-decoding link destinations (pure Rust).
 url = "2.5"
+# Decoding link fragments (`#%C3%BCber`) back to the heading text; already
+# a dependency of url.
+percent-encoding = "2.3"
 
 [dev-dependencies]
 tempfile = "3"

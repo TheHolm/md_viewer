@@ -28,6 +28,58 @@ Background on the rendering crates is in `NOTES.md`.
   sharp pictures arrive; the line at the top of the window is held in
   place for a moment, but not after the user scrolls.
 
+- Following a `#fragment` to a heading that is not on the page yet (a
+  long, lazily rendered document) only remembers it: nothing renders up to
+  the heading, and the view jumps there whenever the heading is appended
+  later. An anchor that never appears stays pending silently. An empty
+  fragment (`#`) does not scroll to the top.
+- An image file is read whole, with no size limit and no check that it is
+  a regular file: `![x](/dev/zero)` reads until memory runs out, and a FIFO
+  blocks a render worker for good (everything after it never appears).
+- Cancelling the worker pool can miss a worker that is just going to sleep
+  (`Shared::cancel` sets the flag without holding the queue lock); that
+  thread then sleeps forever. A panic inside a worker (mathra, merman,
+  resvg, image) is not caught, so its result never arrives and loading
+  never finishes.
+- Lazy rendering advances only on the vertical adjustment's `changed`
+  signal, not on `value-changed`, so plain scrolling may not render more
+  once GTK has finished measuring the page.
+- The view's tick callback never stops: the frame clock runs (and every
+  table is measured) every frame while a window is open, even when idle.
+- An active search is redone in full (text copy, matching, highlights,
+  scrollbar marks) for every batch of blocks appended while loading.
+- A UTF-8 byte-order mark at the start of a file is not stripped, so the
+  first heading, list or fence of such a file is shown as plain text.
+- Deeply nested lists cost memory quadratic in the depth (each item writes
+  four spaces per level).
+- Heading anchors collapse runs of hyphens and drop trailing ones, unlike
+  GitHub (`Install - Linux` is `install--linux` here, `install---linux` on
+  GitHub), so a table of contents copied from GitHub can miss; combining
+  marks are dropped too.
+- Relative `href`s inside an SVG image resolve against the working
+  directory rather than the SVG's folder (`resources_dir` is not set).
+- The image cache is never invalidated: an image changed on disk, or one
+  that was missing and now exists, shows the old result until restart.
+- Placing each rendered graphic walks every graphic of the document
+  (`progressive::place`), quadratic in the number of graphics.
+- Clickable table-cell labels hold strong references to themselves through
+  their own controllers, and each window's zoom CSS provider is never
+  removed from the display, so both leak a little per closed window.
+- In regex mode, `.`/`\W`/`\S` match the placeholder character of embedded
+  objects (tables, code cards, pictures), inflating the match count. Ignore
+  case lowercases rather than case-folds (`ß` does not match `ss`).
+- Only mouse-wheel scrolling releases the "hold the top line" after a zoom;
+  keyboard and scrollbar scrolling are pulled back while it lasts.
+- The window's key handler takes Escape, `n`, `N` and `/` from the error
+  dialog and popovers; a double click on a link in a table cell or on a
+  linked picture opens it twice.
+- The device scale (and the screen size the graphics limit comes from) is
+  read when a document starts; the limit is re-read at every zoom, but the
+  scale is not, so moving a window to a monitor with another scale leaves
+  graphics blurry or oversized until it is reopened.
+- An image in a table cell that cannot be drawn (missing, too large, ...)
+  shows `[image: <alt>]` without the reason.
+
 ## Limitations
 
 - merman's diagram engines make the binary much larger (about 26.5 MB
@@ -44,6 +96,13 @@ Background on the rendering crates is in `NOTES.md`.
   planned: the viewer deliberately loads nothing over the network. Such an
   image shows a placeholder saying so.
 - An animated GIF shows only its first frame.
+- Nothing is drawn larger than ten screens. A graphic too large even at 100%
+  is refused ("too large" in its place); a very large one lowers the
+  document's maximum zoom, so the whole page stops zooming in where that
+  graphic reaches the limit. At a ceiling of exactly 100% the zoom indicator
+  is hidden (as at every 100%), so nothing says why zooming in does nothing.
+- A standalone raster image keeps the file's full resolution even though
+  it is shown at the window width.
 - A match inside a diagram highlights the whole diagram card, not the exact
   label characters. Likewise a match on a standalone or table-cell image's
   alt text highlights the whole picture, and a match on an inline image's alt
@@ -78,7 +137,14 @@ Background on the rendering crates is in `NOTES.md`.
   cross-file/anchor scrolling) needs input events and a running desktop
   session, so the GUI tests do not reach it; the resolution and range logic
   is fully tested, and the interaction is checked by hand (or with `xdotool`
-  on Xvfb, see `NOTES.md`).
+  on Xvfb, see `NOTES.md`). The GUI unit tests do open a real document
+  session and check that every heading is registered at its own buffer
+  offset and that a clicked fragment is resolved and found, but not the
+  scrolling itself.
+- The zoom ceiling is tested end to end in the GUI unit tests (a picture
+  lowering it zooms the window out, the indicator shows "(max)", zooming in
+  is refused), but the indicator's click and keyboard/wheel zooming against
+  the ceiling are checked by hand.
 - How a loaded image is placed (standalone at the window width, inline at
   the line height, in a table cell, and its place in a zoom re-render) needs
   a display and input events, as do clicking a linked image and the

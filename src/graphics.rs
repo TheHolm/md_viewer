@@ -37,6 +37,11 @@ pub struct Image {
     /// the find bar (their labels are otherwise only pixels); formulas draw
     /// outlines, so their list is empty.
     pub labels: Vec<String>,
+    /// The largest zoom this graphic can be shown at without exceeding
+    /// [`RasterSettings::max_px`] on screen (see [`zoom_limit`]); always at
+    /// least 1.0, since a graphic too large at 100% is refused instead. A
+    /// graphic asked for at a larger zoom is drawn at this one.
+    pub max_zoom: f32,
 }
 
 impl Image {
@@ -64,6 +69,76 @@ pub struct RasterSettings {
     /// `font_px * zoom`, and diagrams are drawn `zoom` times their natural
     /// size; in both cases the image's logical size grows with the zoom.
     pub zoom: f32,
+    /// The largest a graphic may be on screen, in device pixels (width,
+    /// height): [`SCREEN_MULTIPLE`] times the screen (see [`max_px_for`]).
+    /// A graphic larger than this at 100% zoom is refused with an error;
+    /// one that fits is never drawn larger, whatever the zoom.
+    pub max_px: [u32; 2],
+}
+
+/// How many screens wide and high a graphic may be at most.
+pub const SCREEN_MULTIPLE: u32 = 10;
+
+/// [`RasterSettings::max_px`] when the screen is not known (yet): ten times
+/// a 1920x1080 screen.
+pub const FALLBACK_MAX_PX: [u32; 2] = [1920 * SCREEN_MULTIPLE, 1080 * SCREEN_MULTIPLE];
+
+/// The largest a graphic may be on a screen of `width` x `height` logical
+/// pixels at device `scale`: [`SCREEN_MULTIPLE`] times its size in device
+/// pixels. An empty screen size or an invalid scale gives
+/// [`FALLBACK_MAX_PX`].
+pub fn max_px_for(width: i32, height: i32, scale: i32) -> [u32; 2] {
+    let (Ok(width), Ok(height), Ok(scale)) = (
+        u32::try_from(width),
+        u32::try_from(height),
+        u32::try_from(scale),
+    ) else {
+        return FALLBACK_MAX_PX;
+    };
+    if width == 0 || height == 0 || scale == 0 {
+        return FALLBACK_MAX_PX;
+    }
+    let side = |pixels: u32| pixels.saturating_mul(scale).saturating_mul(SCREEN_MULTIPLE);
+    [side(width), side(height)]
+}
+
+/// The largest zoom at which a graphic `width` x `height` device pixels at
+/// 100% zoom stays within `max_px`, never less than 1.0. Fails, with the
+/// message shown in the graphic's place, when it does not fit even at 100%
+/// (or its size is not a finite number), or when it has no area.
+pub fn zoom_limit(width: f32, height: f32, max_px: [u32; 2]) -> Result<f32, String> {
+    if !(width.is_finite() && height.is_finite())
+        || width > max_px[0] as f32
+        || height > max_px[1] as f32
+    {
+        return Err(format!(
+            "too large ({} x {} px, limit {} x {})",
+            pixels_for_message(width),
+            pixels_for_message(height),
+            max_px[0],
+            max_px[1]
+        ));
+    }
+    if width < 0.5 || height < 0.5 {
+        let round = |side: f32| side.max(0.0).round() as u32;
+        return Err(format!(
+            "image has no area ({}x{})",
+            round(width),
+            round(height)
+        ));
+    }
+    let limit = (max_px[0] as f32 / width).min(max_px[1] as f32 / height);
+    Ok(limit.max(1.0))
+}
+
+/// A pixel size as shown in an error message: rounded, or "huge" for a size
+/// too large to print meaningfully.
+fn pixels_for_message(side: f32) -> String {
+    if side.is_finite() && side < 1e12 {
+        format!("{}", side.round() as u64)
+    } else {
+        "huge".to_string()
+    }
 }
 
 impl Default for RasterSettings {
@@ -74,18 +149,20 @@ impl Default for RasterSettings {
             scale: 1.0,
             color: [0, 0, 0],
             zoom: 1.0,
+            max_px: FALLBACK_MAX_PX,
         }
     }
 }
 
 impl RasterSettings {
     /// An exact, hashable form of the settings, for cache keys.
-    fn key(&self) -> (u32, u32, u32, [u8; 3]) {
+    fn key(&self) -> SettingsKey {
         (
             self.font_px.to_bits(),
             self.scale.to_bits(),
             self.zoom.to_bits(),
             self.color,
+            self.max_px,
         )
     }
 }
@@ -153,15 +230,40 @@ fn svg_options(font_px: f32) -> usvg::Options<'static> {
 }
 
 /// Rasterizes `svg` at `scale` device pixels per SVG pixel, with `em` units
-/// resolving to `font_px`. Fails on invalid SVG or an empty image.
+/// resolving to `font_px`, within [`FALLBACK_MAX_PX`]. Fails on invalid SVG,
+/// an empty image or one larger than the limit.
 pub fn rasterize(svg: &str, font_px: f32, scale: f32) -> Rendered {
+    rasterize_within(svg, font_px, scale, 1.0, FALLBACK_MAX_PX)
+}
+
+/// Rasterizes `svg` at `scale` device pixels per SVG pixel (`em` units
+/// resolving to `font_px`), where `zoom` is the part of that size due to the
+/// document zoom, so the size at 100% is the drawn size divided by `zoom`.
+///
+/// The size is checked against `max_px` before anything is allocated: a
+/// graphic larger than `max_px` at 100% is refused (see [`zoom_limit`]), and
+/// one that would only exceed it at `zoom` is drawn at its
+/// [`Image::max_zoom`] instead - smaller than asked, never larger than the
+/// limit. The returned image's `scale` is the device-pixel scale actually
+/// drawn at.
+fn rasterize_within(svg: &str, font_px: f32, scale: f32, zoom: f32, max_px: [u32; 2]) -> Rendered {
     let tree = usvg::Tree::from_str(svg, &svg_options(font_px)).map_err(|e| e.to_string())?;
-    let labels = text_labels(&tree);
     let size = tree.size();
-    let width = (size.width() * scale).ceil() as u32;
-    let height = (size.height() * scale).ceil() as u32;
+    let zoom = if zoom.is_finite() && zoom > 0.0 {
+        zoom
+    } else {
+        1.0
+    };
+    let max_zoom = zoom_limit(
+        size.width() * scale / zoom,
+        size.height() * scale / zoom,
+        max_px,
+    )?;
+    let scale = scale * (max_zoom / zoom).min(1.0);
+    let width = ((size.width() * scale).ceil() as u32).clamp(1, max_px[0]);
+    let height = ((size.height() * scale).ceil() as u32).clamp(1, max_px[1]);
     let mut pixmap = tiny_skia::Pixmap::new(width, height)
-        .ok_or_else(|| format!("image has no area ({width}x{height})"))?;
+        .ok_or_else(|| format!("cannot allocate a {width}x{height} image"))?;
     resvg::render(
         &tree,
         tiny_skia::Transform::from_scale(scale, scale),
@@ -173,8 +275,19 @@ pub fn rasterize(svg: &str, font_px: f32, scale: f32) -> Rendered {
         scale,
         depth: 0.0,
         pixels: pixmap.take(),
-        labels,
+        labels: text_labels(&tree),
+        max_zoom,
     })
+}
+
+/// How much smaller than asked `image` was drawn because of its zoom limit:
+/// 1.0 when drawn at `zoom`, less when `zoom` exceeds [`Image::max_zoom`].
+fn cap_factor(image: &Image, zoom: f32) -> f32 {
+    if zoom > image.max_zoom {
+        image.max_zoom / zoom
+    } else {
+        1.0
+    }
 }
 
 /// Every text node drawn in `tree`, as its decoded text, in document order
@@ -248,8 +361,18 @@ pub fn render_math(tex: &str, display: bool, settings: &RasterSettings) -> Rende
     let svg = math_svg(tex, display)?;
     let font_px = settings.font_px * settings.zoom * MATH_SCALE;
     let svg = svg.replace("currentColor", &hex_color(settings.color));
-    let mut image = rasterize(&svg, font_px, settings.scale)?;
-    image.depth = math_depth_em(&svg) * font_px;
+    let mut image = rasterize_within(
+        &svg,
+        font_px,
+        settings.scale,
+        settings.zoom,
+        settings.max_px,
+    )?;
+    // Drawn smaller than asked when capped; the logical size and depth stay
+    // those of the formula as drawn.
+    let factor = cap_factor(&image, settings.zoom);
+    image.scale = settings.scale;
+    image.depth = math_depth_em(&svg) * font_px * factor;
     // Formulas are drawn as outlines; any SVG text mathra emits is not the
     // TeX source, so it is never offered to the find bar.
     image.labels.clear();
@@ -356,7 +479,13 @@ fn mermaid_svg_with(
 /// size (on a transparent background; the GUI puts it on a light card, as
 /// Mermaid's colours assume).
 fn rasterize_diagram(svg: &str, settings: &RasterSettings) -> Rendered {
-    let mut image = rasterize(svg, DIAGRAM_FONT_PX, settings.scale * settings.zoom)?;
+    let mut image = rasterize_within(
+        svg,
+        DIAGRAM_FONT_PX,
+        settings.scale * settings.zoom,
+        settings.zoom,
+        settings.max_px,
+    )?;
     image.scale = settings.scale;
     Ok(image)
 }
@@ -401,17 +530,26 @@ const INLINE_IMAGE_MAX_LINES: f32 = 1.5;
 /// The widest an inline image is drawn, as a multiple of the body font size.
 const INLINE_IMAGE_MAX_EM: f32 = 12.0;
 
-/// Decodes the image file at `path` into premultiplied RGBA, honouring the
-/// file's Exif orientation and the device scale (so a HiDPI texture maps one
-/// texel to one device pixel and stays sharp). SVG files are rasterized with
-/// [`rasterize`] (which also draws raster images embedded in the SVG); other
-/// files go through the `image` crate (PNG, JPEG, GIF - first frame only - and
-/// WebP).
+/// The fewest pixels a shrunk inline image keeps on its shorter side.
+const INLINE_IMAGE_MIN_TEXELS: f32 = 32.0;
+
+/// Decodes the image file at `path` into premultiplied RGBA at 100% zoom,
+/// honouring the file's Exif orientation. SVG files are rasterized at the
+/// device scale with [`rasterize`]'s limits (which also draws raster images
+/// embedded in the SVG); other files go through the `image` crate (PNG,
+/// JPEG, GIF - first frame only - and WebP) and keep the file's own pixels:
+/// a raster image is never enlarged for a HiDPI screen (that adds no
+/// detail), its logical size is simply its size in pixels.
+///
+/// Either way the picture's size on screen at 100% is checked against
+/// `settings.max_px` (see [`zoom_limit`]); a raster file over it is refused
+/// from its header, before its pixels are decoded.
 pub fn decode_image(path: &Path, settings: &RasterSettings) -> Rendered {
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read file: {e}"))?;
+    let device_scale = settings.scale.max(1.0);
     if is_svg_path(path) {
         let svg = String::from_utf8(bytes).map_err(|e| format!("invalid SVG text: {e}"))?;
-        return rasterize(&svg, settings.font_px, settings.scale.max(1.0));
+        return rasterize_within(&svg, settings.font_px, device_scale, 1.0, settings.max_px);
     }
     let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
@@ -419,25 +557,21 @@ pub fn decode_image(path: &Path, settings: &RasterSettings) -> Rendered {
         .into_decoder()
         .map_err(|e| e.to_string())?;
     let orientation = decoder.orientation().map_err(|e| e.to_string())?;
+    let (file_width, file_height) = oriented(decoder.dimensions(), orientation);
+    // One file pixel is one logical pixel, `device_scale` device pixels.
+    let max_zoom = zoom_limit(
+        file_width as f32 * device_scale,
+        file_height as f32 * device_scale,
+        settings.max_px,
+    )?;
+    // A backstop in case the header lied about the size.
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(file_width.max(file_height));
+    limits.max_image_height = Some(file_width.max(file_height));
+    decoder.set_limits(limits).map_err(|e| e.to_string())?;
     let mut decoded = image::DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
     decoded.apply_orientation(orientation);
-
-    // Render at the device scale, keeping the logical size at the file's
-    // natural size: `width / scale` stays the same, but the texture gains the
-    // device pixels a HiDPI screen draws 1:1.
-    let scale = settings.scale.max(1.0);
-    let rgba = if scale > 1.0 {
-        let width = (decoded.width() as f32 * scale).round().max(1.0) as u32;
-        let height = (decoded.height() as f32 * scale).round().max(1.0) as u32;
-        image::imageops::resize(
-            &decoded,
-            width,
-            height,
-            image::imageops::FilterType::Lanczos3,
-        )
-    } else {
-        decoded.to_rgba8()
-    };
+    let rgba = decoded.into_rgba8();
     let (width, height) = rgba.dimensions();
     if width == 0 || height == 0 {
         return Err("empty image".to_string());
@@ -445,11 +579,22 @@ pub fn decode_image(path: &Path, settings: &RasterSettings) -> Rendered {
     Ok(Image {
         width,
         height,
-        scale,
+        scale: 1.0,
         depth: 0.0,
         pixels: premultiply(rgba.into_raw()),
         labels: Vec::new(),
+        max_zoom,
     })
+}
+
+/// The size of an image of `size` (as stored in the file) once `orientation`
+/// is applied: a quarter turn swaps width and height.
+fn oriented(size: (u32, u32), orientation: image::metadata::Orientation) -> (u32, u32) {
+    use image::metadata::Orientation::{Rotate270, Rotate270FlipH, Rotate90, Rotate90FlipH};
+    match orientation {
+        Rotate90 | Rotate270 | Rotate90FlipH | Rotate270FlipH => (size.1, size.0),
+        _ => size,
+    }
 }
 
 /// Loads the image file at `path` for display at the zoom in `settings`: its
@@ -481,9 +626,11 @@ fn is_svg_path(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("svg"))
 }
 
-/// Scales an image's logical size by `zoom` (its pixels stay the same, so a
-/// raster image is upscaled when zoomed in).
+/// Scales an image's logical size by `zoom`, but never past its
+/// [`Image::max_zoom`] (its pixels stay the same, so a raster image is
+/// upscaled when zoomed in).
 fn zoom_image(mut image: Image, zoom: f32) -> Image {
+    let zoom = zoom.min(image.max_zoom);
     if zoom > 0.0 && (zoom - 1.0).abs() > f32::EPSILON {
         image.scale /= zoom;
     }
@@ -493,7 +640,10 @@ fn zoom_image(mut image: Image, zoom: f32) -> Image {
 /// Shrinks `image` (keeping its aspect ratio) so an inline image does not
 /// dwarf the line it sits on: at most [`INLINE_IMAGE_MAX_LINES`] lines tall
 /// and [`INLINE_IMAGE_MAX_EM`] body-font widths wide. Smaller images are left
-/// alone.
+/// alone. A shrunk image also keeps only the pixels it is drawn with (its
+/// capped size at the device scale), so a large file used as an inline icon
+/// does not hold its full resolution in the texture; its zoom limit grows
+/// accordingly.
 fn cap_inline(mut image: Image, settings: &RasterSettings) -> Image {
     let line = settings.font_px * settings.zoom;
     let max_height = line * INLINE_IMAGE_MAX_LINES;
@@ -506,14 +656,51 @@ fn cap_inline(mut image: Image, settings: &RasterSettings) -> Image {
     if width > max_width && width > 0.0 {
         factor = factor.min(max_width / width);
     }
-    if factor < 1.0 {
-        image.scale /= factor;
+    if factor >= 1.0 {
+        return image;
     }
+    let logical_width = width * factor;
+    // Keep the pixels drawn at the device scale, but at least
+    // INLINE_IMAGE_MIN_TEXELS on the shorter side, so rounding the texture
+    // size to whole pixels barely changes the aspect ratio.
+    let shorter = image.width.min(image.height) as f32;
+    let resample = (logical_width * settings.scale.max(1.0) / image.width as f32)
+        .max(INLINE_IMAGE_MIN_TEXELS / shorter);
+    if resample < 1.0 {
+        let texels_width = (image.width as f32 * resample).round().max(1.0) as u32;
+        let texels_height = (image.height as f32 * resample).round().max(1.0) as u32;
+        // Premultiplied pixels resample correctly as they are.
+        let buffer = image::ImageBuffer::<image::Rgba<u8>, &[u8]>::from_raw(
+            image.width,
+            image.height,
+            &image.pixels,
+        );
+        if let Some(buffer) = buffer {
+            let resized = image::imageops::resize(
+                &buffer,
+                texels_width,
+                texels_height,
+                image::imageops::FilterType::Triangle,
+            );
+            image.width = texels_width;
+            image.height = texels_height;
+            image.pixels = resized.into_raw();
+        }
+    }
+    image.scale = image.width as f32 / logical_width;
+    image.max_zoom /= factor;
     image
 }
 
+/// The exact, hashable form of [`RasterSettings`].
+type SettingsKey = (u32, u32, u32, [u8; 3], [u32; 2]);
+
 /// What a cached formula is looked up by: source, display flag, settings.
-type MathKey = (String, bool, (u32, u32, u32, [u8; 3]));
+type MathKey = (String, bool, SettingsKey);
+
+/// What a decoded image is looked up by: path, device scale, body font
+/// size, size limit.
+type ImageKey = (PathBuf, u32, u32, [u32; 2]);
 
 /// How many rendered formulas [`Cache`] keeps before it starts over.
 const MATH_CACHE_LIMIT: usize = 4096;
@@ -536,8 +723,9 @@ pub struct Cache {
     math: Mutex<HashMap<MathKey, Rendered>>,
     /// Laid-out diagram SVG (or the layout error) by source.
     diagrams: Mutex<HashMap<String, Result<Arc<String>, String>>>,
-    /// Decoded images by (path, device scale, body font size), at 100% zoom.
-    images: Mutex<HashMap<(PathBuf, u32, u32), Rendered>>,
+    /// Decoded images by (path, device scale, body font size, size limit),
+    /// at 100% zoom.
+    images: Mutex<HashMap<ImageKey, Rendered>>,
     /// How many times a formula was typeset or a diagram laid out.
     misses: AtomicUsize,
 }
@@ -594,6 +782,7 @@ impl Cache {
                     path.clone(),
                     settings.scale.to_bits(),
                     settings.font_px.to_bits(),
+                    settings.max_px,
                 );
                 let cached = lock(&self.images).get(&key).cloned();
                 let decoded = match cached {
@@ -654,6 +843,66 @@ pub fn render_document(blocks: &mut [Block], settings: &RasterSettings) {
 mod tests {
     use super::*;
 
+    /// A quarter turn swaps width and height; other orientations (flips,
+    /// half turn) keep them.
+    #[test]
+    fn oriented_swaps_on_quarter_turns() {
+        use image::metadata::Orientation::*;
+        for turn in [Rotate90, Rotate270, Rotate90FlipH, Rotate270FlipH] {
+            assert_eq!(oriented((3, 7), turn), (7, 3), "{turn:?}");
+        }
+        for same in [NoTransforms, Rotate180, FlipHorizontal, FlipVertical] {
+            assert_eq!(oriented((3, 7), same), (3, 7), "{same:?}");
+        }
+    }
+
+    /// How much smaller a capped graphic was drawn: the ratio of its limit
+    /// to the zoom asked for, or 1.0 when within the limit.
+    #[test]
+    fn cap_factor_is_limit_over_zoom() {
+        let image = Image {
+            width: 1,
+            height: 1,
+            scale: 1.0,
+            depth: 0.0,
+            pixels: vec![0; 4],
+            labels: Vec::new(),
+            max_zoom: 1.5,
+        };
+        assert_eq!(cap_factor(&image, 3.0), 0.5);
+        assert_eq!(cap_factor(&image, 1.5), 1.0);
+        assert_eq!(cap_factor(&image, 1.0), 1.0);
+    }
+
+    /// Sizes in error messages are whole pixels, or "huge" when not
+    /// printable meaningfully.
+    #[test]
+    fn pixels_for_message_rounds_or_says_huge() {
+        assert_eq!(pixels_for_message(10.4), "10");
+        assert_eq!(pixels_for_message(19_201.0), "19201");
+        assert_eq!(pixels_for_message(1e30), "huge");
+        assert_eq!(pixels_for_message(f32::NAN), "huge");
+        assert_eq!(pixels_for_message(f32::INFINITY), "huge");
+    }
+
+    /// A shrunk inline image whose pixel buffer does not match its size (a
+    /// hand-made `Image`) is left with its pixels rather than panicking; its
+    /// logical size is still capped.
+    #[test]
+    fn cap_inline_tolerates_mismatched_pixels() {
+        let image = Image {
+            width: 1000,
+            height: 1000,
+            scale: 1.0,
+            depth: 0.0,
+            pixels: vec![0; 4],
+            labels: Vec::new(),
+            max_zoom: 1.0,
+        };
+        let capped = cap_inline(image, &RasterSettings::default());
+        assert_eq!((capped.width, capped.pixels.len()), (1000, 4));
+        assert!((capped.logical_height() - 22.5).abs() < 0.01);
+    }
     /// The preferred families win in order; otherwise any family is used.
     #[test]
     fn pick_family_order() {

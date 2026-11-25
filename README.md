@@ -19,7 +19,12 @@ Ctrl+W closes a window.
 
 Zoom with Ctrl+mouse wheel, Ctrl+plus / Ctrl+minus (Ctrl+0 resets to 100%)
 or a touchpad pinch, from 50% to 300%: text, tables, code, formulas and
-diagrams all grow, and the part you are reading stays in place.
+diagrams all grow, and the part you are reading stays in place. The header
+bar shows the zoom when it is not 100% (click it to reset). Nothing is
+drawn larger than ten screens: a document with a very large picture stops
+zooming in where that picture reaches the limit (the zoom then shows
+"(max)"), and a graphic too large even at 100% shows "too large" in its
+place.
 
 Find text with Ctrl+F or `/`: matches are highlighted in the text, tables
 and code, marked on the scrollbar, and a matching label inside a diagram

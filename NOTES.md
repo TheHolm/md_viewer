@@ -199,16 +199,27 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   installed family, GNOME's Adwaita Sans first, see `pick_family`),
   `decode_image`/`load_image` for local image files (PNG/JPEG/GIF first
   frame/WebP through the `image` crate, `.svg` through `rasterize`; Exif
-  orientation is applied, straight alpha is premultiplied, and raster images
-  are decoded at the device scale with a Lanczos resize so they stay sharp on
-  HiDPI while keeping their logical size; the logical size grows with the
-  zoom like math and diagrams) and
+  orientation is applied, straight alpha is premultiplied; raster images
+  keep the file's own pixels - never enlarged for HiDPI, which adds no
+  detail and multiplied the memory - and one file pixel is one logical
+  pixel; an inline image is shrunk to the pixels it is drawn with; the
+  logical size grows with the zoom like math and diagrams) and
   `render_document`, which fills in every graphic of a rendered document one
   after another. `rasterize` also collects every SVG text node into
   `Image::labels` (usvg expands `<use>`, so a diagram's labels are found at
   their drawn positions); math clears them because it draws outlines. `RasterSettings` carries the text size, device scale, text
-  colour and zoom (math is typeset at `font_px * zoom`, diagrams drawn
-  `zoom` times their natural size). Diagram labels are measured with the
+  colour, zoom (math is typeset at `font_px * zoom`, diagrams drawn
+  `zoom` times their natural size) and the size limit `max_px`.
+  The size limit: nothing is ever drawn larger than `SCREEN_MULTIPLE` (10)
+  times the screen in device pixels (`max_px_for`; `FALLBACK_MAX_PX` before
+  the window is on a monitor, and in tests). `zoom_limit` checks a
+  graphic's size at 100% before anything is allocated (in floating point,
+  so a huge SVG size is not wrapped into a bogus "no area" error): over the
+  limit it is refused with "too large (...)", shown in its place; otherwise
+  `Image::max_zoom` is the largest zoom it fits at, and asked for more it is
+  drawn at that zoom, never larger. A raster file is checked from its
+  header (Exif orientation applied) before its pixels are decoded, with
+  `image::Limits` as a backstop, so a decompression bomb costs nothing. Diagram labels are measured with the
   same font files resvg draws them with (merman's `native-fonts`,
   `native_fonts`/`font_files`; merman's built-in estimates if no font files
   can be loaded). `Graphic` names one formula, diagram or image; `Cache` (one
@@ -235,7 +246,9 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   moment may still arrive, so the GUI tags runs with a generation).
 - `src/zoom.rs` (`md_viewer::zoom`) - zoom levels (`STEPS`, 50%-300%),
   `Zoom` (step in/out, reset, free `set` for pinches, `scroll` accumulating
-  wheel clicks), `wheel_clicks` (touchpad pixels to clicks) and the zoom CSS.
+  wheel clicks and stopping at the ends, the document's `ceiling` that every
+  change is clamped to, and the header bar `indicator` text),
+  `wheel_clicks` (touchpad pixels to clicks) and the zoom CSS.
 - `src/layout.rs` (`md_viewer::layout`) - the GUI's sizing and styling
   arithmetic as plain functions, so it is tested without a display: the
   width available to anchored widgets, table and diagram sizes, Pango font
@@ -256,9 +269,14 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   `resolve_link` (a destination resolved against the document into a web,
   local-file, Markdown-file or same-document-anchor target), `resolve_image`
   (`http`/`https` -> `Remote`, `file:`/paths -> `Local`, anything else ->
-  `Unsupported` with a reason), `heading_slug`
-  (GitHub-style heading anchors; duplicate `-N` suffixes are added by the
-  GUI, which sees headings in order), `file_uri`, and `LinkRanges` (the
+  `Unsupported` with a reason), `heading_starts` (the headings inside a
+  text block: a text block holds many headings, paragraphs and lists, so a
+  heading is a run of spans with the same `Style::Heading`, plus formulas
+  or images next to it), `heading_slug` (GitHub-style heading anchors),
+  `Anchors` (the registry the GUI fills as blocks are appended, adding the
+  duplicate `-N` suffixes in document order; fragments are percent-decoded
+  by `resolve_link`, so `#%C3%BCber` finds `über`), `file_uri`, and
+  `LinkRanges` (the
   character ranges of the clickable text, accumulated as blocks are
   appended).
 - `tests/` - integration tests split by topic:
@@ -271,13 +289,17 @@ run there; runtime verification on a real FreeBSD system is a manual step.
     the Pango markup for table cells
   - `links.rs` - link resolution (web, mail, local, relative, Markdown,
     anchor, ignored schemes, a `file:` URL with a host), image destination
-    resolution (local, remote, unsupported, percent-decoding), heading slugs
-    (including dropping a trailing hyphen), `file_uri`, `LinkRanges`, and the
-    links inside label text
+    resolution (local, remote, unsupported, percent-decoding), fragment
+    decoding, heading slugs (including dropping a trailing hyphen), finding
+    the headings of a text block, the anchor registry, `file_uri`,
+    `LinkRanges`, and the links inside label text
   - `graphics.rs` - rasterizing, math and mhchem, Mermaid diagrams (several
     types, labels, scale, errors), image decoding (PNG, JPEG, SVG,
-    premultiplication, Exif orientation, device scale, zoom, the inline cap
-    and a raster image embedded in an SVG), filling in whole documents,
+    premultiplication, Exif orientation, no enlargement at a device scale,
+    zoom, the inline cap and shrinking, and a raster image embedded in an
+    SVG), the size limit (ten screens, `zoom_limit`, oversized SVGs,
+    formulas, PNGs and a PNG bomb refused, zoom stopping at the limit for
+    formulas, diagrams and images), filling in whole documents,
     that the showcase fixture renders, and that the root `showcase.md`
     renders with no fallbacks at all (every formula and diagram `Ok`)
   - `layout.rs` - the `md_viewer::layout` functions
@@ -389,21 +411,31 @@ run there; runtime verification on a real FreeBSD system is a manual step.
 - Zoom (50%-300%) scales text, tables, code cards, math and diagrams;
   graphics are re-rendered sharp at the new size, visible ones first. The
   zoom belongs to the window and carries over to the next document opened
-  in it; it is not saved between runs.
+  in it; it is not saved between runs. A document can lower the maximum:
+  the window's zoom stops where anything on the page (any graphic, or the
+  largest heading) would exceed the size limit (ten screens, see
+  `graphics`). Graphics are measured as they render, so a graphic arriving
+  later can lower the ceiling below the current zoom; the window then zooms
+  out to it (`Session::note_limit`/`report_limit` -> `DocWindow::limit_zoom`,
+  reported after a poll so nothing is borrowed). The header bar shows the
+  zoom percentage when it is not 100% ("(max)" at the ceiling); clicking it
+  resets the zoom.
 - A fenced code block whose info string starts with `mermaid`
   (case-insensitive) is a `Block::Mermaid` diagram, drawn on a white card
   in both themes (Mermaid's colours assume a light background).
 - A formula or diagram that cannot be rendered is shown as its source in
-  code style; display math and diagrams add a line with the reason. Nothing
-  is ever dropped.
+  code style; display math and diagrams add a line with the reason, inline
+  math a short "⚠ reason" after it (`Math::failure_note`). Nothing is ever
+  dropped.
 - Images: `![alt](path)` in a paragraph is loaded from a local file
   (resolved against the document, `file:` URLs allowed) and drawn. An image
   alone on its line (or after a list marker) is a standalone picture, scaled
   to the window width like a diagram; one among text is an inline paintable
   capped to a few lines high and sitting on the baseline. Raster formats go
-  through the `image` crate (Exif orientation applied, decoded at the device
-  scale for HiDPI), `.svg` through resvg (including raster images embedded in
-  the SVG). Network destinations (`http`/`https`) are
+  through the `image` crate (Exif orientation applied, the file's own
+  pixels, scaled by the screen when drawn), `.svg` through resvg (including
+  raster images embedded in the SVG). A picture larger than the size limit
+  shows `[image: <alt> — too large (...)]`. Network destinations (`http`/`https`) are
   never fetched - that is deliberately not supported and not planned - and
   an empty source, unsupported scheme, missing file or unreadable format
   shows `[image: <alt> — <reason>]`. An image in a table cell is drawn inline
@@ -414,7 +446,9 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   non-Markdown local files via `GtkUriLauncher`, Markdown files in a new
   viewer window, relative paths resolved against the document); a
   `#fragment` scrolls to the matching heading, whose anchor is a
-  GitHub-style slug (duplicates get `-1`, `-2`, ...). Dangerous schemes
+  GitHub-style slug (duplicates get `-1`, `-2`, ...). Every heading has its
+  own anchor, registered at its first character as its text block is
+  appended (`links::heading_starts`). Dangerous schemes
   (`javascript:`, `data:`, ...) and empty destinations are ignored, and a
   formula that is a link's only content is not clickable (it is drawn as
   pixels). An image that is a link's content *is* clickable: a standalone or
