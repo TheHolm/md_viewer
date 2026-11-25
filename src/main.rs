@@ -267,6 +267,25 @@ struct Slot {
     offset: i32,
     /// How far the graphic reaches below the baseline, in pixels.
     depth: Cell<f32>,
+    /// The bytes of pixels the graphic holds (0 once dropped).
+    bytes: Cell<usize>,
+    /// Whether it holds its pixels, or was dropped to stay within the
+    /// document's memory budget.
+    held: Cell<Held>,
+}
+
+/// Whether a graphic on the page holds its pixels (see
+/// [`Session::enforce_budget`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
+    /// Drawn with its pixels.
+    Drawn,
+    /// Dropped: a spinner of the same size stands in until it is near the
+    /// view again.
+    Dropped,
+    /// Dropped, and asked to be rendered again in the run with this
+    /// generation.
+    Requested(u64),
 }
 
 impl Slot {
@@ -478,6 +497,14 @@ struct Session {
     zoom_limit: Cell<f64>,
     /// True when `zoom_limit` was lowered and the window has not been told.
     limit_dirty: Cell<bool>,
+    /// The bytes of pixels the graphics on the page hold (see
+    /// [`Session::enforce_budget`]).
+    held_bytes: Cell<usize>,
+    /// The most bytes of pixels the page may hold: always
+    /// [`graphics::DOCUMENT_BUDGET`], except in tests.
+    budget: Cell<usize>,
+    /// True while a [`Session::schedule_budget`] run is waiting.
+    budget_pending: Cell<bool>,
     /// Tells the window the document's new zoom limit.
     limit_changed: Box<dyn Fn(f64)>,
     /// A block (searched before it was rendered) to scroll to once it is on
@@ -638,8 +665,7 @@ impl Session {
                 .set(self.outstanding.get().saturating_sub(1));
             if self.progress.borrow().is_shown(id) {
                 if let (Ok(image), Some(Some(slot))) = (&rendered, self.slots.borrow().get(id)) {
-                    self.note_limit(image);
-                    slot.apply(image, &self.resizable);
+                    self.redraw_slot(slot, image);
                     if self.anchor.borrow().is_some() {
                         self.hold_anchor();
                     }
@@ -650,6 +676,8 @@ impl Session {
             }
         }
         self.append_ready();
+        self.enforce_budget();
+        self.redraw_near();
         self.update_status();
         self.advance_frontier();
         self.report_limit();
@@ -664,6 +692,7 @@ impl Session {
         for index in ready {
             let offset = self.view.buffer().end_iter().offset();
             self.insert_block(index);
+            progressive::clear_graphics(&mut self.blocks.borrow_mut()[index]);
             if self.pending_scroll.borrow().as_ref() == Some(&index) {
                 self.pending_scroll.replace(None);
                 let mut iter = self.view.buffer().iter_at_offset(offset);
@@ -746,7 +775,121 @@ impl Session {
     /// lowers the document's zoom limit to the image's.
     fn add_graphic(&self, image: &Image, slot: Slot) {
         self.note_limit(image);
+        slot.bytes.set(image.pixels.len());
+        self.held_bytes
+            .set(self.held_bytes.get() + image.pixels.len());
         self.add_slot(Some(slot));
+    }
+
+    /// Shows `image` (a re-render) in `slot`, counting its pixels instead
+    /// of the old ones.
+    fn redraw_slot(&self, slot: &Slot, image: &Image) {
+        self.note_limit(image);
+        slot.apply(image, &self.resizable);
+        let held = self.held_bytes.get() - slot.bytes.get() + image.pixels.len();
+        self.held_bytes.set(held);
+        slot.bytes.set(image.pixels.len());
+        slot.held.set(Held::Drawn);
+    }
+
+    /// Drops the pixels of the graphics farthest from the view while the
+    /// document holds more than its budget ([`graphics::DOCUMENT_BUDGET`]);
+    /// each keeps
+    /// its size on the page, showing a spinner until it is near the view
+    /// again ([`Session::redraw_near`]). Graphics on or within
+    /// [`layout::KEEP_SCREENS`] screens of the view are never dropped.
+    fn enforce_budget(&self) {
+        if self.held_bytes.get() <= self.budget.get() {
+            return;
+        }
+        let slots = self.slots.borrow();
+        let candidates: Vec<(usize, usize, f64)> = slots
+            .iter()
+            .enumerate()
+            .filter_map(|(id, slot)| {
+                let slot = slot.as_ref()?;
+                (slot.held.get() == Held::Drawn)
+                    .then(|| (id, slot.bytes.get(), self.distance_from_view(slot.offset)))
+            })
+            .collect();
+        let drops = progressive::pick_drops(self.held_bytes.get(), self.budget.get(), &candidates);
+        for id in drops {
+            if let Some(Some(slot)) = slots.get(id) {
+                slot.texture.show_spinner(self.view.upcast_ref());
+                self.held_bytes
+                    .set(self.held_bytes.get().saturating_sub(slot.bytes.get()));
+                slot.bytes.set(0);
+                slot.held.set(Held::Dropped);
+            }
+        }
+    }
+
+    /// Runs [`Session::enforce_budget`] and [`Session::redraw_near`] once
+    /// the main loop is idle: the page's layout (and so where each graphic
+    /// is) settles after scrolling and as lines are measured, and the
+    /// adjustment signals that report it may come in the middle of a
+    /// layout pass. Several requests before then run once.
+    fn schedule_budget(self: &Rc<Self>) {
+        if self.budget_pending.replace(true) {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        glib::idle_add_local_once(move || {
+            if let Some(session) = weak.upgrade() {
+                session.budget_pending.set(false);
+                session.enforce_budget();
+                session.redraw_near();
+            }
+        });
+    }
+
+    /// Asks again for the dropped graphics that are now on or near the
+    /// view (within [`layout::KEEP_SCREENS`] screens), so they are drawn
+    /// before they are seen. A request from an earlier run (since cancelled
+    /// by a zoom) is made again.
+    fn redraw_near(self: &Rc<Self>) {
+        if self.rezoom.borrow().is_some() {
+            return;
+        }
+        let generation = self.generation.get();
+        let ids: Vec<usize> = self
+            .slots
+            .borrow()
+            .iter()
+            .enumerate()
+            .filter_map(|(id, slot)| {
+                let slot = slot.as_ref()?;
+                let wanted = match slot.held.get() {
+                    Held::Drawn => false,
+                    Held::Dropped => true,
+                    Held::Requested(asked) => asked != generation,
+                };
+                (wanted && self.distance_from_view(slot.offset) == 0.0).then(|| {
+                    slot.held.set(Held::Requested(generation));
+                    id
+                })
+            })
+            .collect();
+        let jobs = ids.into_iter().map(|id| self.jobs[id].clone()).collect();
+        self.submit_batch(jobs);
+    }
+
+    /// How far (in pixels) the line at buffer `offset` is from the view
+    /// widened by [`layout::KEEP_SCREENS`] window heights each way; 0 when
+    /// it is within that.
+    fn distance_from_view(&self, offset: i32) -> f64 {
+        let adjustment = self.scrolled.vadjustment();
+        let page = adjustment.page_size();
+        let (top, height) = self
+            .view
+            .line_yrange(&self.view.buffer().iter_at_offset(offset));
+        layout::distance_from_view(
+            f64::from(top),
+            f64::from(top + height),
+            adjustment.value(),
+            adjustment.value() + page,
+            page * layout::KEEP_SCREENS,
+        )
     }
 
     /// Lowers the document's zoom limit to `image`'s, if that is lower; the
@@ -834,6 +977,8 @@ impl Session {
                         picture: Some(pictures.len()),
                         offset,
                         depth: Cell::new(0.0),
+                        bytes: Cell::new(0),
+                        held: Cell::new(Held::Drawn),
                     },
                 );
                 pictures.push((picture, image.logical_width(), image.logical_height()));
@@ -934,6 +1079,8 @@ impl Session {
                         picture: None,
                         offset: start,
                         depth: Cell::new(image.depth),
+                        bytes: Cell::new(0),
+                        held: Cell::new(Held::Drawn),
                     },
                 );
             }
@@ -1007,6 +1154,8 @@ impl Session {
                             picture: Some(index),
                             offset,
                             depth: Cell::new(0.0),
+                            bytes: Cell::new(0),
+                            held: Cell::new(Held::Drawn),
                         },
                     );
                     pictures.push((picture, rendered.logical_width(), rendered.logical_height()));
@@ -1031,6 +1180,8 @@ impl Session {
                             picture: None,
                             offset: start,
                             depth: Cell::new(0.0),
+                            bytes: Cell::new(0),
+                            held: Cell::new(Held::Drawn),
                         },
                     );
                 }
@@ -1185,6 +1336,8 @@ impl Session {
                             picture: None,
                             offset,
                             depth: Cell::new(image.depth),
+                            bytes: Cell::new(0),
+                            held: Cell::new(Held::Drawn),
                         },
                     );
                 }
@@ -1222,6 +1375,8 @@ impl Session {
                                 picture: None,
                                 offset,
                                 depth: Cell::new(0.0),
+                                bytes: Cell::new(0),
+                                held: Cell::new(Held::Drawn),
                             },
                         );
                     }
@@ -1307,7 +1462,15 @@ impl Session {
             .borrow()
             .iter()
             .enumerate()
-            .filter_map(|(id, slot)| slot.as_ref().map(|slot| (id, slot.offset)))
+            .filter_map(|(id, slot)| {
+                let slot = slot.as_ref()?;
+                if slot.held.get() != Held::Drawn {
+                    // Dropped graphics are asked for again when near the view.
+                    slot.held.set(Held::Dropped);
+                    return None;
+                }
+                Some((id, slot.offset))
+            })
             .collect();
         let order = progressive::zoom_order(&shown, self.first_visible_offset(), &unshown);
         let jobs = order.into_iter().map(|id| self.jobs[id].clone()).collect();
@@ -1315,6 +1478,7 @@ impl Session {
         self.outstanding.set(0);
         self.pool.replace(None);
         self.submit_batch(jobs);
+        self.redraw_near();
         self.update_status();
     }
 
@@ -2550,6 +2714,9 @@ impl DocWindow {
             pending_anchor: RefCell::new(None),
             zoom_limit: Cell::new(f64::INFINITY),
             limit_dirty: Cell::new(false),
+            held_bytes: Cell::new(0),
+            budget: Cell::new(graphics::DOCUMENT_BUDGET),
+            budget_pending: Cell::new(false),
             limit_changed,
             pending_scroll: RefCell::new(None),
             open_link,
@@ -2621,8 +2788,21 @@ impl DocWindow {
                 if let Some(session) = weak.upgrade() {
                     session.marks.queue_draw();
                     session.advance_frontier();
+                    session.schedule_budget();
                 }
             });
+            // Plain scrolling only changes the value: render more, and draw
+            // dropped graphics coming near the view again.
+            let weak = Rc::downgrade(&session);
+            session
+                .scrolled
+                .vadjustment()
+                .connect_value_changed(move |_| {
+                    if let Some(session) = weak.upgrade() {
+                        session.advance_frontier();
+                        session.schedule_budget();
+                    }
+                });
         }
         let weak: Weak<Session> = Rc::downgrade(&session);
         glib::timeout_add_local_once(
@@ -3081,8 +3261,11 @@ mod scaled_texture {
     /// The instance state: the texture and its logical size.
     #[derive(Default)]
     pub struct Imp {
-        /// The device-pixel texture.
+        /// The device-pixel texture (`None` while a spinner stands in).
         pub texture: RefCell<Option<gdk::Texture>>,
+        /// The spinner drawn instead of a dropped texture, with the handler
+        /// forwarding its animation frames.
+        pub spinner: RefCell<Option<(gdk::Paintable, glib::SignalHandlerId)>>,
         /// The logical width, in pixels.
         pub width: Cell<f64>,
         /// The logical height, in pixels.
@@ -3109,17 +3292,38 @@ mod scaled_texture {
             self.height.get().ceil() as i32
         }
 
-        /// Draws the texture scaled into the requested area.
+        /// Draws the texture scaled into the requested area, or the spinner
+        /// centred in it (at most 32 pixels, and not at all in a tiny area).
         fn snapshot(&self, snapshot: &gdk::Snapshot, width: f64, height: f64) {
-            let (Some(texture), Some(snapshot)) = (
-                self.texture.borrow().clone(),
-                snapshot.downcast_ref::<gtk4::Snapshot>(),
-            ) else {
+            let Some(gtk_snapshot) = snapshot.downcast_ref::<gtk4::Snapshot>() else {
                 return;
             };
-            let bounds = graphene::Rect::new(0.0, 0.0, width as f32, height as f32);
-            snapshot.append_texture(&texture, &bounds);
+            if let Some(texture) = self.texture.borrow().clone() {
+                let bounds = graphene::Rect::new(0.0, 0.0, width as f32, height as f32);
+                gtk_snapshot.append_texture(&texture, &bounds);
+            } else if let Some((spinner, _)) = &*self.spinner.borrow() {
+                let size = super::layout::spinner_size(width, height);
+                if size > 0.0 {
+                    gtk_snapshot.save();
+                    gtk_snapshot.translate(&graphene::Point::new(
+                        ((width - size) / 2.0) as f32,
+                        ((height - size) / 2.0) as f32,
+                    ));
+                    spinner.snapshot(snapshot, size, size);
+                    gtk_snapshot.restore();
+                }
+            }
         }
+    }
+}
+
+/// An image's shared pixel buffer, handed to GDK without copying it.
+struct SharedPixels(std::sync::Arc<Vec<u8>>);
+
+impl AsRef<[u8]> for SharedPixels {
+    /// The pixels.
+    fn as_ref(&self) -> &[u8] {
+        &self.0
     }
 }
 
@@ -3144,10 +3348,13 @@ impl ScaledTexture {
             image.width as i32,
             image.height as i32,
             gdk::MemoryFormat::R8g8b8a8Premultiplied,
-            &glib::Bytes::from(&image.pixels),
+            &glib::Bytes::from_owned(SharedPixels(image.pixels.clone())),
             image.width as usize * 4,
         );
         let imp = self.imp();
+        if let Some((spinner, handler)) = imp.spinner.take() {
+            spinner.disconnect(handler);
+        }
         imp.texture.replace(Some(texture.upcast()));
         imp.width.set(image.logical_width() as f64);
         imp.height.set(image.logical_height() as f64);
@@ -3158,6 +3365,33 @@ impl ScaledTexture {
         self.store(image);
         self.invalidate_size();
         self.invalidate_contents();
+    }
+
+    /// Frees the texture, keeping the logical size, and draws a spinner
+    /// (animated while `widget` is mapped) in its place until
+    /// [`ScaledTexture::set_image`] gives it pixels again.
+    fn show_spinner(&self, widget: &gtk4::Widget) {
+        use gtk4::subclass::prelude::ObjectSubclassIsExt;
+        let spinner = adw::SpinnerPaintable::new(Some(widget));
+        let weak = self.downgrade();
+        let handler = spinner.connect_invalidate_contents(move |_| {
+            if let Some(texture) = weak.upgrade() {
+                texture.invalidate_contents();
+            }
+        });
+        let imp = self.imp();
+        imp.texture.replace(None);
+        if let Some((old, handler)) = imp.spinner.replace(Some((spinner.upcast(), handler))) {
+            old.disconnect(handler);
+        }
+        self.invalidate_contents();
+    }
+
+    /// True while a spinner stands in for a dropped texture.
+    #[cfg(test)]
+    fn shows_spinner(&self) -> bool {
+        use gtk4::subclass::prelude::ObjectSubclassIsExt;
+        self.imp().texture.borrow().is_none()
     }
 
     /// Scales the logical size by `ratio`, stretching the current texture,
@@ -3359,7 +3593,7 @@ mod tests {
             height: 20,
             scale: 2.0,
             depth: 0.0,
-            pixels: vec![0; 40 * 20 * 4],
+            pixels: vec![0; 40 * 20 * 4].into(),
             labels: Vec::new(),
             max_zoom: 1.0,
         };
@@ -3484,6 +3718,114 @@ mod tests {
         assert!((window.zoom.get().level() - 1.5).abs() < 1e-3);
         window.change_zoom(Zoom::reset);
         assert!(!window.zoom_indicator.is_visible());
+        window.window.close();
+        budget_checks(app);
+    }
+
+    /// Runs the main loop until `session` has every block on the page and
+    /// no render outstanding.
+    fn settle(session: &Session) {
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            while context.iteration(false) {}
+            if session.progress.borrow().all_shown()
+                && session.outstanding.get() == 0
+                && !session.budget_pending.get()
+                && session.rezoom.borrow().is_none()
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "the document settles");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Checks of the memory budget on a real window (part of
+    /// [`gtk_helpers`]), with the budget lowered to fit four pictures: a
+    /// long document with many pictures loads completely while holding no
+    /// more than the budget; pictures far from the view are dropped, keeping
+    /// their size and showing a spinner; scrolling to the end draws the
+    /// pictures there again, and the ones at the top are dropped instead.
+    fn budget_checks(app: &adw::Application) {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let mut markdown = String::new();
+        for i in 0..12 {
+            let path = dir.path().join(format!("p{i}.png"));
+            image::RgbaImage::from_pixel(200, 100, image::Rgba([0, 0, 200, 255]))
+                .save(&path)
+                .expect("write picture");
+            markdown += &format!("![p{i}](p{i}.png)\n\n");
+            for line in 0..60 {
+                markdown += &format!("Filler {i}.{line}\n\n");
+            }
+        }
+        let document = dir.path().join("doc.md");
+        let mut blocks = md_viewer::render(&markdown);
+        md_viewer::resolve_images(&mut blocks, &document);
+        let window = DocWindow::new(app);
+        let session = window.show_document(&document, blocks);
+        let picture_bytes = 200 * 100 * 4;
+        session.budget.set(4 * picture_bytes);
+        session.start(RasterSettings::default());
+        settle(&session);
+        // Render everything (as a search would) and settle again.
+        session.render_to(usize::MAX);
+        settle(&session);
+        let count = |held: fn(Held) -> bool| {
+            session
+                .slots
+                .borrow()
+                .iter()
+                .flatten()
+                .filter(|slot| held(slot.held.get()))
+                .count()
+        };
+        assert_eq!(count(|_| true), 12);
+        assert!(session.held_bytes.get() <= session.budget.get());
+        assert!(count(|held| held != Held::Drawn) >= 8);
+        {
+            let slots = session.slots.borrow();
+            let first = slots[0].as_ref().expect("first picture");
+            assert_eq!(first.held.get(), Held::Drawn);
+            let last = slots[11].as_ref().expect("last picture");
+            assert_ne!(last.held.get(), Held::Drawn);
+            assert!(last.texture.shows_spinner());
+            assert_eq!(last.bytes.get(), 0);
+            assert_eq!(last.texture.intrinsic_width(), 200);
+            assert_eq!(last.texture.intrinsic_height(), 100);
+        }
+        // Scroll to the last picture: it is drawn again, the first one
+        // dropped, and the budget still holds.
+        let offset = session.slots.borrow()[11].as_ref().expect("last").offset;
+        let (top, _) = session
+            .view
+            .line_yrange(&session.view.buffer().iter_at_offset(offset));
+        session.scrolled.vadjustment().set_value(f64::from(top));
+        settle(&session);
+        {
+            let slots = session.slots.borrow();
+            let last = slots[11].as_ref().expect("last picture");
+            assert_eq!(last.held.get(), Held::Drawn);
+            assert!(!last.texture.shows_spinner());
+            assert_eq!(last.bytes.get(), picture_bytes);
+            assert_ne!(slots[0].as_ref().expect("first").held.get(), Held::Drawn);
+        }
+        assert!(session.held_bytes.get() <= session.budget.get());
+        // A zoom re-renders only what is drawn; dropped pictures keep their
+        // spinner and are stretched with the page.
+        session.zoom_to(1.5);
+        settle(&session);
+        {
+            let slots = session.slots.borrow();
+            let last = slots[11].as_ref().expect("last picture");
+            assert_eq!(last.held.get(), Held::Drawn);
+            assert_eq!(last.texture.intrinsic_width(), 300);
+            let first = slots[0].as_ref().expect("first picture");
+            assert!(first.texture.shows_spinner());
+            assert_eq!(first.texture.intrinsic_width(), 300);
+        }
+        assert!(session.held_bytes.get() <= session.budget.get());
         window.window.close();
     }
 }

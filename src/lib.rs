@@ -665,12 +665,66 @@ fn markup_attributes(style: Style) -> String {
     }
 }
 
+/// The largest file the viewer reads: a document, an image, or an image an
+/// SVG refers to.
+pub const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Reads the file at `path`, refusing anything that is not a regular file
+/// (a FIFO would block the reader forever, a device like `/dev/zero` never
+/// ends) and anything larger than `limit` bytes. The type and size are
+/// checked before the file is opened, and at most `limit + 1` bytes are read,
+/// so a file growing meanwhile is refused too. Errors are `InvalidInput`
+/// with a message saying why.
+pub fn read_limited(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let refuse = |message: String| io::Error::new(io::ErrorKind::InvalidInput, message);
+    let too_large = |size: u64| {
+        refuse(format!(
+            "file too large ({}, limit {})",
+            size_text(size),
+            size_text(limit)
+        ))
+    };
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(refuse("not a regular file".to_string()));
+    }
+    if metadata.len() > limit {
+        return Err(too_large(metadata.len()));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    fs::File::open(path)?
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(too_large(bytes.len() as u64));
+    }
+    Ok(bytes)
+}
+
+/// A byte count for messages: whole MiB from 1 MiB up, bytes below.
+fn size_text(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    if bytes >= MIB {
+        format!("{} MiB", bytes / MIB)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
 /// Reads the document at `path` into a string.
 ///
-/// The file is only ever opened for reading. Fails if the file cannot be read
-/// or is not valid UTF-8.
+/// The file is only ever opened for reading. Fails if the file cannot be
+/// read, is not a regular file, is larger than [`MAX_FILE_BYTES`] (see
+/// [`read_limited`]) or is not valid UTF-8 (`InvalidData`).
 pub fn read_document(path: &Path) -> io::Result<String> {
-    fs::read_to_string(path)
+    let bytes = read_limited(path, MAX_FILE_BYTES)?;
+    String::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        )
+    })
 }
 
 /// Reads the document at `path` and renders it, ready for display.
@@ -1255,6 +1309,15 @@ fn trailing_newlines(blocks: &[Block]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sizes in messages are bytes below 1 MiB, whole MiB above.
+    #[test]
+    fn size_text_units() {
+        assert_eq!(size_text(0), "0 bytes");
+        assert_eq!(size_text(1024 * 1024 - 1), "1048575 bytes");
+        assert_eq!(size_text(1024 * 1024), "1 MiB");
+        assert_eq!(size_text(MAX_FILE_BYTES), "512 MiB");
+    }
 
     /// Builds a text block of unstyled spans, for brevity.
     fn text_block(parts: &[&str]) -> Block {

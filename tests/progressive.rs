@@ -5,8 +5,8 @@
 
 use md_viewer::graphics::{Graphic, RasterSettings};
 use md_viewer::progressive::{
-    for_each_graphic, jobs, place, worker_count, zoom_order, Job, Phase, Pool, Progress,
-    SPINNER_DELAY_MS,
+    clear_graphics, for_each_graphic, jobs, pick_drops, place, worker_count, zoom_order, Job,
+    Phase, Pool, Progress, SPINNER_DELAY_MS,
 };
 use md_viewer::{render, Block, Inline};
 use std::path::Path;
@@ -108,6 +108,31 @@ fn place_stores_results() {
         stored += image.is_some() as usize
     });
     assert_eq!(stored, 1);
+}
+
+/// Clearing a block forgets every result stored in it (formulas, images,
+/// diagrams) and leaves the other blocks alone.
+#[test]
+fn clear_graphics_forgets_results() {
+    let mut blocks = render(DOCUMENT);
+    let mut id = 0;
+    for_each_graphic(&mut blocks, |_, _, image| {
+        *image = Some(Err(format!("r{id}")));
+        id += 1;
+    });
+    let count = |blocks: &mut [md_viewer::Block]| {
+        let mut stored = 0;
+        for_each_graphic(blocks, |_, _, image| stored += image.is_some() as usize);
+        stored
+    };
+    let before = count(&mut blocks);
+    clear_graphics(&mut blocks[1]);
+    assert_eq!(count(&mut blocks[1..2]), 0);
+    assert!(count(&mut blocks) < before);
+    for block in &mut blocks {
+        clear_graphics(block);
+    }
+    assert_eq!(count(&mut blocks), 0);
 }
 
 /// Blocks go on the page in order, each once all its graphics are in: the
@@ -405,4 +430,24 @@ fn place_stores_image_result() {
         panic!("expected an image");
     };
     assert_eq!(image.image, Some(Err("broken".to_string())));
+}
+
+/// Within the budget nothing is dropped; over it, the farthest graphics go
+/// first until it is met, never one near the view (distance 0) or one that
+/// holds nothing; if what is near alone exceeds the budget, every far one
+/// goes and that is all.
+#[test]
+fn pick_drops_farthest_first() {
+    let candidates = [
+        (0, 100, 0.0),
+        (1, 100, 50.0),
+        (2, 100, 900.0),
+        (3, 100, 300.0),
+        (4, 0, 5000.0),
+    ];
+    assert!(pick_drops(400, 400, &candidates).is_empty());
+    assert_eq!(pick_drops(450, 400, &candidates), [2]);
+    assert_eq!(pick_drops(500, 250, &candidates), [2, 3, 1]);
+    assert_eq!(pick_drops(500, 0, &candidates), [2, 3, 1]);
+    assert!(pick_drops(500, 0, &[]).is_empty());
 }

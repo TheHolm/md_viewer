@@ -132,6 +132,40 @@ pub fn place(blocks: &mut [Block], id: usize, rendered: Rendered) -> bool {
     rendered.is_none()
 }
 
+/// Forgets the rendered graphics of `block` (they become `None` again),
+/// once the block is on the page: its widgets hold what they show, so the
+/// parsed document need not keep a reference to every picture's pixels.
+pub fn clear_graphics(block: &mut Block) {
+    for_each_graphic(std::slice::from_mut(block), |_, _, image| *image = None);
+}
+
+/// Which graphics on the page to drop (their pixels freed, re-rendered when
+/// scrolled near again) so a document holding `held` bytes gets within
+/// `budget`: from `candidates` (graphic id, bytes, distance from the view as
+/// [`crate::layout::distance_from_view`] gives it), the farthest first,
+/// never one at distance 0 (on or near the screen). May not reach the
+/// budget if what is near the view alone exceeds it.
+pub fn pick_drops(held: usize, budget: usize, candidates: &[(usize, usize, f64)]) -> Vec<usize> {
+    if held <= budget {
+        return Vec::new();
+    }
+    let mut far: Vec<&(usize, usize, f64)> = candidates
+        .iter()
+        .filter(|(_, bytes, distance)| *distance > 0.0 && *bytes > 0)
+        .collect();
+    far.sort_by(|a, b| b.2.total_cmp(&a.2));
+    let mut held = held;
+    let mut drops = Vec::new();
+    for (id, bytes, _) in far {
+        if held <= budget {
+            break;
+        }
+        held = held.saturating_sub(*bytes);
+        drops.push(*id);
+    }
+    drops
+}
+
 /// Tracks which graphics have been rendered and which blocks are on the
 /// page. Blocks go on the page strictly in order, and only once all of their
 /// graphics are rendered, so a slow graphic holds back the blocks after it
@@ -343,7 +377,15 @@ impl Shared {
     }
 
     /// Stops the workers and wakes any that are waiting for a job.
+    ///
+    /// The flag is set while holding the queue lock: a worker checks it and
+    /// goes to sleep under that lock, so setting it unlocked could fall
+    /// between the two, and the wake-up would be missed for good.
     fn cancel(&self) {
+        let _queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.cancelled.store(true, Ordering::Relaxed);
         self.condvar.notify_all();
     }
@@ -358,6 +400,22 @@ impl Pool {
         threads: usize,
         deliver: impl Fn(usize, Rendered) + Send + Sync + 'static,
     ) -> Pool {
+        Pool::start_with(jobs, threads, deliver, move |graphic| {
+            Cache::shared().render(graphic, &settings)
+        })
+    }
+
+    /// [`Pool::start`] with the function that renders a graphic given, so
+    /// tests can make one fail. A panic in `render` (a bug in a renderer
+    /// crate) is caught and delivered as an error, so the graphic shows its
+    /// source or placeholder and loading still finishes.
+    fn start_with(
+        jobs: Vec<Job>,
+        threads: usize,
+        deliver: impl Fn(usize, Rendered) + Send + Sync + 'static,
+        render: impl Fn(&Graphic) -> Rendered + Send + Sync + 'static,
+    ) -> Pool {
+        let render = Arc::new(render);
         let shared = Arc::new(Shared {
             queue: Mutex::new(VecDeque::from(jobs)),
             condvar: Condvar::new(),
@@ -365,12 +423,12 @@ impl Pool {
         });
         let deliver = Arc::new(deliver);
         for _ in 0..threads.max(1) {
-            let (shared, deliver) = (shared.clone(), deliver.clone());
+            let (shared, deliver, render) = (shared.clone(), deliver.clone(), render.clone());
             std::thread::spawn(move || loop {
                 let Some(job) = shared.next_job() else {
                     return;
                 };
-                let rendered = Cache::shared().render(&job.graphic, &settings);
+                let rendered = render_caught(|| render(&job.graphic));
                 if shared.cancelled.load(Ordering::Relaxed) {
                     return;
                 }
@@ -392,9 +450,111 @@ impl Pool {
     }
 }
 
+/// Runs `render`, turning a panic into an error naming its message.
+fn render_caught(render: impl FnOnce() -> Rendered) -> Rendered {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(render)).unwrap_or_else(|payload| {
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|text| text.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown error".to_string());
+        Err(format!("renderer failed: {message}"))
+    })
+}
+
 impl Drop for Pool {
     /// Dropping the pool cancels it.
     fn drop(&mut self) {
         self.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A math job with id `id`.
+    fn job(id: usize) -> Job {
+        Job {
+            id,
+            block: 0,
+            graphic: Graphic::Math {
+                tex: format!("x_{id}"),
+                display: false,
+            },
+        }
+    }
+
+    /// A panic is turned into an error with its message (a `&str` or a
+    /// `String` payload); a normal result passes through.
+    #[test]
+    fn render_caught_turns_panics_into_errors() {
+        assert_eq!(
+            render_caught(|| Err("plain".to_string())),
+            Err("plain".to_string())
+        );
+        assert_eq!(
+            render_caught(|| panic!("boom")),
+            Err("renderer failed: boom".to_string())
+        );
+        let n = 3;
+        assert_eq!(
+            render_caught(|| panic!("boom {n}")),
+            Err("renderer failed: boom 3".to_string())
+        );
+        assert_eq!(
+            render_caught(|| std::panic::panic_any(7_u8)),
+            Err("renderer failed: unknown error".to_string())
+        );
+    }
+
+    /// A job whose renderer panics is delivered as an error, and the worker
+    /// carries on with the other jobs, so every job gets its result.
+    #[test]
+    fn panicking_job_is_delivered_as_an_error() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let sender = Mutex::new(sender);
+        let jobs: Vec<Job> = (0..6).map(job).collect();
+        let _pool = Pool::start_with(
+            jobs,
+            1,
+            move |id, rendered| {
+                let _ = sender.lock().unwrap().send((id, rendered));
+            },
+            |graphic| match graphic {
+                Graphic::Math { tex, .. } if tex == "x_2" => panic!("bad formula"),
+                _ => Err("not rendered in this test".to_string()),
+            },
+        );
+        let mut results: Vec<(usize, Rendered)> = (0..6)
+            .map(|_| receiver.recv_timeout(Duration::from_secs(10)).unwrap())
+            .collect();
+        results.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            results[2].1,
+            Err("renderer failed: bad formula".to_string())
+        );
+        assert!(results
+            .iter()
+            .all(|(id, rendered)| *id == 2 || rendered.is_err()));
+        assert_eq!(results.len(), 6);
+    }
+
+    /// Cancelling a pool whose workers are going to sleep on an empty
+    /// queue stops every worker: each drops its share of the pool's state
+    /// promptly. Repeated many times, since the race this guards against
+    /// (a cancel landing between a worker's check and its wait) is rare.
+    #[test]
+    fn cancel_never_strands_a_waiting_worker() {
+        for _ in 0..500 {
+            let pool = Pool::start_with(Vec::new(), 2, |_, _| {}, |_| Err(String::new()));
+            pool.cancel();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Arc::strong_count(&pool.shared) > 1 {
+                assert!(Instant::now() < deadline, "a worker never stopped");
+                std::thread::yield_now();
+            }
+        }
     }
 }

@@ -2,10 +2,10 @@
 //! (`md_viewer::layout`).
 
 use md_viewer::layout::{
-    align_fraction, available_width, cell_classes, color_channel, diagram_size, font_size_px,
-    heading_scale, math_rise, needs_more, pango_channel, pango_color, percent_alpha, table_size,
-    text_zoom_limit, DIAGRAM_PADDING, DOCUMENT_MARGIN, FRONTIER_LOOKAHEAD, MIN_DIAGRAM_WIDTH,
-    MIN_TABLE_WIDTH,
+    align_fraction, available_width, cell_classes, color_channel, diagram_size, distance_from_view,
+    font_size_px, heading_scale, math_rise, needs_more, pango_channel, pango_color, percent_alpha,
+    spinner_size, table_size, text_zoom_limit, DIAGRAM_PADDING, DOCUMENT_MARGIN,
+    FRONTIER_LOOKAHEAD, KEEP_SCREENS, MIN_DIAGRAM_WIDTH, MIN_TABLE_WIDTH,
 };
 use md_viewer::Align;
 
@@ -285,4 +285,25 @@ fn text_zoom_limit_from_largest_heading() {
     assert_eq!(text_zoom_limit(15.0, 1.0, [10, 10]), 1.0);
     assert_eq!(text_zoom_limit(0.0, 1.0, [10, 10]), f64::INFINITY);
     assert_eq!(text_zoom_limit(f32::NAN, 1.0, [10, 10]), f64::INFINITY);
+}
+
+/// The distance of a span from the view widened by a margin: 0 when they
+/// overlap (touching counts), otherwise the gap above or below.
+#[test]
+fn distance_from_view_gaps() {
+    assert_eq!(distance_from_view(100.0, 200.0, 0.0, 500.0, 0.0), 0.0);
+    assert_eq!(distance_from_view(600.0, 700.0, 0.0, 500.0, 0.0), 100.0);
+    assert_eq!(distance_from_view(600.0, 700.0, 0.0, 500.0, 100.0), 0.0);
+    assert_eq!(distance_from_view(0.0, 50.0, 1000.0, 1500.0, 500.0), 450.0);
+    assert_eq!(distance_from_view(0.0, 3000.0, 1000.0, 1500.0, 0.0), 0.0);
+    assert_eq!(KEEP_SCREENS, 1.0);
+}
+
+/// The spinner of a dropped graphic is at most 32 pixels and fits the
+/// shorter side, and is left out of an area under 8 pixels.
+#[test]
+fn spinner_sizes() {
+    assert_eq!(spinner_size(400.0, 300.0), 32.0);
+    assert_eq!(spinner_size(400.0, 20.0), 20.0);
+    assert_eq!(spinner_size(7.0, 100.0), 0.0);
 }

@@ -3,8 +3,8 @@
 //! it opens, where the file chooser starts, how failures are reported).
 
 use md_viewer::{
-    chooser_folder, error_message, open_document, open_target, read_document, window_title, Block,
-    Inline, Origin, Span, Style, Target,
+    chooser_folder, error_message, open_document, open_target, read_document, read_limited,
+    window_title, Block, Inline, Origin, Span, Style, Target, MAX_FILE_BYTES,
 };
 use std::fs;
 use std::io::{ErrorKind, Write};
@@ -67,6 +67,65 @@ fn read_document_invalid_utf8() {
     let file = temp_file(&[0x66, 0xff, 0xfe, 0x6f]);
     let error = read_document(file.path()).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidData);
+}
+
+/// Makes a FIFO at `path` with `mkfifo`.
+pub fn make_fifo(path: &Path) {
+    let made = std::process::Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(made.success());
+}
+
+/// `read_limited` reads a regular file within the limit, including one
+/// exactly at it, and refuses one over it before reading, with the sizes in
+/// the message.
+#[test]
+fn read_limited_size_limit() {
+    let file = temp_file(b"0123456789");
+    assert_eq!(read_limited(file.path(), 10).unwrap(), b"0123456789");
+    let error = read_limited(file.path(), 9).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert_eq!(
+        error.to_string(),
+        "file too large (10 bytes, limit 9 bytes)"
+    );
+    let large = tempfile::NamedTempFile::new().unwrap();
+    large.as_file().set_len(3 * 1024 * 1024).unwrap();
+    let error = read_limited(large.path(), 2 * 1024 * 1024).unwrap_err();
+    assert_eq!(error.to_string(), "file too large (3 MiB, limit 2 MiB)");
+    assert_eq!(MAX_FILE_BYTES, 512 * 1024 * 1024);
+}
+
+/// Anything but a regular file is refused before it is opened: a directory,
+/// an endless device and a FIFO (opening which would block until a writer
+/// appears). A missing file is an ordinary not-found error.
+#[test]
+fn read_limited_refuses_special_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("pipe");
+    make_fifo(&fifo);
+    for path in [dir.path(), Path::new("/dev/zero"), fifo.as_path()] {
+        let error = read_limited(path, MAX_FILE_BYTES).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidInput, "{path:?}");
+        assert_eq!(error.to_string(), "not a regular file", "{path:?}");
+    }
+    let missing = read_limited(&dir.path().join("missing"), 10).unwrap_err();
+    assert_eq!(missing.kind(), ErrorKind::NotFound);
+}
+
+/// The document goes through the same checks: a FIFO or an endless device
+/// is refused at once rather than hanging the viewer, and the reason reaches
+/// the error message.
+#[test]
+fn read_document_refuses_special_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("doc.md");
+    make_fifo(&fifo);
+    let error = read_document(&fifo).unwrap_err();
+    assert!(error_message(&fifo, &error).ends_with(": not a regular file"));
+    assert!(read_document(Path::new("/dev/zero")).is_err());
 }
 
 /// `open_document` reads and renders in one step.

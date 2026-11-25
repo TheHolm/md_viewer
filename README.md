@@ -191,6 +191,11 @@ Planned features. Known bugs are listed in `BUGS.md`.
   `adw::Application`, opens a fixture, pumps the GLib main loop and drives
   those paths by emitting signals, plus optional `xdotool` scripts on Xvfb
   for the real event path.
+* Investigate loading pictures only as the document is scrolled (and
+  dropping them again far from the view), instead of keeping every
+  rendered graphic: search still needs a light preload of what pictures
+  contribute (diagram labels could come from the laid-out SVG alone, without
+  drawing pixels).
 * Reload a document when it changes on disk.
 * An error popup instead of a message on STDERR for a bad `FILE` argument.
 * Remember the zoom level between runs.

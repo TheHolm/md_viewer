@@ -4,7 +4,7 @@
 use md_viewer::graphics::{
     decode_image, hex_color, load_image, math_depth_em, math_svg, max_px_for, mermaid_svg,
     rasterize, render_document, render_math, render_mermaid, zoom_limit, Cache, Graphic,
-    RasterSettings, FALLBACK_MAX_PX, MATH_SCALE, SCREEN_MULTIPLE,
+    RasterSettings, DOCUMENT_BUDGET, FALLBACK_MAX_PX, MATH_SCALE, SCREEN_MULTIPLE,
 };
 use md_viewer::{render, Block, ImageRef, Inline, Math};
 use std::path::{Path, PathBuf};
@@ -553,6 +553,122 @@ fn svg_embedded_raster_image() {
     assert_eq!(pixel(&image, 0, 0)[3], 0);
 }
 
+/// An image file that is not a regular file is refused at once (a FIFO
+/// would block the worker forever, `/dev/zero` never ends), with the reason
+/// in the placeholder.
+#[test]
+fn image_special_files_are_refused() {
+    let dir = temp_dir();
+    let fifo = dir.path().join("pipe.png");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    for path in [fifo.as_path(), Path::new("/dev/zero"), dir.path()] {
+        let error = decode_image(path, &RasterSettings::default()).unwrap_err();
+        assert_eq!(error, "cannot read file: not a regular file", "{path:?}");
+    }
+}
+
+/// Writes `svg` to `name` in `dir` and returns its path.
+fn write_svg(dir: &Path, name: &str, svg: &str) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, svg).unwrap();
+    path
+}
+
+/// An SVG with one `<image>` covering it, referring to `href`.
+fn svg_with_image(href: &str) -> String {
+    format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8">
+             <image x="0" y="0" width="8" height="8" href="{href}"/></svg>"#
+    )
+}
+
+/// An SVG file's `<image href>` to a relative file resolves against the
+/// SVG's own folder (not the working directory), also percent-encoded, as
+/// a `file:` URL, or as another SVG.
+#[test]
+fn svg_file_references_resolve_against_its_folder() {
+    let dir = temp_dir();
+    let sub = dir.path().join("sub dir");
+    std::fs::create_dir(&sub).unwrap();
+    let red = write_image(&sub, "red.png", 4, 4, [255, 0, 0, 255]);
+    write_svg(
+        &sub,
+        "blue.svg",
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="4" height="4" fill="#0000ff"/></svg>"##,
+    );
+    let file_url = url::Url::from_file_path(&red).unwrap().to_string();
+    for (href, colour) in [
+        ("sub dir/red.png", [255, 0, 0, 255]),
+        ("sub%20dir/red.png", [255, 0, 0, 255]),
+        (file_url.as_str(), [255, 0, 0, 255]),
+        ("sub dir/blue.svg", [0, 0, 255, 255]),
+    ] {
+        let path = write_svg(dir.path(), "outer.svg", &svg_with_image(href));
+        let image = decode_image(&path, &RasterSettings::default()).unwrap();
+        assert_eq!(pixel(&image, 4, 4), colour, "{href}");
+    }
+}
+
+/// References that are refused draw nothing in their place, but the SVG
+/// still renders: a FIFO and `/dev/zero` (which would hang or exhaust
+/// memory), a raster image whose header is over the size limit, a web URL,
+/// and any file reference from SVG that is not a file (as formulas and
+/// diagrams are).
+#[test]
+fn svg_file_references_are_limited() {
+    let dir = temp_dir();
+    let fifo = dir.path().join("pipe.png");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    write_image(dir.path(), "wide.png", 300, 300, [255, 0, 0, 255]);
+    write_image(dir.path(), "red.png", 4, 4, [255, 0, 0, 255]);
+    let limited = RasterSettings {
+        max_px: [200, 200],
+        ..RasterSettings::default()
+    };
+    for href in [
+        "pipe.png",
+        "/dev/zero",
+        "wide.png",
+        "https://example.com/x.png",
+        "missing.png",
+    ] {
+        let path = write_svg(dir.path(), "outer.svg", &svg_with_image(href));
+        let image = decode_image(&path, &limited).unwrap();
+        assert_eq!(pixel(&image, 4, 4)[3], 0, "{href}");
+    }
+    let red = dir.path().join("red.png");
+    let svg = svg_with_image(red.to_str().unwrap());
+    assert_eq!(pixel(&rasterize(&svg, 15.0, 1.0).unwrap(), 4, 4)[3], 0);
+}
+
+/// A `data:` raster image embedded in an SVG is also checked from its
+/// header: one over the size limit is left out instead of being decoded.
+#[test]
+fn svg_embedded_raster_is_limited() {
+    let mut png = Vec::new();
+    image::RgbaImage::from_pixel(300, 300, image::Rgba([255, 0, 0, 255]))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    let svg = svg_with_image(&format!("data:image/png;base64,{}", base64(&png)));
+    let dir = temp_dir();
+    let path = write_svg(dir.path(), "data.svg", &svg);
+    let limited = RasterSettings {
+        max_px: [200, 200],
+        ..RasterSettings::default()
+    };
+    assert_eq!(pixel(&decode_image(&path, &limited).unwrap(), 4, 4)[3], 0);
+    let roomy = decode_image(&path, &RasterSettings::default()).unwrap();
+    assert_eq!(pixel(&roomy, 4, 4), [255, 0, 0, 255]);
+}
+
 /// Loading at a zoom grows the logical size (the pixels stay the same), like
 /// math and diagrams.
 #[test]
@@ -659,6 +775,20 @@ fn zoom_limit_checks_both_sides() {
     );
     let empty = zoom_limit(0.0, 10.0, max).unwrap_err();
     assert!(empty.contains("no area"), "{empty}");
+}
+
+/// A graphic whose pixels alone would exceed the document's memory budget
+/// (1 GiB) is refused at 100%, even within the screen limit; one just under
+/// it fits.
+#[test]
+fn zoom_limit_checks_the_memory_budget() {
+    assert_eq!(DOCUMENT_BUDGET, 1024 * 1024 * 1024);
+    let max = [100_000, 100_000];
+    assert_eq!(
+        zoom_limit(20_000.0, 20_000.0, max).unwrap_err(),
+        "memory limit (1526 MiB, budget 1024 MiB)"
+    );
+    assert!(zoom_limit(16_384.0, 16_384.0, max).is_ok());
 }
 
 /// An SVG larger than the limit is refused before anything is allocated,

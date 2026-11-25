@@ -33,17 +33,17 @@ Background on the rendering crates is in `NOTES.md`.
   the heading, and the view jumps there whenever the heading is appended
   later. An anchor that never appears stays pending silently. An empty
   fragment (`#`) does not scroll to the top.
-- An image file is read whole, with no size limit and no check that it is
-  a regular file: `![x](/dev/zero)` reads until memory runs out, and a FIFO
-  blocks a render worker for good (everything after it never appears).
-- Cancelling the worker pool can miss a worker that is just going to sleep
-  (`Shared::cancel` sets the flag without holding the queue lock); that
-  thread then sleeps forever. A panic inside a worker (mathra, merman,
-  resvg, image) is not caught, so its result never arrives and loading
-  never finishes.
-- Lazy rendering advances only on the vertical adjustment's `changed`
-  signal, not on `value-changed`, so plain scrolling may not render more
-  once GTK has finished measuring the page.
+- The memory budget is enforced on the GUI thread, after results arrive:
+  the render workers do not reserve their bytes before allocating, so while
+  rendering the document can briefly hold up to one graphic per worker
+  over the budget. Pixels shared between graphics (the same formula many
+  times, served from the cache) are counted once per use, so the budget is
+  conservative there. Graphics on or within a screen of the view are never
+  dropped, so a few very large ones there can exceed the budget; a graphic
+  that only needs more than the budget once zoomed in is not refused.
+- The file-type check before reading (no FIFOs or devices) and the open
+  that follows are two steps: a file replaced by a FIFO in between still
+  blocks a render worker.
 - The view's tick callback never stops: the frame clock runs (and every
   table is measured) every frame while a window is open, even when idle.
 - An active search is redone in full (text copy, matching, highlights,
@@ -56,8 +56,6 @@ Background on the rendering crates is in `NOTES.md`.
   GitHub (`Install - Linux` is `install--linux` here, `install---linux` on
   GitHub), so a table of contents copied from GitHub can miss; combining
   marks are dropped too.
-- Relative `href`s inside an SVG image resolve against the working
-  directory rather than the SVG's folder (`resources_dir` is not set).
 - The image cache is never invalidated: an image changed on disk, or one
   that was missing and now exists, shows the old result until restart.
 - Placing each rendered graphic walks every graphic of the document

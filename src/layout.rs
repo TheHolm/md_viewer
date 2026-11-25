@@ -255,3 +255,39 @@ pub fn text_zoom_limit(base_px: f32, scale: f32, max_px: [u32; 2]) -> f64 {
     }
     (f64::from(max_px[1]) / line).max(1.0)
 }
+
+/// How far, in pixels, the span `top..bottom` lies outside the band
+/// `view_top..view_bottom` widened by `margin` on both sides: 0 when they
+/// overlap. Used to keep graphics near the view and drop far ones.
+pub fn distance_from_view(
+    top: f64,
+    bottom: f64,
+    view_top: f64,
+    view_bottom: f64,
+    margin: f64,
+) -> f64 {
+    let (low, high) = (view_top - margin, view_bottom + margin);
+    if bottom < low {
+        low - bottom
+    } else if top > high {
+        top - high
+    } else {
+        0.0
+    }
+}
+
+/// How many window heights above and below the view graphics are kept
+/// (never dropped to save memory, and drawn again ahead of scrolling).
+pub const KEEP_SCREENS: f64 = 1.0;
+
+/// The side of the spinner drawn in a `width` x `height` area while a
+/// graphic is dropped: at most 32 pixels and the shorter side, nothing when
+/// that is under 8 pixels.
+pub fn spinner_size(width: f64, height: f64) -> f64 {
+    let size = width.min(height).min(32.0);
+    if size >= 8.0 {
+        size
+    } else {
+        0.0
+    }
+}

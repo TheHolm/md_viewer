@@ -29,6 +29,17 @@ section for the GitHub Release body.
 - Raster images are no longer enlarged on HiDPI screens (that added no
   detail but multiplied their memory), and a large image used inline in the
   text keeps only the pixels it is drawn with.
+- A document's pictures, formulas and diagrams hold at most 1 GiB of memory:
+  when a document needs more, graphics far from the view are dropped (a
+  spinner of the same size stands in) and drawn again as you scroll back to
+  them. A single graphic needing more than that shows "memory limit" in its
+  place.
+- A document, image or picture referred to by an SVG that is not a regular
+  file (a pipe, a device such as `/dev/zero`) or is larger than 512 MiB is
+  refused instead of hanging or exhausting memory. Pictures inside an SVG
+  file now load relative to the SVG's own folder.
+- A bug in one of the rendering libraries no longer stops a document from
+  finishing loading: the graphic shows "renderer failed" instead.
 
 ### Details
 
@@ -62,6 +73,20 @@ section for the GitHub Release body.
   header bar text.
 - `Math::failure_note` gives the note after a formula's source, now also
   for inline math.
+- `read_limited` (regular files only, at most `MAX_FILE_BYTES` = 512 MiB)
+  reads the document, image files and SVG references; a custom usvg
+  `ImageHrefResolver` resolves those against the SVG's folder, reads nothing
+  for formulas and diagrams, and checks embedded raster headers.
+- Worker pool: `Shared::cancel` sets the flag under the queue lock (a worker
+  about to wait could miss it and sleep forever); panics in a renderer are
+  caught (`render_caught`) and delivered as errors. Lazy rendering also
+  advances on the adjustment's `value-changed`, not only `changed`.
+- Memory: pixels are an `Arc<Vec<u8>>` shared by the cache, the document
+  and the texture (no copies); results are cleared from the parsed document
+  once their block is on the page; cache maps are bounded in bytes. A
+  per-document budget (`DOCUMENT_BUDGET`) drops far graphics
+  (`progressive::pick_drops`, `Session::enforce_budget`), showing an
+  `adw::SpinnerPaintable` until `Session::redraw_near` re-renders them.
 - Tests: heading detection and anchors (several headings per block,
   duplicates, markup, formulas, lists and quotes), fragment decoding, the
   size limit (oversized SVG, formula, diagram and PNG, a PNG bomb, Exif

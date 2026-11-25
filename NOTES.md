@@ -219,7 +219,33 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   `Image::max_zoom` is the largest zoom it fits at, and asked for more it is
   drawn at that zoom, never larger. A raster file is checked from its
   header (Exif orientation applied) before its pixels are decoded, with
-  `image::Limits` as a backstop, so a decompression bomb costs nothing. Diagram labels are measured with the
+  `image::Limits` as a backstop, so a decompression bomb costs nothing.
+  Files are read through `md_viewer::read_limited`: regular files only
+  (checked before opening, so a FIFO cannot block and `/dev/zero` cannot
+  fill memory) and at most `MAX_FILE_BYTES` (512 MiB). This covers the
+  document, image files and the files an SVG file's `<image href>` names;
+  those resolve against the SVG's folder (`svg_options_for`, a custom
+  usvg `ImageHrefResolver`), and formulas and diagrams cannot refer to files
+  at all. Raster images embedded in an SVG (files or `data:` URLs) are
+  checked from their header against the size limit before resvg decodes
+  them.
+- Memory: `Image::pixels` is an `Arc<Vec<u8>>` shared by the cache, the
+  document and the GTK texture (`SharedPixels`, `glib::Bytes::from_owned`,
+  no copy); a block's results are cleared from the parsed document once it
+  is on the page (`progressive::clear_graphics`). The cache maps are also
+  bounded in bytes (`CACHE_BYTES`, 96 MiB each). Each document has a budget
+  of `DOCUMENT_BUDGET` (1 GiB) of pixels on the page: a graphic needing more
+  at 100% is refused ("memory limit (...)"); otherwise, when the page holds
+  more, `Session::enforce_budget` drops the graphics farthest from the view
+  (`progressive::pick_drops`, never within `layout::KEEP_SCREENS` screens of
+  it): their texture is freed and a spinner of the same size stands in
+  (`ScaledTexture::show_spinner`, an `adw::SpinnerPaintable`), so nothing
+  moves. `Session::redraw_near` asks the pool for dropped graphics coming
+  near the view again (`Slot::held`: `Drawn`, `Dropped`, `Requested(run)`; a
+  request from a run cancelled by a zoom is made again). Both run after each
+  poll and, via `schedule_budget`, once idle after the adjustment's
+  `changed`/`value-changed` signals. A zoom re-renders only drawn graphics.
+  The budget does not limit the zoom. Diagram labels are measured with the
   same font files resvg draws them with (merman's `native-fonts`,
   `native_fonts`/`font_files`; merman's built-in estimates if no font files
   can be loaded). `Graphic` names one formula, diagram or image; `Cache` (one
@@ -586,6 +612,8 @@ Things learned the hard way; add to this list when you learn another.
   `keydown ctrl click 4 keyup ctrl` zooms in, `key ctrl+0`); combine with
   `import` screenshots. The automated tests cannot press keys, so zoom and
   the copy button are checked this way.
+- `Session::budget` is the document budget as a field only so the GUI unit
+  test can lower it (a real 1 GiB document would be too heavy for a test).
 - Headless GUI runs: start `Xvfb :77 &` and run with `DISPLAY=:77
   GDK_BACKEND=x11 GSK_RENDERER=cairo`. GTK then warns that it cannot
   acquire a session bus (no `dbus-launch`); that warning is harmless, and
