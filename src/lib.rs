@@ -6,6 +6,7 @@
 //! walks the blocks in order: text blocks are inserted into a text buffer with
 //! one text tag per [`Style`], and tables become grid widgets.
 
+mod casefold;
 pub mod graphics;
 pub mod layout;
 pub mod links;

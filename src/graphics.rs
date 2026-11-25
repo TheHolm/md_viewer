@@ -64,7 +64,8 @@ impl Image {
 pub struct RasterSettings {
     /// The body text size in logical pixels; math is sized relative to it.
     pub font_px: f32,
-    /// The device-pixel scale (2.0 on a HiDPI display).
+    /// The device-pixel scale: 2.0 on a HiDPI display, fractional (1.25,
+    /// 1.5, ...) with fractional scaling.
     pub scale: f32,
     /// The text colour math is drawn in, as RGB.
     pub color: [u8; 3],
@@ -92,21 +93,17 @@ pub const SCREEN_MULTIPLE: u32 = 10;
 pub const FALLBACK_MAX_PX: [u32; 2] = [1920 * SCREEN_MULTIPLE, 1080 * SCREEN_MULTIPLE];
 
 /// The largest a graphic may be on a screen of `width` x `height` logical
-/// pixels at device `scale`: [`SCREEN_MULTIPLE`] times its size in device
-/// pixels. An empty screen size or an invalid scale gives
-/// [`FALLBACK_MAX_PX`].
-pub fn max_px_for(width: i32, height: i32, scale: i32) -> [u32; 2] {
-    let (Ok(width), Ok(height), Ok(scale)) = (
-        u32::try_from(width),
-        u32::try_from(height),
-        u32::try_from(scale),
-    ) else {
-        return FALLBACK_MAX_PX;
-    };
-    if width == 0 || height == 0 || scale == 0 {
+/// pixels at device `scale` (fractional with fractional scaling, e.g.
+/// 1.25): [`SCREEN_MULTIPLE`] times its size in device pixels (rounded to
+/// whole pixels). An empty screen size or an invalid scale (not finite or
+/// not positive) gives [`FALLBACK_MAX_PX`].
+pub fn max_px_for(width: i32, height: i32, scale: f64) -> [u32; 2] {
+    if width <= 0 || height <= 0 || !scale.is_finite() || scale <= 0.0 {
         return FALLBACK_MAX_PX;
     }
-    let side = |pixels: u32| pixels.saturating_mul(scale).saturating_mul(SCREEN_MULTIPLE);
+    // Float to integer casts saturate, so huge values stay at u32::MAX.
+    let side =
+        |pixels: i32| ((f64::from(pixels) * scale).round() as u32).saturating_mul(SCREEN_MULTIPLE);
     [side(width), side(height)]
 }
 
@@ -831,9 +828,29 @@ type SettingsKey = (u32, u32, u32, [u8; 3], [u32; 2]);
 /// What a cached formula is looked up by: source, display flag, settings.
 type MathKey = (String, bool, SettingsKey);
 
-/// What a decoded image is looked up by: path, device scale, body font
-/// size, size limit.
-type ImageKey = (PathBuf, u32, u32, [u32; 2]);
+/// What a decoded image is looked up by: path, the file's stamp, device
+/// scale, body font size, size limit.
+type ImageKey = (PathBuf, Option<FileStamp>, u32, u32, [u32; 2]);
+
+/// What identifies one version of a file for the image cache: its size,
+/// modification time (seconds and nanoseconds since the epoch) and inode.
+/// A file rewritten, replaced or created since it was cached has another
+/// stamp, so it is decoded again.
+pub type FileStamp = (u64, i64, i64, u64);
+
+/// The stamp of the file at `path` as it is now, or `None` when it cannot
+/// be read (missing, for instance; a missing file that appears later then
+/// has a stamp and misses the cache).
+pub fn file_stamp(path: &Path) -> Option<FileStamp> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ino(),
+    ))
+}
 
 /// How many rendered formulas [`Cache`] keeps before it starts over.
 const MATH_CACHE_LIMIT: usize = 4096;
@@ -857,8 +874,8 @@ pub struct Cache {
     math: Mutex<HashMap<MathKey, Rendered>>,
     /// Laid-out diagram SVG (or the layout error) by source.
     diagrams: Mutex<HashMap<String, Result<Arc<String>, String>>>,
-    /// Decoded images by (path, device scale, body font size, size limit),
-    /// at 100% zoom.
+    /// Decoded images by (path, file stamp, device scale, body font size,
+    /// size limit), at 100% zoom.
     images: Mutex<HashMap<ImageKey, Rendered>>,
     /// How many times a formula was typeset or a diagram laid out.
     misses: AtomicUsize,
@@ -911,8 +928,10 @@ impl Cache {
                 rasterize_diagram(&svg?, settings)
             }
             Graphic::Image { path, inline } => {
+                let stamp = file_stamp(path);
                 let key = (
                     path.clone(),
+                    stamp,
                     settings.scale.to_bits(),
                     settings.font_px.to_bits(),
                     settings.max_px,
@@ -923,6 +942,11 @@ impl Cache {
                     None => {
                         self.misses.fetch_add(1, Ordering::Relaxed);
                         let decoded = decode_image(path, settings);
+                        // Results for an older version of the file are
+                        // stale: drop them rather than hold their pixels.
+                        lock(&self.images).retain(|(cached, cached_stamp, ..), _| {
+                            cached != path || *cached_stamp == stamp
+                        });
                         insert_bounded(
                             &self.images,
                             key,
@@ -1357,6 +1381,50 @@ mod tests {
         .join();
         assert!(mutex.is_poisoned());
         assert_eq!(*lock(&mutex), 1);
+    }
+
+    /// An image file changed on disk (or created after it was found
+    /// missing) is decoded again rather than answered from the cache, and
+    /// the entry for its old version is dropped.
+    #[test]
+    fn cache_notices_changed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("picture.png");
+        let cache = Cache::default();
+        let settings = RasterSettings::default();
+        let graphic = Graphic::Image {
+            path: path.clone(),
+            inline: false,
+        };
+        assert!(cache.render(&graphic, &settings).is_err());
+        image::RgbaImage::new(4, 3).save(&path).unwrap();
+        let first = cache.render(&graphic, &settings).unwrap();
+        assert_eq!((first.width, first.height), (4, 3));
+        assert_eq!(cache.render(&graphic, &settings).unwrap(), first);
+        let misses = cache.misses();
+        // A different size, so the stamp differs even within one second.
+        image::RgbaImage::new(7, 5).save(&path).unwrap();
+        let second = cache.render(&graphic, &settings).unwrap();
+        assert_eq!((second.width, second.height), (7, 5));
+        assert_eq!(cache.misses(), misses + 1);
+        let images = lock(&cache.images);
+        assert_eq!(images.len(), 1);
+        assert!(images.keys().all(|key| key.1 == file_stamp(&path)));
+    }
+
+    /// `file_stamp` is `None` for a missing file and changes with the
+    /// file's contents.
+    #[test]
+    fn file_stamp_follows_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        assert_eq!(file_stamp(&path), None);
+        std::fs::write(&path, "a").unwrap();
+        let first = file_stamp(&path);
+        assert!(first.is_some());
+        assert_eq!(file_stamp(&path), first);
+        std::fs::write(&path, "ab").unwrap();
+        assert_ne!(file_stamp(&path), first);
     }
 
     /// The shared cache is one instance.

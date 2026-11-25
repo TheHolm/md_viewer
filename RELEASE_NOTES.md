@@ -54,6 +54,19 @@ section for the GitHub Release body.
   file now load relative to the SVG's own folder.
 - A bug in one of the rendering libraries no longer stops a document from
   finishing loading: the graphic shows "renderer failed" instead.
+- Moving a window to a monitor with another scale redraws its pictures,
+  formulas and diagrams sharp for that monitor, at the same size (as GNOME
+  does for every window); the text you are reading is never zoomed out by
+  the move. With fractional scaling (125%, 150%, ...) graphics are drawn
+  with exactly the pixels needed instead of at 200%, which also saves
+  memory.
+- An image file changed on disk, or one that was missing and now exists, is
+  shown as it is now when the document is reopened or zoomed, instead of
+  as it was when first loaded.
+- A graphic over the document memory limit is drawn as soon as there is
+  room, wherever it is on the page, instead of waiting to be scrolled to.
+- "Ignore case" and smart-case search use full Unicode case folding:
+  `strasse` finds `Straße`, `file` finds `ﬁle`, final `ς` matches `Σ`.
 
 ### Details
 
@@ -131,6 +144,28 @@ section for the GitHub Release body.
   shrinking, no HiDPI enlargement), the zoom ceiling and indicator, a GUI
   session test of the anchors and of the zoom ceiling, and a CLI smoke test
   opening oversized graphics.
+- Monitors: `screen_scale` reads `gdk::Surface::scale` (fractional) rather
+  than the integer `scale_factor`, and `max_px_for` takes it as a float.
+  `DocWindow::follow_monitors` connects the surface's `notify::scale` and
+  `enter-monitor` on realize; `Session::rescale` takes the new scale and
+  limit, works the zoom limit out again from the text and the re-rendered
+  graphics, and restarts the run (`restart_run`, split out of
+  `rerender`). `keep_zoom` makes the window apply a lower limit with
+  `Zoom::set_ceiling_keeping_level` instead of zooming out, until the user
+  zooms; a window finding its first monitor is not a move.
+- The image cache key includes `graphics::file_stamp` (size, mtime,
+  inode), and inserting a new version drops the old one's entry.
+- `Session::redraw_near` asks for limited graphics anywhere, nearest first,
+  as long as they fit in the room left after the near dropped ones.
+- `src/casefold.rs`: the `C`/`F` mappings of Unicode 18.0's
+  `CaseFolding.txt` (generated once), used by `search::fold` instead of
+  `char::to_lowercase`.
+- Tests: file stamps and the cache re-decoding a changed or new file,
+  fractional `max_px_for` and rendering at a fractional scale, the
+  ceiling that keeps the level, a GUI test of rescaling (logical sizes
+  kept, device pixels following whole and fractional scales, no zoom-out
+  on a move, the limit rising again, following the headless monitor), a
+  far limited graphic drawn once there is room, and full case folding.
 
 ## v0.8.0 — Lazy rendering and complete search
 

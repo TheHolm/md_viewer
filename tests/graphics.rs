@@ -89,6 +89,41 @@ fn rasterize_scale() {
     assert_eq!(image.logical_height(), 10.0);
 }
 
+/// A fractional device scale (fractional scaling, e.g. 150%) gives that
+/// many device pixels, rounded up, not the next whole scale: formulas,
+/// diagrams and SVG files keep their logical size within a pixel.
+#[test]
+fn fractional_scale() {
+    let image = rasterize(HALF_RED, 15.0, 1.5).unwrap();
+    assert_eq!((image.width, image.height), (30, 15));
+    assert_eq!(image.logical_width(), 20.0);
+    let one = RasterSettings::default();
+    let fraction = RasterSettings { scale: 1.25, ..one };
+    let math = |settings| render_math("\\frac{a}{b}", true, settings).unwrap();
+    let diagram = |settings| render_mermaid("graph LR; A-->B", settings).unwrap();
+    for (natural, scaled) in [
+        (math(&one), math(&fraction)),
+        (diagram(&one), diagram(&fraction)),
+    ] {
+        assert_eq!(scaled.scale, 1.25);
+        assert!((scaled.logical_width() - natural.logical_width()).abs() <= 1.0);
+        assert!((scaled.logical_height() - natural.logical_height()).abs() <= 1.0);
+        assert!(
+            scaled.width < natural.width * 3 / 2,
+            "{} {}",
+            natural.width,
+            scaled.width
+        );
+        assert!(scaled.width > natural.width);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v.svg");
+    std::fs::write(&path, HALF_RED).unwrap();
+    let svg = decode_image(&path, &fraction).unwrap();
+    assert_eq!((svg.width, svg.height), (25, 13));
+    assert_eq!(svg.scale, 1.25);
+}
+
 /// `em` units resolve to the given font size.
 #[test]
 fn rasterize_em_units() {
@@ -738,18 +773,32 @@ fn assert_too_large<T: std::fmt::Debug>(result: Result<T, String>) {
     }
 }
 
-/// The limit is ten screens in device pixels; an unknown or invalid screen
-/// gives the fallback (ten 1920x1080 screens), and huge values saturate.
+/// The limit is ten screens in device pixels, at a fractional scale too
+/// (rounded to whole pixels); an unknown or invalid screen or scale gives
+/// the fallback (ten 1920x1080 screens), and huge values saturate.
 #[test]
 fn max_px_is_ten_screens() {
     assert_eq!(SCREEN_MULTIPLE, 10);
-    assert_eq!(max_px_for(1920, 1080, 1), [19_200, 10_800]);
-    assert_eq!(max_px_for(1920, 1080, 2), [38_400, 21_600]);
+    assert_eq!(max_px_for(1920, 1080, 1.0), [19_200, 10_800]);
+    assert_eq!(max_px_for(1920, 1080, 2.0), [38_400, 21_600]);
+    assert_eq!(max_px_for(1920, 1080, 1.5), [28_800, 16_200]);
+    assert_eq!(max_px_for(1707, 960, 1.25), [21_340, 12_000]);
     assert_eq!(FALLBACK_MAX_PX, [19_200, 10_800]);
-    for (width, height, scale) in [(0, 1080, 1), (1920, 0, 1), (1920, 1080, 0), (-5, 10, 1)] {
+    for (width, height, scale) in [
+        (0, 1080, 1.0),
+        (1920, 0, 1.0),
+        (1920, 1080, 0.0),
+        (-5, 10, 1.0),
+        (1920, 1080, -1.0),
+        (1920, 1080, f64::NAN),
+        (1920, 1080, f64::INFINITY),
+    ] {
         assert_eq!(max_px_for(width, height, scale), FALLBACK_MAX_PX);
     }
-    assert_eq!(max_px_for(i32::MAX, 1, i32::MAX), [u32::MAX, u32::MAX]);
+    assert_eq!(
+        max_px_for(i32::MAX, 1, f64::from(i32::MAX)),
+        [u32::MAX, u32::MAX]
+    );
 }
 
 /// `zoom_limit` is how far a graphic can be zoomed before reaching the

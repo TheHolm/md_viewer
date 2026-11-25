@@ -31,9 +31,7 @@ Background on the rendering crates is in `NOTES.md`.
 - The memory budget is enforced on the GUI thread, after results arrive:
   the render workers do not reserve their bytes before allocating, so while
   rendering the document can briefly hold up to one graphic per worker
-  over the budget (accepted as not a problem). A graphic shown as over the
-  document memory limit keeps saying so while far from the view; it is
-  tried again only once it is near the view and there is room.
+  over the budget (accepted as not a problem).
 - A large image used inline several times is shrunk separately for each
   use, so each holds its own (small) pixel buffer.
 - A UTF-8 byte-order mark at the start of a file is not stripped, so the
@@ -44,25 +42,23 @@ Background on the rendering crates is in `NOTES.md`.
   GitHub (`Install - Linux` is `install--linux` here, `install---linux` on
   GitHub), so a table of contents copied from GitHub can miss; combining
   marks are dropped too.
-- The image cache is never invalidated: an image changed on disk, or one
-  that was missing and now exists, shows the old result until restart.
+- An image file changed on disk shows the change only when the document is
+  reopened or zoomed (nothing watches the file), and a change to a file an
+  SVG image refers to (`<image href>`) is not noticed at all until restart.
 - Placing each rendered graphic walks every graphic of the document
   (`progressive::place`), quadratic in the number of graphics.
 - Clickable table-cell labels hold strong references to themselves through
   their own controllers, and each window's zoom CSS provider is never
   removed from the display, so both leak a little per closed window.
 - In regex mode, `.`/`\W`/`\S` match the placeholder character of embedded
-  objects (tables, code cards, pictures), inflating the match count. Ignore
-  case lowercases rather than case-folds (`ß` does not match `ss`).
+  objects (tables, code cards, pictures), inflating the match count. Regex
+  mode's `(?i)` uses the regex crate's simple case folding (`ß` does not
+  match `ss` there, unlike in the other modes).
 - Only mouse-wheel scrolling releases the "hold the top line" after a zoom;
   keyboard and scrollbar scrolling are pulled back while it lasts.
 - The window's key handler takes Escape, `n`, `N` and `/` from the error
   dialog and popovers; a double click on a link in a table cell or on a
   linked picture opens it twice.
-- The device scale (and the screen size the graphics limit comes from) is
-  read when a document starts; the limit is re-read at every zoom, but the
-  scale is not, so moving a window to a monitor with another scale leaves
-  graphics blurry or oversized until it is reopened.
 - An image in a table cell that cannot be drawn (missing, too large, ...)
   shows `[image: <alt>]` without the reason.
 
@@ -112,6 +108,11 @@ Background on the rendering crates is in `NOTES.md`.
   its default application) is not exercised by the tests, to launch
   nothing; the tests check that a dangerous file shows the dialog with
   Cancel as the default, and that nothing else is launched.
+- Moving a window to another monitor (the surface's `notify::scale` and
+  `enter-monitor` signals) is not tested: headless X has one monitor and
+  one scale. The GUI unit tests call `Session::rescale` directly (whole and
+  fractional scales, a lower and a higher limit) and check following the
+  headless monitor once.
 - A real window resize is not tested (headless X without a window manager
   does not resize windows); the tests check that the width signal wakes the
   frame callback.

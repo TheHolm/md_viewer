@@ -528,6 +528,11 @@ struct Session {
     zoom_limit: Cell<f64>,
     /// True when `zoom_limit` was lowered and the window has not been told.
     limit_dirty: Cell<bool>,
+    /// True after the window moved to a monitor with another scale (see
+    /// [`Session::rescale`]) until the user next changes the zoom: while
+    /// set, a lower zoom limit stops zooming in further but never zooms
+    /// the window out.
+    keep_zoom: Cell<bool>,
     /// The bytes of pixels the graphics on the page hold (see
     /// [`Session::enforce_budget`]).
     held_bytes: Cell<usize>,
@@ -539,8 +544,10 @@ struct Session {
     /// How many times a graphic was drawn, numbering them for the budget
     /// (newest first when limiting).
     arrivals: Cell<u64>,
-    /// Tells the window the document's new zoom limit.
-    limit_changed: Box<dyn Fn(f64)>,
+    /// Tells the window the document's new zoom limit, and whether it must
+    /// keep its zoom level even if that is above the limit (see
+    /// `keep_zoom`).
+    limit_changed: Box<dyn Fn(f64, bool)>,
     /// A block (searched before it was rendered) to scroll to once it is on
     /// the page.
     pending_scroll: RefCell<Option<usize>>,
@@ -984,39 +991,52 @@ impl Session {
 
     /// Asks again for the dropped graphics that are now on or near the
     /// view (within [`layout::KEEP_SCREENS`] screens), so they are drawn
-    /// before they are seen, and for graphics over the document limit once
-    /// they fit. A request from an earlier run (since cancelled by a zoom)
-    /// is made again.
+    /// before they are seen, and for graphics over the document limit
+    /// wherever they are, as soon as they fit in the room left once the
+    /// near ones are counted (the nearest first). A request from an earlier
+    /// run (since cancelled by a zoom) is made again.
     fn redraw_near(self: &Rc<Self>) {
         if self.rezoom.borrow().is_some() {
             return;
         }
         let generation = self.generation.get();
         let mut room = self.budget.get().saturating_sub(self.held_bytes.get());
-        let ids: Vec<usize> = self
-            .slots
-            .borrow()
-            .iter()
-            .enumerate()
-            .filter_map(|(id, slot)| {
-                let slot = slot.as_ref()?;
-                let wanted = match slot.held.get() {
+        let mut ids = Vec::new();
+        let mut limited = Vec::new();
+        {
+            let slots = self.slots.borrow();
+            for (id, slot) in slots.iter().enumerate() {
+                let Some(slot) = slot else {
+                    continue;
+                };
+                let again = match slot.held.get() {
                     Held::Drawn => false,
                     Held::Dropped => true,
                     Held::Requested(asked) => asked != generation,
-                    // Only once it would fit, so it is not refused again.
-                    Held::Limited => room >= slot.size.get(),
+                    Held::Limited => {
+                        limited.push((self.distance_from_view(slot.offset), id, slot.size.get()));
+                        false
+                    }
                 };
-                if !(wanted && self.distance_from_view(slot.offset) == 0.0) {
-                    return None;
+                if again && self.distance_from_view(slot.offset) == 0.0 {
+                    room = room.saturating_sub(slot.size.get());
+                    ids.push(id);
                 }
-                if slot.held.get() == Held::Limited {
-                    room -= slot.size.get();
+            }
+            // Only once it fits, so it is not refused again.
+            limited.sort_by(|a, b| a.0.total_cmp(&b.0));
+            for (_, id, size) in limited {
+                if room >= size {
+                    room -= size;
+                    ids.push(id);
                 }
-                slot.held.set(Held::Requested(generation));
-                Some(id)
-            })
-            .collect();
+            }
+            for id in &ids {
+                if let Some(Some(slot)) = slots.get(*id) {
+                    slot.held.set(Held::Requested(generation));
+                }
+            }
+        }
         let jobs = ids.into_iter().map(|id| self.jobs[id].clone()).collect();
         self.submit_batch(jobs);
     }
@@ -1054,7 +1074,7 @@ impl Session {
     /// may zoom out at once, which re-renders and restretches the graphics).
     fn report_limit(&self) {
         if self.limit_dirty.replace(false) {
-            (self.limit_changed)(self.zoom_limit.get());
+            (self.limit_changed)(self.zoom_limit.get(), self.keep_zoom.get());
         }
     }
 
@@ -1583,6 +1603,8 @@ impl Session {
     /// the rendering run stops, and a new one starts once zooming has
     /// settled for [`REZOOM_DELAY_MS`].
     fn zoom_to(self: &Rc<Self>, level: f32) {
+        // The user chose a zoom: lower limits may zoom out again.
+        self.keep_zoom.set(false);
         let ratio = f64::from(level) / f64::from(self.shown_zoom.get());
         self.shown_zoom.set(level);
         for slot in self.slots.borrow().iter().flatten() {
@@ -1609,17 +1631,59 @@ impl Session {
         self.poll_regularly();
     }
 
-    /// Re-renders the graphics of the current run at the new zoom: the ones
-    /// already submitted (those on the page plus those waiting below it), in
-    /// the order visible first, then below, then above the window. Graphics
-    /// beyond the frontier are left for later, rendered lazily when scrolled
-    /// near.
+    /// Re-renders the graphics of the current run at the new zoom (with the
+    /// size limit of the monitor the window is on now), see
+    /// [`Session::restart_run`].
     fn rerender(self: &Rc<Self>) {
         let mut settings = self.settings.get();
         settings.zoom = self.shown_zoom.get();
         // The window may have moved to another monitor since.
         settings.max_px = screen_max_px(&self.view);
         self.settings.set(settings);
+        self.restart_run();
+    }
+
+    /// Follows a move to a monitor with another device `scale` (fractional
+    /// with fractional scaling) or size limit `max_px`; does nothing if
+    /// neither changed. As GNOME does for every window, graphics keep their
+    /// logical size: the ones drawn (and those not on the page yet) are
+    /// rendered again with as many device pixels as the new scale needs.
+    /// The zoom limit is worked out again from the text and the graphics
+    /// as they are redrawn, and it can rise; while it is below the current
+    /// zoom, the window is not zoomed out (see `keep_zoom`). Returns true if
+    /// anything changed.
+    ///
+    /// `keep` is false when the window only now found its first monitor:
+    /// the limit then applies as usual, zooming out if needed.
+    fn rescale(self: &Rc<Self>, scale: f32, max_px: [u32; 2], keep: bool) -> bool {
+        let mut settings = self.settings.get();
+        if settings.scale == scale && settings.max_px == max_px {
+            return false;
+        }
+        settings.scale = scale;
+        settings.max_px = max_px;
+        self.settings.set(settings);
+        self.keep_zoom.set(keep);
+        self.zoom_limit.set(layout::text_zoom_limit(
+            settings.font_px,
+            settings.scale,
+            settings.max_px,
+        ));
+        self.limit_dirty.set(true);
+        self.report_limit();
+        // A zoom still settling re-renders with these settings shortly.
+        if self.rezoom.borrow().is_none() {
+            self.restart_run();
+        }
+        true
+    }
+
+    /// Starts a new rendering run with the current settings, cancelling the
+    /// one in progress: the graphics already submitted (those on the page
+    /// plus those waiting below it) are rendered again, in the order
+    /// visible first, then below, then above the window. Graphics beyond
+    /// the frontier are left for later, rendered lazily when scrolled near.
+    fn restart_run(self: &Rc<Self>) {
         let frontier = self.frontier.get();
         let unshown = self.progress.borrow_mut().reset_unshown(frontier);
         let shown: Vec<(usize, i32)> = self
@@ -2315,6 +2379,11 @@ struct DocWindow {
     /// The find bar's matching mode, kept for the window (and its future
     /// documents); a new window starts with smart case.
     mode: Cell<SearchMode>,
+    /// Whether the window re-renders its document for a new monitor (see
+    /// [`DocWindow::follow_monitor`]); off in the unit tests.
+    follows_monitor: Cell<bool>,
+    /// Whether the window was on a known monitor when last checked.
+    on_monitor: Cell<bool>,
 }
 
 impl DocWindow {
@@ -2424,6 +2493,10 @@ impl DocWindow {
             search_next,
             search_mode_button,
             mode: Cell::new(SearchMode::SmartCase),
+            // The unit tests render with fixed settings and call
+            // `Session::rescale` themselves.
+            follows_monitor: Cell::new(!cfg!(test)),
+            on_monitor: Cell::new(false),
         });
         add_css(
             &this.zoom_css,
@@ -2440,12 +2513,41 @@ impl DocWindow {
         this.window.add_action(&open);
         this.install_zoom();
         this.install_search();
+        this.follow_monitors();
         this.window.connect_close_request(|window| {
             window.remove_action("open");
             glib::Propagation::Proceed
         });
         this.window.present();
         this
+    }
+
+    /// Follows the window's monitor: once the window has a surface, a change
+    /// of its scale (moving to a monitor with another scale) or entering
+    /// another monitor re-renders the document's graphics for it (see
+    /// [`DocWindow::follow_monitor`]).
+    fn follow_monitors(self: &Rc<Self>) {
+        let state = Rc::downgrade(self);
+        self.window.connect_realize(move |window| {
+            let Some(surface) = window.surface() else {
+                return;
+            };
+            let weak = state.clone();
+            surface.connect_scale_notify(move |_| {
+                if let Some(state) = weak.upgrade() {
+                    state.follow_monitor();
+                }
+            });
+            let weak = state.clone();
+            surface.connect_enter_monitor(move |_, _| {
+                if let Some(state) = weak.upgrade() {
+                    state.follow_monitor();
+                }
+            });
+            if let Some(state) = state.upgrade() {
+                state.follow_monitor();
+            }
+        });
     }
 
     /// Installs the find action (Ctrl+F), the mode popover and the key
@@ -2643,11 +2745,43 @@ impl DocWindow {
         }
     }
 
-    /// Lowers the zoom ceiling to `limit`, the largest zoom the document's
+    /// Sets the zoom ceiling to `limit`, the largest zoom the document's
     /// graphics allow; if the window is zoomed in further, it zooms out to
-    /// the ceiling (keeping the line at the top of the window in place).
-    fn limit_zoom(&self, limit: f64) {
-        self.change_zoom(|zoom| zoom.set_ceiling(limit));
+    /// the ceiling (keeping the line at the top of the window in place),
+    /// unless `keep` is set (after a move to a monitor with another scale),
+    /// in which case the ceiling stops at the current level instead.
+    fn limit_zoom(&self, limit: f64, keep: bool) {
+        if keep {
+            let mut zoom = self.zoom.get();
+            zoom.set_ceiling_keeping_level(limit);
+            self.zoom.set(zoom);
+            self.update_zoom_indicator();
+        } else {
+            self.change_zoom(|zoom| zoom.set_ceiling(limit));
+        }
+    }
+
+    /// Re-renders the current document's graphics for the scale and size
+    /// limit of the monitor the window is on now, if either changed (see
+    /// [`Session::rescale`]). Only a move from a known monitor keeps the
+    /// zoom level: the window finding its first monitor (the document may
+    /// have started with the fallback size limit) is not a move.
+    fn follow_monitor(&self) {
+        if !self.follows_monitor.get() {
+            return;
+        }
+        let was_on_monitor = self.on_monitor.get();
+        let session = self.session.borrow().clone();
+        if let Some(session) = session {
+            self.on_monitor.set(window_monitor(&session.view).is_some());
+            session.rescale(
+                screen_scale(&session.view),
+                screen_max_px(&session.view),
+                was_on_monitor,
+            );
+        } else {
+            self.on_monitor.set(window_monitor(&self.window).is_some());
+        }
     }
 
     /// Shows the zoom percentage in the header bar, or hides it at 100%.
@@ -2874,9 +3008,9 @@ impl DocWindow {
         };
         let limit_changed = {
             let window = Rc::downgrade(self);
-            Box::new(move |limit| {
+            Box::new(move |limit, keep| {
                 if let Some(window) = window.upgrade() {
-                    window.limit_zoom(limit);
+                    window.limit_zoom(limit, keep);
                 }
             })
         };
@@ -2923,6 +3057,7 @@ impl DocWindow {
             heading_blocks,
             zoom_limit: Cell::new(f64::INFINITY),
             limit_dirty: Cell::new(false),
+            keep_zoom: Cell::new(false),
             held_bytes: Cell::new(0),
             budget: Cell::new(graphics::DOCUMENT_BUDGET),
             budget_pending: Cell::new(false),
@@ -3036,14 +3171,14 @@ impl DocWindow {
     }
 
     /// The settings graphics are rendered with for `view`: the window's
-    /// text size, the display's scale factor, the theme's text colour and
-    /// the window's zoom.
+    /// text size, the display's (possibly fractional) scale, the theme's
+    /// text colour and the window's zoom.
     fn raster_settings(&self, view: &gtk4::TextView) -> RasterSettings {
         let color = view.color();
         let channel = layout::color_channel;
         RasterSettings {
             font_px: self.base_px,
-            scale: view.scale_factor().max(1) as f32,
+            scale: screen_scale(view),
             color: [
                 channel(color.red()),
                 channel(color.green()),
@@ -3317,21 +3452,45 @@ fn label_link_at(label: &gtk4::Label, links: &[LabelLink], x: f64, y: f64) -> Op
         .map(|link| link.dest.clone())
 }
 
+/// The device scale of the window `widget` is in: the surface's fractional
+/// scale (1.25, 1.5, ... with fractional scaling; GTK's integer scale factor
+/// rounds those up to 2), or the widget's scale factor before the window has
+/// a surface; never below 1.
+fn screen_scale(widget: &impl IsA<gtk4::Widget>) -> f32 {
+    let scale = widget
+        .native()
+        .and_then(|native| native.surface())
+        .map_or_else(
+            || f64::from(widget.scale_factor()),
+            |surface| surface.scale(),
+        );
+    if scale.is_finite() {
+        scale.max(1.0) as f32
+    } else {
+        1.0
+    }
+}
+
+/// The monitor (most of) the window `widget` is in is shown on, if known.
+fn window_monitor(widget: &impl IsA<gtk4::Widget>) -> Option<gdk::Monitor> {
+    widget
+        .native()
+        .and_then(|native| native.surface())
+        .and_then(|surface| surface.display().monitor_at_surface(&surface))
+}
+
 /// The size limit for graphics shown in `widget`: [`graphics::SCREEN_MULTIPLE`]
 /// times the monitor its window is on, in device pixels, or
 /// [`graphics::FALLBACK_MAX_PX`] before the window is on a monitor.
 fn screen_max_px(widget: &impl IsA<gtk4::Widget>) -> [u32; 2] {
-    let monitor = widget
-        .native()
-        .and_then(|native| native.surface())
-        .and_then(|surface| {
-            let display = surface.display();
-            display.monitor_at_surface(&surface)
-        });
-    match monitor {
+    match window_monitor(widget) {
         Some(monitor) => {
             let geometry = monitor.geometry();
-            graphics::max_px_for(geometry.width(), geometry.height(), widget.scale_factor())
+            graphics::max_px_for(
+                geometry.width(),
+                geometry.height(),
+                f64::from(screen_scale(widget)),
+            )
         }
         None => graphics::FALLBACK_MAX_PX,
     }
@@ -4465,6 +4624,176 @@ mod tests {
             .iter()
             .flatten()
             .all(|slot| slot.texture.message().is_none()));
+        window.window.close();
+        limited_far_checks(app);
+    }
+
+    /// Graphics over the document limit are retried wherever they are
+    /// (part of [`gtk_helpers`]): with the view scrolled far below them,
+    /// they stay limited (and are not asked for again) while there is no
+    /// room, and are drawn without scrolling back once there is.
+    fn limited_far_checks(app: &adw::Application) {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let mut markdown = String::new();
+        for i in 0..3 {
+            let path = dir.path().join(format!("p{i}.png"));
+            image::RgbaImage::from_pixel(100, 50, image::Rgba([120, 0, 0, 255]))
+                .save(&path)
+                .expect("write picture");
+            markdown += &format!("![p{i}](p{i}.png)\n\n");
+        }
+        for line in 0..400 {
+            markdown += &format!("Filler {line}\n\n");
+        }
+        let document = dir.path().join("doc.md");
+        let mut blocks = md_viewer::render(&markdown);
+        md_viewer::resolve_images(&mut blocks, &document);
+        let window = DocWindow::new(app);
+        let session = window.show_document(&document, blocks);
+        let picture_bytes = 100 * 50 * 4;
+        session.budget.set(picture_bytes);
+        session.start(RasterSettings::default());
+        settle(&session);
+        session.render_to(usize::MAX);
+        settle(&session);
+        let states = || {
+            session
+                .slots
+                .borrow()
+                .iter()
+                .flatten()
+                .map(|slot| slot.held.get())
+                .collect::<Vec<_>>()
+        };
+        let limited = |states: &[Held]| states.iter().filter(|h| **h == Held::Limited).count();
+        assert_eq!(limited(&states()), 2, "{:?}", states());
+        // Scroll to the end, far from the pictures.
+        let end = session.view.buffer().end_iter();
+        let (top, _) = session.view.line_yrange(&end);
+        session.scrolled.vadjustment().set_value(f64::from(top));
+        settle(&session);
+        let offset = session.slots.borrow()[0].as_ref().expect("first").offset;
+        assert!(session.distance_from_view(offset) > 0.0);
+        // No room: still limited, not asked for again.
+        session.schedule_budget();
+        settle(&session);
+        assert_eq!(limited(&states()), 2, "{:?}", states());
+        // Room for all three: drawn where they are.
+        session.budget.set(3 * picture_bytes);
+        session.schedule_budget();
+        settle(&session);
+        assert!(
+            states().iter().all(|held| *held == Held::Drawn),
+            "{:?}",
+            states()
+        );
+        assert!(session.distance_from_view(offset) > 0.0);
+        window.window.close();
+        rescale_checks(app);
+    }
+
+    /// Moving to a monitor with another scale (part of [`gtk_helpers`];
+    /// `Session::rescale` is called directly, as headless X has one
+    /// monitor): graphics keep their logical size while their device pixels
+    /// follow the new, possibly fractional, scale (a raster image keeps its
+    /// file's pixels); the same values again change nothing; a zoom limit
+    /// that drops below the current zoom stops zooming in without zooming
+    /// the window out, until the user zooms.
+    fn rescale_checks(app: &adw::Application) {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        std::fs::write(
+            dir.path().join("v.svg"),
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"50\">\
+             <rect width=\"100\" height=\"50\" fill=\"teal\"/></svg>",
+        )
+        .expect("write SVG");
+        image::RgbaImage::from_pixel(100, 50, image::Rgba([9, 9, 9, 255]))
+            .save(dir.path().join("r.png"))
+            .expect("write picture");
+        let document = dir.path().join("doc.md");
+        let mut blocks = md_viewer::render("Formula $x^2$ here.\n\n![v](v.svg)\n\n![r](r.png)\n");
+        md_viewer::resolve_images(&mut blocks, &document);
+        let window = DocWindow::new(app);
+        let session = window.show_document(&document, blocks);
+        session.start(RasterSettings::default());
+        settle(&session);
+        let sizes = || {
+            session
+                .slots
+                .borrow()
+                .iter()
+                .flatten()
+                .map(|slot| {
+                    (
+                        slot.texture.intrinsic_width(),
+                        slot.texture.intrinsic_height(),
+                        slot.size.get(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = sizes();
+        assert_eq!(before.len(), 3);
+        assert_eq!(before[1], (100, 50, 100 * 50 * 4));
+        assert_eq!(before[2], (100, 50, 100 * 50 * 4));
+        let same_logical = |now: &[(i32, i32, usize)]| {
+            for (old, new) in before.iter().zip(now) {
+                assert!(old.0.abs_diff(new.0) <= 1, "{before:?} {now:?}");
+                assert!(old.1.abs_diff(new.1) <= 1, "{before:?} {now:?}");
+            }
+        };
+        let max_px = graphics::FALLBACK_MAX_PX;
+        assert!(session.rescale(2.0, max_px, true));
+        settle(&session);
+        let double = sizes();
+        same_logical(&double);
+        assert_eq!(double[1].2, 200 * 100 * 4);
+        assert_eq!(double[2].2, 100 * 50 * 4);
+        assert!(double[0].2 > 3 * before[0].2);
+        // Fractional: 1.5 times the pixels on each side, not 2.
+        assert!(session.rescale(1.5, max_px, true));
+        settle(&session);
+        let fractional = sizes();
+        same_logical(&fractional);
+        assert_eq!(fractional[1].2, 150 * 75 * 4);
+        assert_eq!(fractional[2].2, 100 * 50 * 4);
+        assert!(fractional[0].2 < double[0].2);
+        assert!(!session.rescale(1.5, max_px, true));
+        assert_eq!(session.settings.get().scale, 1.5);
+        // At 200% on a monitor whose limit allows only 150% for the
+        // pictures, the window keeps its zoom; zooming in is refused.
+        window.change_zoom(|zoom| zoom.set(2.0));
+        settle(&session);
+        assert!(session.rescale(2.0, [300, 1_000_000], true));
+        settle(&session);
+        assert!((session.zoom_limit.get() - 1.5).abs() < 1e-3);
+        assert!((window.zoom.get().level() - 2.0).abs() < 1e-3);
+        assert!((window.zoom.get().max() - 2.0).abs() < 1e-3);
+        assert_eq!(window.zoom_indicator.label().as_deref(), Some("200% (max)"));
+        window.change_zoom(Zoom::zoom_in);
+        assert!((window.zoom.get().level() - 2.0).abs() < 1e-3);
+        // The user zooming out ends that: limits apply as usual again.
+        window.change_zoom(Zoom::zoom_out);
+        assert!(!session.keep_zoom.get());
+        assert!((window.zoom.get().level() - 1.75).abs() < 1e-3);
+        settle(&session);
+        // A monitor that allows more raises the limit again.
+        assert!(session.rescale(1.0, max_px, true));
+        settle(&session);
+        assert!(session.zoom_limit.get() > 2.0);
+        // Without `keep` (the window finding its first monitor), a lower
+        // limit zooms out as usual.
+        assert!(session.rescale(1.0, [150, 1_000_000], false));
+        settle(&session);
+        assert!((window.zoom.get().level() - 1.5).abs() < 1e-3);
+        // Following the real (headless) monitor: its scale and size limit
+        // are taken, and the window is then known to be on a monitor.
+        window.follows_monitor.set(true);
+        window.follow_monitor();
+        settle(&session);
+        assert!(window.on_monitor.get());
+        assert_eq!(session.settings.get().max_px, screen_max_px(&session.view));
+        assert_eq!(session.settings.get().scale, screen_scale(&session.view));
         window.window.close();
     }
 }

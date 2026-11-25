@@ -175,3 +175,31 @@ fn zoom_css() {
     );
     assert_eq!(css("x", 14.0, 1.0), ".x { font-size: 14.00px; }");
 }
+
+/// `set_ceiling_keeping_level` never zooms out: a ceiling below the level
+/// stops at the level (zooming in is refused, zooming out works, and the
+/// indicator says "(max)"); one above it is taken as is, and can rise again.
+#[test]
+fn ceiling_keeping_level() {
+    let mut zoom = Zoom::default();
+    zoom.set(2.0);
+    zoom.set_ceiling_keeping_level(1.5);
+    assert_eq!(zoom.level(), 2.0);
+    assert_eq!(zoom.max(), 2.0);
+    assert!(zoom.at_max());
+    assert_eq!(zoom.indicator().as_deref(), Some("200% (max)"));
+    assert!(!zoom.zoom_in());
+    assert_eq!(zoom.level(), 2.0);
+    assert!(zoom.zoom_out());
+    assert_eq!(zoom.level(), 1.75);
+    zoom.set_ceiling_keeping_level(2.5);
+    assert_eq!(zoom.max(), 2.5);
+    assert!(zoom.zoom_in());
+    zoom.set_ceiling_keeping_level(f64::NAN);
+    assert_eq!(zoom.max(), MAX);
+    zoom.set_ceiling_keeping_level(0.2);
+    assert_eq!(zoom.max(), zoom.level());
+    zoom.set(1.0);
+    zoom.set_ceiling_keeping_level(0.2);
+    assert_eq!(zoom.max(), 1.0);
+}

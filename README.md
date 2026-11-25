@@ -202,4 +202,7 @@ Planned features. Known bugs are listed in `BUGS.md`.
 * Reload a document when it changes on disk.
 * An error popup instead of a message on STDERR for a bad `FILE` argument.
 * Remember the zoom level between runs.
+* An option (possibly a config setting) to keep pictures the same physical
+  size on monitors with different DPI, from the monitor's size in
+  millimetres; today they keep their logical size, as GNOME does.
 * Package as Flatpak and publish on Flathub.

@@ -211,7 +211,7 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   `render_document`, which fills in every graphic of a rendered document one
   after another. `rasterize` also collects every SVG text node into
   `Image::labels` (usvg expands `<use>`, so a diagram's labels are found at
-  their drawn positions); math clears them because it draws outlines. `RasterSettings` carries the text size, device scale, text
+  their drawn positions); math clears them because it draws outlines. `RasterSettings` carries the text size, device scale (fractional with fractional scaling), text
   colour, zoom (math is typeset at `font_px * zoom`, diagrams drawn
   `zoom` times their natural size) and the size limit `max_px`.
   The size limit: nothing is ever drawn larger than `SCREEN_MULTIPLE` (10)
@@ -289,8 +289,9 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   widgets.
 - `src/search.rs` (`md_viewer::search`) - the find bar's matching, pure
   and tested: `SearchMode` (smart case, ignore case, regex), `Matcher`
-  (a query compiled once; `find` returns byte ranges; Unicode case
-  folding maps each folded byte back to its source character, and
+  (a query compiled once; `find` returns byte ranges; Unicode full case
+  folding, from the table in `src/casefold.rs`, maps each folded byte back
+  to its source character, and
   zero-width regex matches are skipped), `char_ranges` (byte to
   character-offset ranges for the text buffer) and the match navigation
   helpers (`next_index`, `first_at_or_after`).
@@ -657,6 +658,39 @@ Things learned the hard way; add to this list when you learn another.
   The budget is planned from an idle callback after layout (`schedule_budget`),
   never right after appending: lines not yet laid out report positions
   that make everything look near the view.
+- Graphics over the document limit (`Held::Limited`) are asked for again
+  wherever they are on the page as soon as they fit in the room left
+  (`Session::redraw_near`, nearest first, after counting the dropped
+  graphics near the view that are being redrawn), so the message is only
+  shown while the budget really is full.
+- The image cache key includes the file's `graphics::file_stamp` (size,
+  mtime, inode; `None` when missing), taken at each lookup, so a changed or
+  newly created image file is decoded again on reopen or the next zoom, and
+  the entry for its old version is removed. A file an SVG file refers to is
+  not stamped.
+- Case-insensitive search uses Unicode full case folding: `src/casefold.rs`
+  is the `C` and `F` lines of the UCD's `CaseFolding.txt`, generated once
+  (one `(char, &str)` pair per line, sorted, binary-searched; a character
+  not listed folds to itself). Do not mix it with `char::to_lowercase`:
+  folding maps Cherokee small letters to the capitals, the opposite of
+  lowercasing, so a mix would never match them. To update, regenerate the
+  table from a newer `CaseFolding.txt` (fetched by hand, outside the
+  viewer) and update the version in its header.
+- Monitors and scales (as GNOME does it): on Wayland each monitor has its
+  own scale (100%/200% by default, 125%/150%/175% with fractional scaling)
+  and a window keeps its logical size on every monitor; a window across two
+  monitors gets the scale of the one it is mostly on. X11 has one global
+  scale. GTK's `Widget::scale_factor` rounds a fractional scale up (1.25 and
+  1.5 both give 2) and only notifies when that integer changes, so the
+  viewer reads `gdk::Surface::scale` (`screen_scale`) and follows the
+  surface's `notify::scale` and `enter-monitor` (`DocWindow::follow_monitor`,
+  connected on realize). `Session::rescale` keeps every graphic's logical
+  size and re-renders with the new device pixels, works the zoom limit out
+  again (it can rise), and does not zoom the window out when the new limit
+  is below the zoom (`Zoom::set_ceiling_keeping_level`, until the user next
+  zooms); the window finding its first monitor is not a move and zooms out
+  as usual. The unit tests turn following off (`follows_monitor`) and call
+  `rescale` directly; a real monitor move is only checked by hand.
 - `read_limited` checks the path, opens with `O_NONBLOCK` (a file swapped
   for a FIFO cannot block the open) and checks the opened file again.
 - `Session::budget` is the document budget as a field only so the GUI unit

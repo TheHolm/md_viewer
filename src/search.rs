@@ -219,23 +219,30 @@ fn literal_ranges(text: &str, query: &str) -> Vec<Range<usize>> {
         .collect()
 }
 
-/// Lowercases `text` (with Unicode case folding) and, for each byte of the
-/// result, the byte offset in `text` of the character it came from. A
-/// character that lowercases to several characters (like `ß` -> `ss`) maps
-/// each of them to the same original offset.
+/// Case-folds `text` with Unicode full case folding (see
+/// [`crate::casefold`]) and, for each byte of the result, the byte offset in
+/// `text` of the character it came from. A character that folds to several
+/// characters (like `ß` -> `ss`) maps each of them to the same original
+/// offset.
 fn fold(text: &str) -> (String, Vec<usize>) {
     let mut folded = String::new();
     let mut map = Vec::new();
     for (offset, character) in text.char_indices() {
-        for lower in character.to_lowercase() {
-            let start = folded.len();
-            folded.push(lower);
-            for _ in start..folded.len() {
-                map.push(offset);
-            }
+        match fold_char(character) {
+            Some(folding) => folded.push_str(folding),
+            None => folded.push(character),
         }
+        map.resize(folded.len(), offset);
     }
     (folded, map)
+}
+
+/// What `character` case-folds to, or `None` when it folds to itself.
+fn fold_char(character: char) -> Option<&'static str> {
+    crate::casefold::FOLDS
+        .binary_search_by_key(&character, |(from, _)| *from)
+        .ok()
+        .map(|index| crate::casefold::FOLDS[index].1)
 }
 
 /// Finds the case-insensitive matches of `folded_query` in `text`, folding
@@ -319,9 +326,9 @@ mod tests {
         assert!(!has_uppercase("123 λ"));
     }
 
-    /// `fold` lowercases every character and maps each byte of the result
+    /// `fold` case-folds every character and maps each byte of the result
     /// back to the byte of the original character it came from, including a
-    /// character that lowercases to several characters.
+    /// character that folds to several characters.
     #[test]
     fn fold_maps_back_to_source() {
         let (folded, map) = fold("aλİ");
@@ -340,9 +347,56 @@ mod tests {
     /// multi-byte character in half.
     #[test]
     fn fold_ranges_whole_characters() {
-        assert_eq!(fold_ranges("Straße", "straße"), vec![0..7]);
+        assert_eq!(fold_ranges("Straße", &fold("straße").0), vec![0..7]);
         assert_eq!(fold_ranges("İ", "i"), vec![0..2]);
         assert_eq!(fold_ranges("aaaaa", "aa"), vec![0..2, 2..4]);
+    }
+
+    /// The case-folding table is sorted by character with no repeats (so
+    /// it can be binary-searched), never maps a character to itself, and
+    /// folding is stable: what a character folds to folds to itself.
+    #[test]
+    fn casefold_table_is_well_formed() {
+        let table = crate::casefold::FOLDS;
+        assert!(table.len() > 1000);
+        assert!(table.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        for (from, to) in table {
+            assert_ne!(to.chars().collect::<Vec<_>>(), [*from]);
+            assert_eq!(fold(to).0, *to, "{from:?}");
+        }
+    }
+
+    /// Full case folding matches what lowercasing alone would miss: `ß`
+    /// and `ẞ` with `ss`, ligatures with their letters, final and medial
+    /// sigma, the long s, the micro sign and Cherokee small letters with
+    /// their capitals; every range covers whole original characters.
+    #[test]
+    fn fold_ranges_use_full_case_folding() {
+        assert_eq!(fold_ranges("Straße", &fold("strasse").0), vec![0..7]);
+        assert_eq!(fold_ranges("STRASSE", &fold("straße").0), vec![0..7]);
+        assert_eq!(fold_ranges("GROẞ", &fold("gross").0), vec![0..6]);
+        assert_eq!(fold_ranges("ﬁle", &fold("file").0), vec![0..5]);
+        assert_eq!(fold_ranges("file", &fold("ﬁ").0), vec![0..2]);
+        assert_eq!(fold_ranges("λόγος", &fold("ΛΌΓΟΣ").0), vec![0..10]);
+        assert_eq!(fold_ranges("ſun", &fold("sun").0), vec![0..4]);
+        assert_eq!(fold_ranges("5µm", &fold("μ").0), vec![1..3]);
+        assert_eq!(fold_ranges("Ꭰ", &fold("ꭰ").0), vec![0..3]);
+        assert_eq!(fold_ranges("ꭰ", &fold("Ꭰ").0), vec![0..3]);
+        // Half of a folded `ß` is not a match on its own boundary.
+        assert_eq!(fold_ranges("aßa", &fold("sa").0), vec![1..4]);
+    }
+
+    /// Ignore case and smart case find `ß` for a query of `ss`, through
+    /// the public matcher.
+    #[test]
+    fn matcher_folds_case_fully() {
+        let matcher = Matcher::new("strasse", SearchMode::SmartCase).unwrap();
+        assert_eq!(matcher.find("Die Straße"), vec![4..11]);
+        let matcher = Matcher::new("STRASSE", SearchMode::NoCase).unwrap();
+        assert_eq!(matcher.find("straße"), vec![0..7]);
+        // An uppercase query in smart case stays exact.
+        let matcher = Matcher::new("STRASSE", SearchMode::SmartCase).unwrap();
+        assert!(matcher.find("straße").is_empty());
     }
 
     /// `document_units` lists the render-independent text of a parsed

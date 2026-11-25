@@ -70,6 +70,20 @@ impl Zoom {
         }
     }
 
+    /// Sets the ceiling like [`Zoom::set_ceiling`], but never lowers the
+    /// level: if the level is above `limit`, the ceiling stays at the level
+    /// instead, so zooming in is refused there and zooming out works as
+    /// usual. Used when the window moved to a monitor with another scale,
+    /// where the text the user is reading should not shrink.
+    pub fn set_ceiling_keeping_level(&mut self, limit: f64) {
+        let limit = if limit.is_nan() {
+            MAX
+        } else {
+            limit.clamp(1.0, MAX)
+        };
+        self.ceiling = limit.max(self.level).min(MAX);
+    }
+
     /// True when the level is at the largest zoom allowed.
     pub fn at_max(&self) -> bool {
         self.level >= self.ceiling - EPSILON
