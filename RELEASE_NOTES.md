@@ -14,7 +14,17 @@ section for the GitHub Release body.
   `other.md#section`) now work for every heading. Before, only a heading
   that happened to sit alone between two tables, code blocks or diagrams
   could be linked to; most such links did nothing. Headings with non-ASCII
-  text (`#über-uns`) can be linked too.
+  text (`#über-uns`) can be linked too. A link to a heading further down a
+  long document that is still loading now renders up to it and scrolls
+  there; `#` alone goes to the top.
+- Safer links. Web links (`http`/`https`, remote Markdown files included)
+  open in the browser and `mailto:` links in the mail client; the viewer
+  itself never fetches anything from the network. Local images, PDFs, plain
+  text, audio and video open in their application; any other local file
+  (programs, scripts, launchers, files marked executable, or files whose
+  name does not match their content) asks first, saying why it is
+  potentially dangerous, and opens only if you choose "Open Anyway". Other
+  link types are never opened. Hovering a link says what clicking it does.
 - Very large graphics no longer crash the viewer or eat gigabytes of
   memory. Nothing is drawn larger than ten screens: an image, SVG, formula
   or diagram too large even at 100% shows "too large" with its size in its
@@ -32,8 +42,12 @@ section for the GitHub Release body.
 - A document's pictures, formulas and diagrams hold at most 1 GiB of memory:
   when a document needs more, graphics far from the view are dropped (a
   spinner of the same size stands in) and drawn again as you scroll back to
-  them. A single graphic needing more than that shows "memory limit" in its
-  place.
+  them. A single graphic needing more than that shows "can't render: object
+  memory limit reached"; when the graphics on screen alone fill the budget,
+  the newest show "can't render: document memory limit reached" until there
+  is room. A formula repeated many times now shares one copy of its pixels.
+- An idle window no longer does work every frame, and searching while a
+  large document loads no longer slows it down.
 - A document, image or picture referred to by an SVG that is not a regular
   file (a pipe, a device such as `/dev/zero`) or is larger than 512 MiB is
   refused instead of hanging or exhausting memory. Pictures inside an SVG
@@ -43,7 +57,30 @@ section for the GitHub Release body.
 
 ### Details
 
-- Version 0.8.0 → 0.8.1 (bug fixes).
+- Version 0.8.0 → 0.8.1. The link confirmation dialog is new behaviour
+  that would call for a minor version; it stays 0.8.1 by the maintainer's
+  explicit exception.
+- Hard decision recorded in `AGENTS.md` and enforced by
+  `tests/no_network.rs`: the viewer never fetches anything from the
+  network, and the code must not be able to (no network crates in
+  `Cargo.lock`, no socket or remote-URI APIs in `src/`).
+- Links: `Resolved` gained `Mail` and `Refused(reason)`;
+  `links::link_action` decides what a click does and `link_tooltip` what
+  the tooltip says; `local_file_risk` judges a local file from
+  `FileFacts` (regular file, executable bit, GIO content type by name and
+  by its first bytes via `read_head`, `content_type_can_be_executable`).
+  `DocWindow::confirm_open` shows an `adw::AlertDialog`.
+- `links::heading_blocks` maps anchors to blocks up front, so
+  `scroll_to_anchor` can `render_to` a heading not on the page yet.
+- The frame callback stops when idle (`Session::wake_ticks`,
+  `layout::IDLE_FRAMES`); search refreshes are throttled while loading
+  (`layout::refresh_delay`, `SEARCH_REFRESH_MS`).
+- Budget: shared buffers count once and are dropped whole
+  (`progressive::held_bytes`, `plan_budget`), the cache returns the entry
+  a racing worker inserted first, and graphics that do not fit near the
+  view show the document limit message (`Held::Limited`).
+- `read_limited` opens with `O_NONBLOCK` (`libc`, now a direct dependency)
+  and checks the opened file, closing the check-then-open race.
 - Heading anchors were computed per text block: a block holds many
   headings, paragraphs and lists, so the one anchor registered was the slug
   of the whole block's text. `links::heading_starts` now finds each heading
@@ -85,7 +122,7 @@ section for the GitHub Release body.
   and the texture (no copies); results are cleared from the parsed document
   once their block is on the page; cache maps are bounded in bytes. A
   per-document budget (`DOCUMENT_BUDGET`) drops far graphics
-  (`progressive::pick_drops`, `Session::enforce_budget`), showing an
+  (`progressive::plan_budget`, `Session::enforce_budget`), showing an
   `adw::SpinnerPaintable` until `Session::redraw_near` re-renders them.
 - Tests: heading detection and anchors (several headings per block,
   duplicates, markup, formulas, lists and quotes), fragment decoding, the

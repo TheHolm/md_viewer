@@ -1284,6 +1284,7 @@ dependencies = [
  "gtk4",
  "image",
  "libadwaita",
+ "libc",
  "mathra",
  "merman",
  "percent-encoding",

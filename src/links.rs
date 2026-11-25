@@ -6,8 +6,13 @@
 //! resolves a destination against the document being viewed
 //! ([`resolve_link`]), finds the headings of a text block
 //! ([`heading_starts`]), generates the anchor a heading links to
-//! ([`heading_slug`], [`Anchors`]), and tracks the character ranges that are
-//! links ([`LinkRanges`]).
+//! ([`heading_slug`], [`Anchors`]), decides what a click on a link does and
+//! how its tooltip describes that ([`LinkAction`], [`local_file_risk`],
+//! [`link_tooltip`]), and tracks the character ranges that are links
+//! ([`LinkRanges`]).
+//!
+//! Nothing here fetches anything: web links are only ever handed to the
+//! user's browser (see "Hard decisions" in `AGENTS.md`).
 
 use crate::{ImageState, Inline, Style};
 use std::collections::HashMap;
@@ -18,9 +23,11 @@ use url::Url;
 /// being viewed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resolved {
-    /// Open in the desktop's default handler (`http`, `https`, `mailto`,
-    /// `file` to a non-Markdown file).
+    /// An `http`/`https` URL, handed to the browser (never fetched by the
+    /// viewer, even for a Markdown file).
     Web(String),
+    /// A `mailto:` URL, handed to the mail client.
+    Mail(String),
     /// A local Markdown document to open in the viewer, with an optional
     /// `#fragment` to scroll to once it is shown.
     Markdown(PathBuf, Option<String>),
@@ -28,7 +35,10 @@ pub enum Resolved {
     File(PathBuf),
     /// A same-document `#fragment`, scrolled to within the current document.
     Anchor(String),
-    /// Nothing to do: an empty, unsafe or unsupported destination.
+    /// Never opened, for the reason given (an unsupported scheme, a file on
+    /// another computer).
+    Refused(String),
+    /// Nothing to do: an empty destination, or the current document itself.
     Ignored,
 }
 
@@ -37,8 +47,8 @@ pub enum Resolved {
 ///
 /// Web and mail links are kept verbatim; `file:` and relative destinations
 /// are resolved to local paths; a fragment naming the current document is an
-/// anchor within it; any other scheme (`javascript:`, `data:`, ...) is
-/// ignored.
+/// anchor within it; any other scheme (`javascript:`, `data:`, `ftp:`, ...)
+/// and a `file:` URL naming another computer are refused.
 pub fn resolve_link(base: &Path, dest: &str) -> Resolved {
     if dest.is_empty() {
         return Resolved::Ignored;
@@ -47,14 +57,15 @@ pub fn resolve_link(base: &Path, dest: &str) -> Resolved {
         return Resolved::Ignored;
     };
     let Ok(joined) = base_url.join(dest) else {
-        return Resolved::Ignored;
+        return Resolved::Refused("not a valid link".to_string());
     };
     let fragment = joined.fragment().map(decode_fragment);
     match joined.scheme() {
-        "http" | "https" | "mailto" => Resolved::Web(joined.to_string()),
+        "http" | "https" => Resolved::Web(joined.to_string()),
+        "mailto" => Resolved::Mail(joined.to_string()),
         "file" => {
             let Some(path) = joined.to_file_path().ok() else {
-                return Resolved::Ignored;
+                return Resolved::Refused("files on other computers are not opened".to_string());
             };
             let same = same_file(&path, base);
             if same {
@@ -72,7 +83,171 @@ pub fn resolve_link(base: &Path, dest: &str) -> Resolved {
                 Resolved::File(path)
             }
         }
-        _ => Resolved::Ignored,
+        scheme => Resolved::Refused(format!("{scheme}: links are not supported")),
+    }
+}
+
+/// What is known about a local file a link names, as the GUI finds it out
+/// (GIO's content types are MIME types on Linux and FreeBSD).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileFacts {
+    /// False for a FIFO, device, directory or socket.
+    pub regular: bool,
+    /// True if any executable permission bit is set.
+    pub executable_bit: bool,
+    /// The content type its name suggests (its extension).
+    pub name_type: String,
+    /// The content type its first bytes suggest, `None` if they say nothing
+    /// definite (`application/octet-stream`, or nothing could be read).
+    pub data_type: Option<String>,
+    /// True if GIO says either content type can be executable (programs,
+    /// scripts, launchers).
+    pub can_be_executable: bool,
+}
+
+/// Content types a local file may have to be opened without asking:
+/// whole families (`image/`, `audio/`, `video/`) or exact types.
+const SAFE_TYPE_PREFIXES: &[&str] = &["image/", "audio/", "video/"];
+
+/// Exact content types that are safe to open without asking.
+const SAFE_TYPES: &[&str] = &["application/pdf", "text/plain"];
+
+/// Content types that are never safe despite their family: an SVG can carry
+/// scripts (and often opens in a browser).
+const UNSAFE_TYPES: &[&str] = &["image/svg+xml", "image/svg+xml-compressed"];
+
+/// True if `content_type` is on the safe list.
+fn is_safe_type(content_type: &str) -> bool {
+    !UNSAFE_TYPES.contains(&content_type)
+        && (SAFE_TYPES.contains(&content_type)
+            || SAFE_TYPE_PREFIXES
+                .iter()
+                .any(|prefix| content_type.starts_with(prefix)))
+}
+
+/// Why opening the local file `name` (described by `facts`) is potentially
+/// dangerous, or `None` if it may be opened without asking: it is a regular
+/// file, not executable, and of a safe type (images, PDF, plain text, audio,
+/// video) by both its name and its content.
+pub fn local_file_risk(name: &str, facts: &FileFacts) -> Option<String> {
+    let lower = name.to_ascii_lowercase();
+    if !facts.regular {
+        return Some(
+            "it is not a regular file (a device, pipe or folder), and opening it could do anything"
+                .to_string(),
+        );
+    }
+    if lower.ends_with(".desktop") || facts.name_type == "application/x-desktop" {
+        return Some("it is a desktop launcher (.desktop), which can run any command".to_string());
+    }
+    if facts.executable_bit {
+        return Some(
+            "it is marked as executable and could run a program on your computer".to_string(),
+        );
+    }
+    if facts.can_be_executable {
+        let shown = facts.data_type.as_deref().unwrap_or(&facts.name_type);
+        return Some(format!(
+            "it is a program or script ({shown}) and could run code on your computer"
+        ));
+    }
+    if let Some(data_type) = &facts.data_type {
+        if !is_safe_type(data_type) && is_safe_type(&facts.name_type) {
+            return Some(format!(
+                "its name says {} but its content is {data_type}",
+                facts.name_type
+            ));
+        }
+        if !is_safe_type(data_type) {
+            return Some(format!(
+                "its type ({data_type}) is not known to be safe; the application that opens it could run code"
+            ));
+        }
+    }
+    if !is_safe_type(&facts.name_type) {
+        return Some(format!(
+            "its type ({}) is not known to be safe; the application that opens it could run code",
+            facts.name_type
+        ));
+    }
+    None
+}
+
+/// What clicking a link does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkAction {
+    /// Hand the URL to the browser.
+    Browse(String),
+    /// Hand the `mailto:` URL to the mail client.
+    Mail(String),
+    /// Open the Markdown file in the viewer, then go to the fragment.
+    Markdown(PathBuf, Option<String>),
+    /// Go to a heading of this document.
+    Anchor(String),
+    /// Open a safe local file in its default application.
+    OpenFile(PathBuf),
+    /// Ask before opening a potentially dangerous local file, for this
+    /// reason.
+    AskFile(PathBuf, String),
+    /// The local file does not exist.
+    Missing(PathBuf),
+    /// Never opened, for this reason.
+    Refused(String),
+    /// Nothing to do.
+    Nothing,
+}
+
+/// Decides what a click on a link resolved to `resolved` does; `facts`
+/// describes a local file (`None` if it does not exist).
+pub fn link_action(
+    resolved: Resolved,
+    facts: impl FnOnce(&Path) -> Option<FileFacts>,
+) -> LinkAction {
+    match resolved {
+        Resolved::Web(url) => LinkAction::Browse(url),
+        Resolved::Mail(url) => LinkAction::Mail(url),
+        Resolved::Markdown(path, fragment) => LinkAction::Markdown(path, fragment),
+        Resolved::Anchor(fragment) => LinkAction::Anchor(fragment),
+        Resolved::Refused(reason) => LinkAction::Refused(reason),
+        Resolved::Ignored => LinkAction::Nothing,
+        Resolved::File(path) => match facts(&path) {
+            None => LinkAction::Missing(path),
+            Some(facts) => {
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                match local_file_risk(&name, &facts) {
+                    Some(reason) => LinkAction::AskFile(path, reason),
+                    None => LinkAction::OpenFile(path),
+                }
+            }
+        },
+    }
+}
+
+/// The tooltip of a link whose click does `action`: what will happen, so
+/// refused and dangerous links are clear before clicking. `dest` is the
+/// destination as written.
+pub fn link_tooltip(dest: &str, action: &LinkAction) -> String {
+    match action {
+        LinkAction::Browse(url) => format!("Open in browser: {url}"),
+        LinkAction::Mail(url) => format!(
+            "Write an email to {}",
+            url.strip_prefix("mailto:").unwrap_or(url)
+        ),
+        LinkAction::Markdown(path, _) => format!("Open in MD Viewer: {}", path.display()),
+        LinkAction::Anchor(_) => format!("Go to section: {dest}"),
+        LinkAction::OpenFile(path) => {
+            format!("Open with the default application: {}", path.display())
+        }
+        LinkAction::AskFile(path, reason) => format!(
+            "⚠ Potentially dangerous: {reason}. Asks before opening.\n{}",
+            path.display()
+        ),
+        LinkAction::Missing(path) => format!("File not found: {}", path.display()),
+        LinkAction::Refused(reason) => format!("Not opened: {reason}\n{dest}"),
+        LinkAction::Nothing => dest.to_string(),
     }
 }
 
@@ -288,6 +463,23 @@ impl Anchors {
     pub fn lookup(&self, fragment: &str) -> Option<i32> {
         self.offsets.get(fragment).copied()
     }
+}
+
+/// Every heading of a parsed document under the anchor it will have, with
+/// the index of its block as the offset: the same anchors (and duplicate
+/// suffixes) the GUI registers as the blocks are appended, known before
+/// they are, so a link to a heading not on the page yet can render up to
+/// it.
+pub fn heading_blocks(blocks: &[crate::Block]) -> Anchors {
+    let mut anchors = Anchors::default();
+    for (index, block) in blocks.iter().enumerate() {
+        if let crate::Block::Text(inlines) = block {
+            for (_, text) in heading_starts(inlines) {
+                anchors.register(&text, i32::try_from(index).unwrap_or(i32::MAX));
+            }
+        }
+    }
+    anchors
 }
 
 /// A clickable range of the document's text, in character offsets.

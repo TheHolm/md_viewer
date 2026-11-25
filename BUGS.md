@@ -28,26 +28,14 @@ Background on the rendering crates is in `NOTES.md`.
   sharp pictures arrive; the line at the top of the window is held in
   place for a moment, but not after the user scrolls.
 
-- Following a `#fragment` to a heading that is not on the page yet (a
-  long, lazily rendered document) only remembers it: nothing renders up to
-  the heading, and the view jumps there whenever the heading is appended
-  later. An anchor that never appears stays pending silently. An empty
-  fragment (`#`) does not scroll to the top.
 - The memory budget is enforced on the GUI thread, after results arrive:
   the render workers do not reserve their bytes before allocating, so while
   rendering the document can briefly hold up to one graphic per worker
-  over the budget. Pixels shared between graphics (the same formula many
-  times, served from the cache) are counted once per use, so the budget is
-  conservative there. Graphics on or within a screen of the view are never
-  dropped, so a few very large ones there can exceed the budget; a graphic
-  that only needs more than the budget once zoomed in is not refused.
-- The file-type check before reading (no FIFOs or devices) and the open
-  that follows are two steps: a file replaced by a FIFO in between still
-  blocks a render worker.
-- The view's tick callback never stops: the frame clock runs (and every
-  table is measured) every frame while a window is open, even when idle.
-- An active search is redone in full (text copy, matching, highlights,
-  scrollbar marks) for every batch of blocks appended while loading.
+  over the budget (accepted as not a problem). A graphic shown as over the
+  document memory limit keeps saying so while far from the view; it is
+  tried again only once it is near the view and there is room.
+- A large image used inline several times is shrunk separately for each
+  use, so each holds its own (small) pixel buffer.
 - A UTF-8 byte-order mark at the start of a file is not stripped, so the
   first heading, list or fence of such a file is shown as plain text.
 - Deeply nested lists cost memory quadratic in the depth (each item writes
@@ -120,6 +108,13 @@ Background on the rendering crates is in `NOTES.md`.
 
 ## Testing gaps
 
+- The link confirmation dialog's "Open Anyway" (which hands the file to
+  its default application) is not exercised by the tests, to launch
+  nothing; the tests check that a dangerous file shows the dialog with
+  Cancel as the default, and that nothing else is launched.
+- A real window resize is not tested (headless X without a window manager
+  does not resize windows); the tests check that the width signal wakes the
+  frame callback.
 - The file chooser's response and the error dialog need user interaction,
   so the tests do not reach them; check them by hand after changing them.
 - Zooming (Ctrl+wheel, Ctrl+plus/minus/0, pinch) and the code cards' copy

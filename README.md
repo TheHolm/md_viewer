@@ -64,12 +64,15 @@ rules, and:
 * **Mermaid diagrams** in ` ```mermaid ` code blocks: flowcharts, sequence
   diagrams, Gantt charts, pie charts, class and state diagrams and the other
   Mermaid diagram types.
-* **Clickable links** in text and table cells: web and `mailto:` links open
-  in the desktop's default handler, local links open on disk (Markdown files
-  in the viewer), relative paths resolve against the document, and
-  `#fragment` links scroll to the matching heading. Hovering a link shows
-  its destination in a tooltip. Unsafe schemes (`javascript:`, `data:`) are
-  ignored.
+* **Clickable links** in text and table cells: web links open in the
+  browser and `mailto:` links in the mail client (the viewer itself never
+  fetches anything from the network), Markdown files open in the viewer,
+  relative paths resolve against the document, and `#fragment` links scroll
+  to the matching heading. Local images, PDFs, plain text, audio and video
+  open in their application; any other local file asks first, saying why
+  it is potentially dangerous. Other link types (`javascript:`, `data:`,
+  `ftp:`, ...) are never opened. Hovering a link says what clicking it
+  does.
 * **Local images**: `![alt](path)` is loaded from disk and shown - alone on
   a line scaled to the window width, inline with the text at about the line
   height, or inside a table cell. Relative paths resolve against the

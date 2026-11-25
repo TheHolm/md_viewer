@@ -21,6 +21,17 @@ for a single session) belongs outside the repo entirely (e.g. under `/tmp`),
 never committed - see the "Never commit changes unless the user explicitly
 asks to commit" rule below, which exists partly for this reason.
 
+## Hard decisions (never change)
+
+- **The viewer never fetches anything from the network, and the code must
+  not contain the ability to.** No HTTP or socket code, no network-capable
+  crate or crate feature, no GIO remote URIs (`gio::File::for_uri` on
+  `http:`/`ftp:`/`smb:` ..., which GVfs would fetch). Remote images and
+  remote references inside SVGs stay unsupported. The only thing done with
+  a web URL is handing it to the user's browser (`gtk4::UriLauncher`) when
+  they click a link; the viewer itself reads only local files.
+  `tests/no_network.rs` enforces this; never weaken that test.
+
 ## Conventions
 
 - `cargo fmt` style, no external formatters

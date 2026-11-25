@@ -3,7 +3,8 @@
 //! ranges, and the links inside label text.
 
 use md_viewer::links::{
-    file_uri, heading_slug, heading_starts, resolve_image, resolve_link, Anchors, LinkRanges,
+    file_uri, heading_blocks, heading_slug, heading_starts, link_action, link_tooltip,
+    local_file_risk, resolve_image, resolve_link, Anchors, FileFacts, LinkAction, LinkRanges,
     Resolved,
 };
 use md_viewer::{label_text, render, Block, ImageState, Inline, Style};
@@ -16,7 +17,8 @@ fn base() -> &'static Path {
 
 // --- resolve_link ---------------------------------------------------------
 
-/// Web and mail destinations are handed over verbatim.
+/// Web and mail destinations are handed over verbatim, each to its own
+/// application; a remote Markdown file is a web page too (never fetched).
 #[test]
 fn web_and_mail_destinations() {
     assert_eq!(
@@ -24,32 +26,36 @@ fn web_and_mail_destinations() {
         Resolved::Web("https://example.com/a?b#c".to_string())
     );
     assert_eq!(
+        resolve_link(base(), "http://example.com/notes.md"),
+        Resolved::Web("http://example.com/notes.md".to_string())
+    );
+    assert_eq!(
         resolve_link(base(), "mailto:someone@example.com"),
-        Resolved::Web("mailto:someone@example.com".to_string())
+        Resolved::Mail("mailto:someone@example.com".to_string())
     );
 }
 
-/// Empty, unsafe and unsupported destinations are ignored.
+/// An empty destination does nothing; unsafe and unsupported schemes, and
+/// a `file:` URL naming another computer, are refused with the reason.
 #[test]
-fn ignored_destinations() {
+fn refused_destinations() {
     assert_eq!(resolve_link(base(), ""), Resolved::Ignored);
-    assert_eq!(
-        resolve_link(base(), "javascript:alert(1)"),
-        Resolved::Ignored
-    );
-    assert_eq!(
-        resolve_link(base(), "data:text/plain,hi"),
-        Resolved::Ignored
-    );
-    assert_eq!(
-        resolve_link(base(), "ftp://example.com/x"),
-        Resolved::Ignored
-    );
-    // A `file:` URL naming a remote host has no local path to open.
-    assert_eq!(
-        resolve_link(base(), "file://server/share/x.md"),
-        Resolved::Ignored
-    );
+    for (dest, reason) in [
+        ("javascript:alert(1)", "javascript: links are not supported"),
+        ("data:text/plain,hi", "data: links are not supported"),
+        ("ftp://example.com/x", "ftp: links are not supported"),
+        ("smb://server/share/x", "smb: links are not supported"),
+        (
+            "file://server/share/x.md",
+            "files on other computers are not opened",
+        ),
+    ] {
+        assert_eq!(
+            resolve_link(base(), dest),
+            Resolved::Refused(reason.to_string()),
+            "{dest}"
+        );
+    }
 }
 
 /// A fragment alone names a heading in the current document.
@@ -444,4 +450,196 @@ fn file_uri_for_absolute_path() {
         Some("file:///tmp/three.png".to_string())
     );
     assert_eq!(file_uri(Path::new("")), None);
+}
+
+// --- Link actions and safety -----------------------------------------------
+
+/// Facts for a regular, non-executable file of type `name_type` by name and
+/// `data_type` by content.
+fn facts(name_type: &str, data_type: Option<&str>) -> FileFacts {
+    FileFacts {
+        regular: true,
+        executable_bit: false,
+        name_type: name_type.to_string(),
+        data_type: data_type.map(str::to_string),
+        can_be_executable: false,
+    }
+}
+
+/// Images, PDF, plain text, audio and video open without asking, by name
+/// alone or confirmed by their content.
+#[test]
+fn safe_file_types() {
+    for (name, name_type, data_type) in [
+        ("a.png", "image/png", Some("image/png")),
+        ("a.jpg", "image/jpeg", None),
+        ("a.pdf", "application/pdf", Some("application/pdf")),
+        ("a.txt", "text/plain", Some("text/plain")),
+        ("a.ogg", "audio/ogg", None),
+        ("a.mp4", "video/mp4", Some("video/mp4")),
+    ] {
+        assert_eq!(
+            local_file_risk(name, &facts(name_type, data_type)),
+            None,
+            "{name}"
+        );
+    }
+}
+
+/// Every other local file is potentially dangerous, and the reason says
+/// why: executable bit, program or script, launcher, a name that lies about
+/// the content, a type not known to be safe (SVG included), or no regular
+/// file at all.
+#[test]
+fn dangerous_file_reasons() {
+    let risk = |name: &str, facts: FileFacts| local_file_risk(name, &facts).expect(name);
+    let executable = FileFacts {
+        executable_bit: true,
+        ..facts("image/png", Some("image/png"))
+    };
+    assert!(risk("a.png", executable).contains("marked as executable"));
+    let script = FileFacts {
+        can_be_executable: true,
+        ..facts(
+            "application/x-shellscript",
+            Some("application/x-shellscript"),
+        )
+    };
+    assert_eq!(
+        risk("run.sh", script),
+        "it is a program or script (application/x-shellscript) and could run code on your computer"
+    );
+    assert!(risk("app.desktop", facts("application/x-desktop", None)).contains("desktop launcher"));
+    assert!(risk("APP.DESKTOP", facts("text/plain", None)).contains("desktop launcher"));
+    assert_eq!(
+        risk(
+            "cat.png",
+            facts("image/png", Some("application/x-executable"))
+        ),
+        "its name says image/png but its content is application/x-executable"
+    );
+    assert!(risk("a.zip", facts("application/zip", None))
+        .contains("(application/zip) is not known to be safe"));
+    assert!(risk("a.svg", facts("image/svg+xml", None)).contains("image/svg+xml"));
+    assert!(risk(
+        "x.bin",
+        facts("text/plain", Some("application/x-sharedlib"))
+    )
+    .contains("application/x-sharedlib"));
+    let pipe = FileFacts {
+        regular: false,
+        ..facts("image/png", None)
+    };
+    assert!(risk("pipe.png", pipe).contains("not a regular file"));
+}
+
+/// A click's action follows from the resolved link; a local file is
+/// checked, and a missing one does nothing.
+#[test]
+fn link_actions() {
+    let none = |_: &Path| -> Option<FileFacts> { None };
+    let png = |_: &Path| Some(facts("image/png", Some("image/png")));
+    let zip = |_: &Path| Some(facts("application/zip", None));
+    let resolve = |dest| resolve_link(base(), dest);
+    assert_eq!(
+        link_action(resolve("https://a.example/"), none),
+        LinkAction::Browse("https://a.example/".to_string())
+    );
+    assert_eq!(
+        link_action(resolve("mailto:a@b.example"), none),
+        LinkAction::Mail("mailto:a@b.example".to_string())
+    );
+    assert_eq!(
+        link_action(resolve("#x"), none),
+        LinkAction::Anchor("x".to_string())
+    );
+    assert!(matches!(
+        link_action(resolve("b.md"), none),
+        LinkAction::Markdown(_, None)
+    ));
+    let file = PathBuf::from("/home/user/docs/f.png");
+    assert_eq!(
+        link_action(resolve("f.png"), png),
+        LinkAction::OpenFile(file.clone())
+    );
+    assert_eq!(
+        link_action(resolve("f.png"), none),
+        LinkAction::Missing(file)
+    );
+    assert!(matches!(
+        link_action(resolve("f.zip"), zip),
+        LinkAction::AskFile(_, _)
+    ));
+    assert!(matches!(
+        link_action(resolve("ftp://x/"), none),
+        LinkAction::Refused(_)
+    ));
+    assert_eq!(link_action(resolve(""), none), LinkAction::Nothing);
+}
+
+/// Each tooltip says what a click does; refused and dangerous links say so
+/// clearly, with the reason.
+#[test]
+fn link_tooltips() {
+    let path = PathBuf::from("/d/f.zip");
+    assert_eq!(
+        link_tooltip(
+            "https://a.example/",
+            &LinkAction::Browse("https://a.example/".into())
+        ),
+        "Open in browser: https://a.example/"
+    );
+    assert_eq!(
+        link_tooltip(
+            "mailto:a@b.example",
+            &LinkAction::Mail("mailto:a@b.example".into())
+        ),
+        "Write an email to a@b.example"
+    );
+    assert_eq!(
+        link_tooltip("x.md", &LinkAction::Markdown("/d/x.md".into(), None)),
+        "Open in MD Viewer: /d/x.md"
+    );
+    assert_eq!(
+        link_tooltip("#intro", &LinkAction::Anchor("intro".into())),
+        "Go to section: #intro"
+    );
+    assert_eq!(
+        link_tooltip("f.png", &LinkAction::OpenFile("/d/f.png".into())),
+        "Open with the default application: /d/f.png"
+    );
+    assert_eq!(
+        link_tooltip(
+            "f.zip",
+            &LinkAction::AskFile(path.clone(), "its type is odd".into())
+        ),
+        "⚠ Potentially dangerous: its type is odd. Asks before opening.\n/d/f.zip"
+    );
+    assert_eq!(
+        link_tooltip("f.zip", &LinkAction::Missing(path)),
+        "File not found: /d/f.zip"
+    );
+    assert_eq!(
+        link_tooltip(
+            "ftp://x/",
+            &LinkAction::Refused("ftp: links are not supported".into())
+        ),
+        "Not opened: ftp: links are not supported\nftp://x/"
+    );
+    assert_eq!(link_tooltip("", &LinkAction::Nothing), "");
+}
+
+/// Every heading of a parsed document is known by anchor, with its block,
+/// before anything is on the page: duplicates suffixed in order, headings
+/// after a table or code block in later blocks.
+#[test]
+fn heading_blocks_maps_anchors_to_blocks() {
+    let blocks =
+        render("# Intro\n\n| a |\n|---|\n| b |\n\n## Usage\n\n```\ncode\n```\n\n## Usage\n");
+    let anchors = heading_blocks(&blocks);
+    assert_eq!(anchors.lookup("intro"), Some(0));
+    assert_eq!(anchors.lookup("usage"), Some(2));
+    assert_eq!(anchors.lookup("usage-1"), Some(4));
+    assert_eq!(anchors.lookup("missing"), None);
+    assert_eq!(heading_blocks(&[]).lookup("intro"), None);
 }

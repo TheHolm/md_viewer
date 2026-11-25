@@ -5,8 +5,8 @@
 
 use md_viewer::graphics::{Graphic, RasterSettings};
 use md_viewer::progressive::{
-    clear_graphics, for_each_graphic, jobs, pick_drops, place, worker_count, zoom_order, Job,
-    Phase, Pool, Progress, SPINNER_DELAY_MS,
+    clear_graphics, for_each_graphic, held_bytes, jobs, place, plan_budget, worker_count,
+    zoom_order, Held, Job, Phase, Pool, Progress, SPINNER_DELAY_MS,
 };
 use md_viewer::{render, Block, Inline};
 use std::path::Path;
@@ -432,22 +432,71 @@ fn place_stores_image_result() {
     assert_eq!(image.image, Some(Err("broken".to_string())));
 }
 
-/// Within the budget nothing is dropped; over it, the farthest graphics go
-/// first until it is met, never one near the view (distance 0) or one that
-/// holds nothing; if what is near alone exceeds the budget, every far one
-/// goes and that is all.
+/// A graphic for the budget tests.
+fn held(id: usize, key: usize, bytes: usize, distance: f64, arrived: u64) -> Held {
+    Held {
+        id,
+        key,
+        bytes,
+        distance,
+        arrived,
+    }
+}
+
+/// A buffer shared by several graphics counts once.
 #[test]
-fn pick_drops_farthest_first() {
-    let candidates = [
-        (0, 100, 0.0),
-        (1, 100, 50.0),
-        (2, 100, 900.0),
-        (3, 100, 300.0),
-        (4, 0, 5000.0),
+fn held_bytes_counts_shared_buffers_once() {
+    let graphics = [
+        held(0, 7, 100, 0.0, 0),
+        held(1, 7, 100, 9.0, 1),
+        held(2, 8, 50, 0.0, 2),
     ];
-    assert!(pick_drops(400, 400, &candidates).is_empty());
-    assert_eq!(pick_drops(450, 400, &candidates), [2]);
-    assert_eq!(pick_drops(500, 250, &candidates), [2, 3, 1]);
-    assert_eq!(pick_drops(500, 0, &candidates), [2, 3, 1]);
-    assert!(pick_drops(500, 0, &[]).is_empty());
+    assert_eq!(held_bytes(&graphics), 150);
+    assert_eq!(held_bytes(&[]), 0);
+}
+
+/// Within the budget nothing happens; over it, the farthest buffers are
+/// dropped first until it fits, never one with a graphic near the view
+/// (distance 0) or one holding nothing.
+#[test]
+fn plan_budget_drops_farthest_first() {
+    let graphics = [
+        held(0, 0, 100, 0.0, 0),
+        held(1, 1, 100, 50.0, 1),
+        held(2, 2, 100, 900.0, 2),
+        held(3, 3, 100, 300.0, 3),
+        held(4, 4, 0, 5000.0, 4),
+    ];
+    assert_eq!(plan_budget(&graphics, 400), (vec![], vec![]));
+    assert_eq!(plan_budget(&graphics, 350), (vec![2], vec![]));
+    assert_eq!(plan_budget(&graphics, 150), (vec![2, 3, 1], vec![]));
+}
+
+/// A shared buffer is dropped whole (all its graphics), and kept whole
+/// while any of its graphics is near the view.
+#[test]
+fn plan_budget_drops_shared_buffers_whole() {
+    let graphics = [
+        held(0, 9, 100, 800.0, 0),
+        held(1, 9, 100, 700.0, 1),
+        held(2, 5, 100, 10.0, 2),
+        held(3, 6, 100, 0.0, 3),
+        held(4, 6, 100, 600.0, 4),
+    ];
+    assert_eq!(plan_budget(&graphics, 200), (vec![0, 1], vec![]));
+    assert_eq!(plan_budget(&graphics, 100), (vec![0, 1, 2], vec![]));
+}
+
+/// When what is near the view alone exceeds the budget, every far buffer
+/// is dropped and then the newest near ones are limited until it fits.
+#[test]
+fn plan_budget_limits_newest_near_buffers() {
+    let graphics = [
+        held(0, 0, 100, 0.0, 5),
+        held(1, 1, 100, 0.0, 9),
+        held(2, 2, 100, 0.0, 7),
+        held(3, 3, 100, 40.0, 1),
+    ];
+    assert_eq!(plan_budget(&graphics, 150), (vec![3], vec![1, 2]));
+    assert_eq!(plan_budget(&graphics, 0), (vec![3], vec![1, 2, 0]));
 }

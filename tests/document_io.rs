@@ -3,8 +3,8 @@
 //! it opens, where the file chooser starts, how failures are reported).
 
 use md_viewer::{
-    chooser_folder, error_message, open_document, open_target, read_document, read_limited,
-    window_title, Block, Inline, Origin, Span, Style, Target, MAX_FILE_BYTES,
+    chooser_folder, error_message, open_document, open_target, read_document, read_head,
+    read_limited, window_title, Block, Inline, Origin, Span, Style, Target, MAX_FILE_BYTES,
 };
 use std::fs;
 use std::io::{ErrorKind, Write};
@@ -126,6 +126,23 @@ fn read_document_refuses_special_files() {
     let error = read_document(&fifo).unwrap_err();
     assert!(error_message(&fifo, &error).ends_with(": not a regular file"));
     assert!(read_document(Path::new("/dev/zero")).is_err());
+}
+
+/// `read_head` reads at most the first bytes of a regular file, and
+/// refuses a FIFO at once instead of waiting for a writer.
+#[test]
+fn read_head_reads_the_start_only() {
+    let file = temp_file(b"0123456789");
+    assert_eq!(read_head(file.path(), 4).unwrap(), b"0123");
+    assert_eq!(read_head(file.path(), 100).unwrap(), b"0123456789");
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("pipe");
+    make_fifo(&fifo);
+    assert_eq!(
+        read_head(&fifo, 4).unwrap_err().kind(),
+        ErrorKind::InvalidInput
+    );
+    assert!(read_head(Path::new("/dev/zero"), 4).is_err());
 }
 
 /// `open_document` reads and renders in one step.

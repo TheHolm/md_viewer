@@ -291,3 +291,28 @@ pub fn spinner_size(width: f64, height: f64) -> f64 {
         0.0
     }
 }
+
+/// How many frames in a row with nothing to resize (and no held spot) stop
+/// the view's frame callback until something changes again.
+pub const IDLE_FRAMES: u32 = 3;
+
+/// The least time between two refreshes of an active search while a
+/// document is still loading.
+pub const SEARCH_REFRESH_MS: u64 = 200;
+
+/// When to refresh an active search after blocks were appended, given the
+/// time `since` the last refresh (`None` if there was none) and whether the
+/// whole document is on the page (`done`): `None` for now, otherwise how
+/// long to wait so refreshes are at least [`SEARCH_REFRESH_MS`] apart.
+pub fn refresh_delay(
+    since: Option<std::time::Duration>,
+    done: bool,
+) -> Option<std::time::Duration> {
+    let interval = std::time::Duration::from_millis(SEARCH_REFRESH_MS);
+    match since {
+        _ if done => None,
+        None => None,
+        Some(since) if since >= interval => None,
+        Some(since) => Some(interval - since),
+    }
+}

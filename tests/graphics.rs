@@ -786,7 +786,7 @@ fn zoom_limit_checks_the_memory_budget() {
     let max = [100_000, 100_000];
     assert_eq!(
         zoom_limit(20_000.0, 20_000.0, max).unwrap_err(),
-        "memory limit (1526 MiB, budget 1024 MiB)"
+        "can't render: object memory limit reached (1526 MiB, limit 1024 MiB)"
     );
     assert!(zoom_limit(16_384.0, 16_384.0, max).is_ok());
 }

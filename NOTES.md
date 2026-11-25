@@ -16,6 +16,10 @@ library and binary are all named `md_viewer`. The version is
 declared in the `VERSION` file at the repository root, the single source of
 the version (see "Versioning" below).
 
+The viewer never fetches anything from the network, and the code must not
+be able to: see "Hard decisions" in `AGENTS.md`, enforced by
+`tests/no_network.rs`. Web links are only handed to the browser.
+
 ## Stack
 
 - Rust 2021 edition, toolchain 1.98 (the version CI builds with)
@@ -237,7 +241,7 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   of `DOCUMENT_BUDGET` (1 GiB) of pixels on the page: a graphic needing more
   at 100% is refused ("memory limit (...)"); otherwise, when the page holds
   more, `Session::enforce_budget` drops the graphics farthest from the view
-  (`progressive::pick_drops`, never within `layout::KEEP_SCREENS` screens of
+  (`progressive::plan_budget`, never within `layout::KEEP_SCREENS` screens of
   it): their texture is freed and a spinner of the same size stands in
   (`ScaledTexture::show_spinner`, an `adw::SpinnerPaintable`), so nothing
   moves. `Session::redraw_near` asks the pool for dropped graphics coming
@@ -474,13 +478,14 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   `#fragment` scrolls to the matching heading, whose anchor is a
   GitHub-style slug (duplicates get `-1`, `-2`, ...). Every heading has its
   own anchor, registered at its first character as its text block is
-  appended (`links::heading_starts`). Dangerous schemes
-  (`javascript:`, `data:`, ...) and empty destinations are ignored, and a
+  appended (`links::heading_starts`). What a click does is decided by
+  `links::link_action` (see "Link safety" under "Gotchas and techniques"):
+  other schemes are refused, empty destinations ignored, and a
   formula that is a link's only content is not clickable (it is drawn as
   pixels). An image that is a link's content *is* clickable: a standalone or
   table-cell picture gets a click controller on its box, an inline one a
-  link range over its buffer character. Hovering a link shows its raw
-  destination in a tooltip: both the
+  link range over its buffer character. Hovering a link shows what a click
+  does (`links::link_tooltip`) in a tooltip: both the
   text view and table-cell labels use `query-tooltip` (whose coordinates are
   widget-space, the same as `dest_at`/`label_link_at`) and set plain tooltip
   text, so destinations containing markup characters are safe.
@@ -612,6 +617,48 @@ Things learned the hard way; add to this list when you learn another.
   `keydown ctrl click 4 keyup ctrl` zooms in, `key ctrl+0`); combine with
   `import` screenshots. The automated tests cannot press keys, so zoom and
   the copy button are checked this way.
+- Link safety (`links::link_action`, `local_file_risk`, `link_tooltip`):
+  `http`/`https` go to the browser (a remote `.md` too: the viewer never
+  fetches), `mailto:` to the mail client, local Markdown opens in the
+  viewer, other schemes and `file://host/...` are refused with the reason
+  in the tooltip. A local non-Markdown file opens directly only if it is a
+  regular, non-executable file whose type by name and by content (GIO's
+  `content_type_guess`, the first 4 KiB read through `read_head`, which
+  does not block on a FIFO) is an image (not SVG), PDF, plain text, audio
+  or video, and GIO does not call it executable (`text/plain` itself is
+  exempt: GIO counts every text type as a possible script); otherwise
+  `DocWindow::confirm_open` shows an `adw::AlertDialog` with the reason,
+  Cancel as the default and "Open Anyway" as destructive. Every link's
+  tooltip says what a click does. Gotcha: an `AlertDialog` heading that
+  wraps makes libadwaita print "Trying to measure GtkLabel ... needs at
+  least" warnings, so the heading is kept short ("Open Dangerous
+  Content?"); the body carries the reason.
+- Headings not on the page yet: `links::heading_blocks` maps every
+  heading's anchor (same suffixes as `Anchors`) to its block when the
+  document opens, so `Session::scroll_to_anchor` renders up to the block
+  (`render_to`) and scrolls once the heading is appended; an anchor naming
+  no heading leaves nothing pending, and `#` scrolls to the top.
+- The frame callback (`Session::wake_ticks`) runs only while there is
+  work: it stops after `layout::IDLE_FRAMES` frames that resize nothing
+  with no held spot, and is woken by the adjustments' `changed` signals
+  (the view's width shows in the horizontal one), new blocks, redrawn
+  graphics and `hold_anchor`.
+- While a document loads, an active search is refreshed at most every
+  `layout::SEARCH_REFRESH_MS` (200 ms), at once when the last block is on
+  the page, and before stepping to another match (`request_refresh`).
+- The budget counts each pixel buffer once (`progressive::held_bytes`, by
+  `Arc` pointer; a slot's texture keeps its buffer alive, so a key is not
+  reused while counted) and drops buffers whole (`plan_budget`). The cache
+  returns the entry another worker inserted first (`insert_bounded`), so
+  one formula shown many times shares one buffer. If what is near the view
+  alone exceeds the budget, the newest graphics there show "can't render:
+  document memory limit reached" (`Held::Limited`,
+  `ScaledTexture::show_message`) and are asked for again once they fit.
+  The budget is planned from an idle callback after layout (`schedule_budget`),
+  never right after appending: lines not yet laid out report positions
+  that make everything look near the view.
+- `read_limited` checks the path, opens with `O_NONBLOCK` (a file swapped
+  for a FIFO cannot block the open) and checks the opened file again.
 - `Session::budget` is the document budget as a field only so the GUI unit
   test can lower it (a real 1 GiB document would be too heavy for a test).
 - Headless GUI runs: start `Xvfb :77 &` and run with `DISPLAY=:77

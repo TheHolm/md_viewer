@@ -140,7 +140,7 @@ pub fn zoom_limit(width: f32, height: f32, max_px: [u32; 2]) -> Result<f32, Stri
     if bytes > DOCUMENT_BUDGET as f64 {
         const MIB: f64 = 1024.0 * 1024.0;
         return Err(format!(
-            "memory limit ({} MiB, budget {} MiB)",
+            "can't render: object memory limit reached ({} MiB, limit {} MiB)",
             (bytes / MIB).ceil(),
             DOCUMENT_BUDGET / (1024 * 1024)
         ));
@@ -887,14 +887,7 @@ impl Cache {
                 }
                 self.misses.fetch_add(1, Ordering::Relaxed);
                 let rendered = render_math(tex, *display, settings);
-                insert_bounded(
-                    &self.math,
-                    key,
-                    rendered.clone(),
-                    MATH_CACHE_LIMIT,
-                    rendered_bytes,
-                );
-                rendered
+                insert_bounded(&self.math, key, rendered, MATH_CACHE_LIMIT, rendered_bytes)
             }
             Graphic::Diagram { source } => {
                 if source.trim().is_empty() {
@@ -909,11 +902,10 @@ impl Cache {
                         insert_bounded(
                             &self.diagrams,
                             source.clone(),
-                            svg.clone(),
+                            svg,
                             DIAGRAM_CACHE_LIMIT,
                             svg_bytes,
-                        );
-                        svg
+                        )
                     }
                 };
                 rasterize_diagram(&svg?, settings)
@@ -934,11 +926,10 @@ impl Cache {
                         insert_bounded(
                             &self.images,
                             key,
-                            decoded.clone(),
+                            decoded,
                             IMAGE_CACHE_LIMIT,
                             rendered_bytes,
-                        );
-                        decoded
+                        )
                     }
                 };
                 decoded.map(|image| {
@@ -969,23 +960,31 @@ const CACHE_BYTES: usize = 96 * 1024 * 1024;
 /// Inserts into a cache map, emptying it first if it holds `limit` entries
 /// or the new value would take it past [`CACHE_BYTES`] (`weigh` gives a
 /// value's size). A value larger than that on its own is not cached.
-fn insert_bounded<K: std::hash::Hash + Eq, V>(
+///
+/// Returns the value to use: if another thread cached the same key while
+/// this one was computing it, that value (so every user of an entry shares
+/// one pixel buffer), otherwise `value`.
+fn insert_bounded<K: std::hash::Hash + Eq, V: Clone>(
     map: &Mutex<HashMap<K, V>>,
     key: K,
     value: V,
     limit: usize,
     weigh: fn(&V) -> usize,
-) {
+) -> V {
+    let mut map = lock(map);
+    if let Some(found) = map.get(&key) {
+        return found.clone();
+    }
     let size = weigh(&value);
     if size > CACHE_BYTES {
-        return;
+        return value;
     }
-    let mut map = lock(map);
     let held: usize = map.values().map(weigh).sum();
     if map.len() >= limit || held + size > CACHE_BYTES {
         map.clear();
     }
-    map.insert(key, value);
+    map.insert(key, value.clone());
+    value
 }
 
 /// The bytes of pixels a rendered result holds.
@@ -1314,6 +1313,17 @@ mod tests {
         insert_bounded(&map, 4, CACHE_BYTES + 1, 100, |size| *size);
         assert!(!lock(&map).contains_key(&4));
         assert_eq!(lock(&map).len(), 1);
+    }
+
+    /// Two threads computing the same entry end up sharing one value: the
+    /// later insert returns the one already cached.
+    #[test]
+    fn cache_insert_returns_the_cached_value() {
+        let map = Mutex::new(HashMap::new());
+        let first = insert_bounded(&map, 1, Arc::new(10), 100, |_| 0);
+        let second = insert_bounded(&map, 1, Arc::new(20), 100, |_| 0);
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(*second, 10);
     }
 
     /// The weights: an image's pixel bytes (none for an error), a diagram's

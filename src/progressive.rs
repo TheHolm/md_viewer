@@ -139,31 +139,85 @@ pub fn clear_graphics(block: &mut Block) {
     for_each_graphic(std::slice::from_mut(block), |_, _, image| *image = None);
 }
 
-/// Which graphics on the page to drop (their pixels freed, re-rendered when
-/// scrolled near again) so a document holding `held` bytes gets within
-/// `budget`: from `candidates` (graphic id, bytes, distance from the view as
-/// [`crate::layout::distance_from_view`] gives it), the farthest first,
-/// never one at distance 0 (on or near the screen). May not reach the
-/// budget if what is near the view alone exceeds it.
-pub fn pick_drops(held: usize, budget: usize, candidates: &[(usize, usize, f64)]) -> Vec<usize> {
-    if held <= budget {
-        return Vec::new();
+/// One graphic on the page, as the memory budget sees it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Held {
+    /// The graphic's id.
+    pub id: usize,
+    /// Identifies its pixel buffer: graphics sharing a buffer (the same
+    /// formula shown many times) have the same key and count once.
+    pub key: usize,
+    /// The bytes of the buffer.
+    pub bytes: usize,
+    /// How far it is from the view (see
+    /// [`crate::layout::distance_from_view`]); 0 when on or near it.
+    pub distance: f64,
+    /// When it was put on the page (larger is newer).
+    pub arrived: u64,
+}
+
+/// The bytes `held` graphics hold, each shared buffer counted once.
+pub fn held_bytes(held: &[Held]) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    held.iter()
+        .filter(|graphic| seen.insert(graphic.key))
+        .map(|graphic| graphic.bytes)
+        .sum()
+}
+
+/// What to do so the `held` graphics fit in `budget` bytes: which to drop
+/// (pixels freed, a spinner in their place, drawn again when near the view)
+/// and which to show as over the document's memory limit.
+///
+/// Buffers are dropped whole, the farthest first: a buffer's distance is
+/// that of its graphic nearest the view, and one with a graphic on or near
+/// the view (distance 0) is never dropped. If what remains still exceeds
+/// the budget, the newest buffers near the view are limited (all their
+/// graphics) until it fits.
+pub fn plan_budget(held: &[Held], budget: usize) -> (Vec<usize>, Vec<usize>) {
+    let mut total = held_bytes(held);
+    if total <= budget {
+        return (Vec::new(), Vec::new());
     }
-    let mut far: Vec<&(usize, usize, f64)> = candidates
-        .iter()
-        .filter(|(_, bytes, distance)| *distance > 0.0 && *bytes > 0)
-        .collect();
-    far.sort_by(|a, b| b.2.total_cmp(&a.2));
-    let mut held = held;
-    let mut drops = Vec::new();
-    for (id, bytes, _) in far {
-        if held <= budget {
-            break;
+    // Buffers by key: bytes, nearest distance, newest arrival, ids.
+    let mut buffers: Vec<(usize, usize, f64, u64, Vec<usize>)> = Vec::new();
+    for graphic in held {
+        match buffers.iter_mut().find(|buffer| buffer.0 == graphic.key) {
+            Some(buffer) => {
+                buffer.2 = buffer.2.min(graphic.distance);
+                buffer.3 = buffer.3.max(graphic.arrived);
+                buffer.4.push(graphic.id);
+            }
+            None => buffers.push((
+                graphic.key,
+                graphic.bytes,
+                graphic.distance,
+                graphic.arrived,
+                vec![graphic.id],
+            )),
         }
-        held = held.saturating_sub(*bytes);
-        drops.push(*id);
     }
-    drops
+    let (mut far, mut near): (Vec<_>, Vec<_>) =
+        buffers.into_iter().partition(|buffer| buffer.2 > 0.0);
+    far.sort_by(|a, b| b.2.total_cmp(&a.2));
+    near.sort_by_key(|buffer| std::cmp::Reverse(buffer.3));
+    let mut take = |list: Vec<(usize, usize, f64, u64, Vec<usize>)>| {
+        let mut ids = Vec::new();
+        for (_, bytes, _, _, members) in list {
+            if total <= budget {
+                break;
+            }
+            if bytes == 0 {
+                continue;
+            }
+            total = total.saturating_sub(bytes);
+            ids.extend(members);
+        }
+        ids
+    };
+    let drops = take(far);
+    let limited = take(near);
+    (drops, limited)
 }
 
 /// Tracks which graphics have been rendered and which blocks are on the

@@ -4,8 +4,8 @@
 use md_viewer::layout::{
     align_fraction, available_width, cell_classes, color_channel, diagram_size, distance_from_view,
     font_size_px, heading_scale, math_rise, needs_more, pango_channel, pango_color, percent_alpha,
-    spinner_size, table_size, text_zoom_limit, DIAGRAM_PADDING, DOCUMENT_MARGIN,
-    FRONTIER_LOOKAHEAD, KEEP_SCREENS, MIN_DIAGRAM_WIDTH, MIN_TABLE_WIDTH,
+    refresh_delay, spinner_size, table_size, text_zoom_limit, DIAGRAM_PADDING, DOCUMENT_MARGIN,
+    FRONTIER_LOOKAHEAD, IDLE_FRAMES, KEEP_SCREENS, MIN_DIAGRAM_WIDTH, MIN_TABLE_WIDTH,
 };
 use md_viewer::Align;
 
@@ -306,4 +306,26 @@ fn spinner_sizes() {
     assert_eq!(spinner_size(400.0, 300.0), 32.0);
     assert_eq!(spinner_size(400.0, 20.0), 20.0);
     assert_eq!(spinner_size(7.0, 100.0), 0.0);
+}
+
+/// The frame callback stops after a few idle frames, not at once (a
+/// resize can take a frame or two to settle).
+#[test]
+fn idle_frames_before_stopping() {
+    assert!((2..=10).contains(&IDLE_FRAMES));
+}
+
+/// A search is refreshed at once the first time, once the document is
+/// fully on the page, or when the last refresh is long enough ago;
+/// otherwise after the rest of the interval.
+#[test]
+fn refresh_delays() {
+    use md_viewer::layout::SEARCH_REFRESH_MS;
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    assert_eq!(SEARCH_REFRESH_MS, 200);
+    assert_eq!(refresh_delay(None, false), None);
+    assert_eq!(refresh_delay(Some(ms(50)), true), None);
+    assert_eq!(refresh_delay(Some(ms(200)), false), None);
+    assert_eq!(refresh_delay(Some(ms(50)), false), Some(ms(150)));
 }

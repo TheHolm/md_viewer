@@ -685,21 +685,55 @@ pub fn read_limited(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
             size_text(limit)
         ))
     };
-    let metadata = fs::metadata(path)?;
-    if !metadata.is_file() {
-        return Err(refuse("not a regular file".to_string()));
-    }
-    if metadata.len() > limit {
-        return Err(too_large(metadata.len()));
-    }
+    let check = |metadata: &fs::Metadata| {
+        if !metadata.is_file() {
+            return Err(refuse("not a regular file".to_string()));
+        }
+        if metadata.len() > limit {
+            return Err(too_large(metadata.len()));
+        }
+        Ok(())
+    };
+    check(&fs::metadata(path)?)?;
+    let file = open_nonblocking(path)?;
+    // The path may have been replaced since it was checked: check what was
+    // actually opened.
+    let metadata = file.metadata()?;
+    check(&metadata)?;
     let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-    fs::File::open(path)?
-        .take(limit.saturating_add(1))
-        .read_to_end(&mut bytes)?;
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > limit {
         return Err(too_large(bytes.len() as u64));
     }
     Ok(bytes)
+}
+
+/// Reads at most the first `len` bytes of the regular file at `path`
+/// (enough to tell its type from its content), without blocking on a FIFO;
+/// anything but a regular file is refused like [`read_limited`] does.
+pub fn read_head(path: &Path, len: usize) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let file = open_nonblocking(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let mut head = Vec::with_capacity(len);
+    file.take(len as u64).read_to_end(&mut head)?;
+    Ok(head)
+}
+
+/// Opens `path` for reading without blocking: opening a FIFO with no writer
+/// would otherwise wait forever (the flag has no effect on reading regular
+/// files, the only kind read further).
+fn open_nonblocking(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
 }
 
 /// A byte count for messages: whole MiB from 1 MiB up, bytes below.
@@ -1309,6 +1343,29 @@ fn trailing_newlines(blocks: &[Block]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Opening without blocking returns at once even for a FIFO with no
+    /// writer (which a plain open would wait on forever), and the opened
+    /// file is seen to be no regular file; a regular file opens normally.
+    #[test]
+    fn open_nonblocking_does_not_wait_for_a_fifo() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let opened = open_nonblocking(&fifo).unwrap();
+        assert!(!opened.metadata().unwrap().is_file());
+        let file = dir.path().join("file");
+        fs::write(&file, "x").unwrap();
+        assert!(open_nonblocking(&file)
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .is_file());
+    }
 
     /// Sizes in messages are bytes below 1 MiB, whole MiB above.
     #[test]
