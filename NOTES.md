@@ -78,12 +78,17 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   picked file to an `adw::AlertDialog` (`md_viewer::Origin`). Ctrl+W closes
   a window. SIGINT/SIGTERM quit cleanly through the main loop.
   - Each shown document is a `Session`: it starts a `progressive::Pool`
-    (one worker per CPU) over all graphics, collects results from an
-    `mpsc` channel every 16 ms (`POLL_MS`, a `glib::timeout_add_local`
-    that stops when idle), stores them with their blocks and appends each
-    block once it and every block before it are complete
-    (`progressive::Progress`). Content is only ever appended, so nothing on
-    the page moves. `progressive::Phase` decides the cover / header spinner.
+    (one worker per CPU) over the graphics up to a *frontier*, collects
+    results from an `mpsc` channel every 16 ms (`POLL_MS`, a
+    `glib::timeout_add_local` that stops when idle), stores them with their
+    blocks and appends each block once it and every block before it are
+    complete (`progressive::Progress`). Content is only ever appended, so
+    nothing on the page moves. The frontier advances as the user scrolls
+    near the end of what is rendered (`Session::advance_frontier`), so a very
+    large document only renders the graphics near the view; the workers wait
+    on a condition variable for more jobs (`Pool::submit`) instead of
+    finishing. `progressive::Phase` decides the cover; the header spinner
+    shows while the run has outstanding work or a re-render is pending.
   - Text goes into the buffer with one `GtkTextTag` per `Style`; formulas
     are paintables (`ScaledTexture`: a device-pixel texture drawn at its
     logical size, replaceable in place), lowered by a per-formula `rise` tag,
@@ -130,7 +135,14 @@ run there; runtime verification on a real FreeBSD system is a manual step.
     (smart case, ignore case, regex). A `Session` keeps a `Search`: the
     whole text buffer is one search source, and every table-cell label,
     code-card label, diagram (its extracted labels joined) and image (its alt
-    text) is a `SearchEntry` registered as it is appended. Matches are
+    text) is a `SearchEntry` registered as it is appended. On top of that,
+    `search::document_units` lists the parsed document's render-independent
+    text (span runs split around formulas and images, table cells, code,
+    image alt) in document order, so a search covers blocks not yet rendered:
+    matches there are counted (with the sentinel buffer offset `i32::MAX`,
+    ordered by block) and, when navigated to, trigger `render_to` and a
+    pending scroll. While any block is not on the page, the count label shows
+    "…" (`SearchSummary::pending`). Matches are
     highlighted with text tags (buffer), a rebuilt Pango attribute list
     (labels, with their base style runs plus the highlight ranges), a CSS
     class (diagram cards and standalone/table-cell image boxes) or nothing
@@ -214,9 +226,12 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   on its line);
   `Progress` decides which blocks may go
   on the page (strictly in order, each once complete) and what to re-render
-  after a zoom (`reset_unshown`); `zoom_order`; `Phase` (FirstScreen,
+  after a zoom (`reset_unshown`, bounded by the frontier so far-off graphics
+  stay unrendered); `zoom_order`; `Phase` (FirstScreen,
   Background, Done); `Pool`, the worker threads (a shared queue taken from
-  the front, cancelled on `cancel` or drop; a result finished at that
+  the front, plus a condition variable the workers wait on when it empties,
+  so `Pool::submit` can add more jobs for lazy rendering; cancelled on
+  `cancel` or drop, which wakes the waiters; a result finished at that
   moment may still arrive, so the GUI tags runs with a generation).
 - `src/zoom.rs` (`md_viewer::zoom`) - zoom levels (`STEPS`, 50%-300%),
   `Zoom` (step in/out, reset, free `set` for pinches, `scroll` accumulating
@@ -409,13 +424,18 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   text view and table-cell labels use `query-tooltip` (whose coordinates are
   widget-space, the same as `dest_at`/`label_link_at`) and set plain tooltip
   text, so destinations containing markup characters are safe.
-- Search matches the rendered document: the whole text buffer (including
-  fallback sources), table-cell text, code-card text, the labels inside
-  diagrams and image alt text; formula source is not searchable (a rendered
+- Search matches the rendered document *and* the parsed text of blocks not
+  yet rendered: the whole text buffer (including fallback sources),
+  table-cell text, code-card text, the labels inside diagrams and image alt
+  text, plus `search::document_units`'s span runs, cells, code and alt for
+  blocks still off the page; formula source is not searchable (a rendered
   formula is pixels). Matches are found per source and kept in document
-  order by buffer offset; a diagram match highlights its whole card, and an
-  image alt-text match highlights a standalone or table-cell picture's box
-  (an inline image's alt text only counts and marks the scrollbar).
+  order by buffer offset (with `i32::MAX` and block order for unrendered
+  ones); a diagram match highlights its whole card, an image alt-text match
+  highlights a standalone or table-cell picture's box (an inline image's alt
+  text only counts and marks the scrollbar), and a match in an unrendered
+  block is counted but not highlighted until it is rendered. The find bar's
+  count is followed by "…" while any block is still off the page.
 
 ## Versioning
 

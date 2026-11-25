@@ -49,8 +49,15 @@ Background on the rendering crates is in `NOTES.md`.
   alt text highlights the whole picture, and a match on an inline image's alt
   text only counts and marks the scrollbar (an inline picture is a paintable,
   not a widget, so there is nothing to highlight).
-- A search started while a document is still loading only covers the part
-  already on the page; its results grow as blocks are appended.
+- A search started while a document is still loading covers the whole
+  document's text, but the sources of rendered formulas and diagram labels
+  only become searchable once they are drawn, so a search for those can gain
+  results as blocks are appended; the find bar shows "…" meanwhile.
+- A match in a block not yet rendered has no position on the page: it is
+  counted and can be navigated to (which renders up to its block and scrolls
+  there), but it is not highlighted or marked on the scrollbar until the
+  block is drawn. Stepping through a match that was just rendered may not
+  keep it selected.
 - A formula that is a link's only content is not clickable (it is drawn as
   pixels, so there is no text to hit); the link still has the link style.
 

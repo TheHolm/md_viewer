@@ -26,6 +26,14 @@ pub const CODE_INDENT: i32 = 28;
 /// copying, in milliseconds.
 pub const COPY_FEEDBACK_MS: u64 = 1500;
 
+/// How many window heights past the bottom of the view a document keeps
+/// rendered, so there is content waiting before more is asked for.
+pub const FRONTIER_LOOKAHEAD: f64 = 2.0;
+
+/// How many graphics are submitted at once as the rendering frontier
+/// advances (once per frame while more is needed).
+pub const FRONTIER_BATCH: usize = 64;
+
 /// The height of a find-bar scrollbar mark, in pixels.
 pub const SEARCH_MARK_HEIGHT: f64 = 4.0;
 
@@ -77,6 +85,19 @@ pub fn scroll_pixels(dy: f64, pixels: bool, page_size: f64) -> f64 {
     } else {
         dy * page_size.max(0.0).powf(2.0 / 3.0)
     }
+}
+
+/// True when the rendering frontier must advance: the rendered content's
+/// bottom (`content_bottom`) is higher than `viewport_bottom` plus
+/// `lookahead` window heights (`page_size`). A window not laid out yet
+/// (`page_size` is zero) never needs more - it is re-checked once it is.
+pub fn needs_more(
+    content_bottom: f64,
+    viewport_bottom: f64,
+    page_size: f64,
+    lookahead: f64,
+) -> bool {
+    page_size > 0.0 && content_bottom < viewport_bottom + lookahead * page_size
 }
 
 /// Where the top of the window is within the line under it, as a fraction

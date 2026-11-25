@@ -6,6 +6,38 @@ changes** summary (what also appears in the GitHub Release body) and a
 added at the top. `scripts/extract-release-notes.sh` prints just one release's
 section for the GitHub Release body.
 
+## v0.8.0 — Lazy rendering and complete search
+
+### User-facing changes
+
+- Very large documents render only what is near the view: graphics far below
+  the window are drawn as you scroll to them, so opening a huge document no
+  longer renders every formula and diagram up front. The header spinner turns
+  while content near the view is being drawn and stops once enough is ready.
+- Search now covers the whole document from the moment it opens, not just the
+  part that has been rendered: text, table cells, code and image alt text far
+  below the window are found at once. While more is still rendering (diagram
+  labels and the sources of formulas that could not be rendered appear as
+  they are drawn), the find bar shows "…" next to the match count until every
+  result is in.
+
+### Details
+
+- Version 0.7.1 → 0.8.0 (new feature).
+- A rendering "frontier" limits which graphics the worker pool renders: only
+  the jobs up to a point a couple of screens past the bottom of the window are
+  submitted, and the frontier advances (a batch of jobs at a time) as the
+  user scrolls near the end of what is rendered. The worker pool no longer
+  finishes when its queue empties; it waits (on a condition variable) for
+  more jobs, and `Pool::submit` appends them. `Progress::reset_unshown` now
+  takes the frontier, so a zoom only re-renders the graphics already on or
+  near the page.
+- Search is built from the parsed blocks (a canonical, ordered list of text,
+  table-cell, code and image-alt units) rather than only from the appended
+  buffer and widgets, so it is complete while the document is still being
+  rendered. Diagram labels and formula fallback sources still only become
+  searchable once they are drawn; the find bar reports that more is pending.
+
 ## v0.7.1 — Fix typing in the find bar
 
 ### User-facing changes

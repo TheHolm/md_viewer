@@ -17,7 +17,7 @@ use crate::{Block, ImageState, Inline};
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 /// Calls `visit` for every graphic in `blocks`, in document order (formulas
 /// and local images in text, then formulas and images in table cells row by
@@ -198,12 +198,20 @@ impl Progress {
         self.shown == self.missing.len()
     }
 
-    /// Forgets the results of every graphic not on the page yet (they were
-    /// rendered with settings that no longer apply, e.g. before a zoom) and
-    /// returns their ids, in order, to be rendered again.
-    pub fn reset_unshown(&mut self) -> Vec<usize> {
+    /// How many blocks, from the start, are on the page.
+    pub fn shown(&self) -> usize {
+        self.shown
+    }
+
+    /// Forgets the results of every graphic not on the page yet, but only up
+    /// to `frontier` (the number of graphics submitted for this run; graphics
+    /// beyond it were never rendered). Their earlier results no longer count
+    /// and they are returned, in order, to be rendered again. Graphics beyond
+    /// the frontier are left untouched, to be rendered lazily when scrolled
+    /// near.
+    pub fn reset_unshown(&mut self, frontier: usize) -> Vec<usize> {
         let mut reset = Vec::new();
-        for id in 0..self.rendered.len() {
+        for id in 0..frontier.min(self.rendered.len()) {
             if !self.is_shown(id) {
                 if self.rendered[id] {
                     self.rendered[id] = false;
@@ -277,13 +285,68 @@ pub fn worker_count(cpus: usize, jobs: usize) -> usize {
 ///
 /// The threads share one queue and take the next job from its front, so
 /// graphics finish roughly in document order. Each result is passed to the
-/// `deliver` callback (from a worker thread). Cancelling (or dropping the
-/// pool) stops the workers after the graphic each is working on; a result
-/// finished at that very moment may still be delivered, so callers tag
-/// results with a generation and drop stale ones.
+/// `deliver` callback (from a worker thread). The workers wait (rather than
+/// finish) when the queue empties, so more jobs can be added with
+/// [`Pool::submit`] - this is how lazy rendering hands out more work as the
+/// user scrolls. Cancelling (or dropping the pool) stops the workers and
+/// wakes any that are waiting; a result finished at that very moment may
+/// still be delivered, so callers tag results with a generation and drop
+/// stale ones.
 pub struct Pool {
+    /// The queue, wake-up channel and cancellation flag the workers share.
+    shared: Arc<Shared>,
+}
+
+/// The state the workers of a [`Pool`] share: the job queue, a condition
+/// variable to wait on when it is empty, and the cancellation flag.
+struct Shared {
+    /// The jobs still to render, taken from the front.
+    queue: Mutex<VecDeque<Job>>,
+    /// Signalled when jobs are added or the pool is cancelled.
+    condvar: Condvar,
     /// Set to stop the workers.
-    cancelled: Arc<AtomicBool>,
+    cancelled: AtomicBool,
+}
+
+impl Shared {
+    /// Blocks until a job is available or the pool is cancelled, then returns
+    /// it (`None` when cancelled).
+    fn next_job(&self) -> Option<Job> {
+        let mut queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if self.cancelled.load(Ordering::Relaxed) {
+                return None;
+            }
+            if let Some(job) = queue.pop_front() {
+                return Some(job);
+            }
+            queue = self
+                .condvar
+                .wait(queue)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    /// Pushes `jobs` onto the back of the queue and wakes the workers.
+    fn submit(&self, jobs: Vec<Job>) {
+        if jobs.is_empty() {
+            return;
+        }
+        self.queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(jobs);
+        self.condvar.notify_all();
+    }
+
+    /// Stops the workers and wakes any that are waiting for a job.
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+        self.condvar.notify_all();
+    }
 }
 
 impl Pool {
@@ -295,35 +358,37 @@ impl Pool {
         threads: usize,
         deliver: impl Fn(usize, Rendered) + Send + Sync + 'static,
     ) -> Pool {
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let queue = Arc::new(Mutex::new(VecDeque::from(jobs)));
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(VecDeque::from(jobs)),
+            condvar: Condvar::new(),
+            cancelled: AtomicBool::new(false),
+        });
         let deliver = Arc::new(deliver);
         for _ in 0..threads.max(1) {
-            let (cancelled, queue, deliver) = (cancelled.clone(), queue.clone(), deliver.clone());
+            let (shared, deliver) = (shared.clone(), deliver.clone());
             std::thread::spawn(move || loop {
-                if cancelled.load(Ordering::Relaxed) {
-                    return;
-                }
-                let job = queue
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .pop_front();
-                let Some(job) = job else {
+                let Some(job) = shared.next_job() else {
                     return;
                 };
                 let rendered = Cache::shared().render(&job.graphic, &settings);
-                if cancelled.load(Ordering::Relaxed) {
+                if shared.cancelled.load(Ordering::Relaxed) {
                     return;
                 }
                 deliver(job.id, rendered);
             });
         }
-        Pool { cancelled }
+        Pool { shared }
+    }
+
+    /// Adds `jobs` to the back of the queue, waking the workers (see
+    /// [`Pool`] for why they wait instead of finishing).
+    pub fn submit(&self, jobs: Vec<Job>) {
+        self.shared.submit(jobs);
     }
 
     /// Stops the workers (see [`Pool`] for results already on their way).
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Relaxed);
+        self.shared.cancel();
     }
 }
 

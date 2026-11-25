@@ -8,8 +8,11 @@
 //!
 //! Every match is reported as a byte range into the text searched, so the
 //! GUI can map it to text-buffer tags, Pango attribute ranges or a whole
-//! diagram card.
+//! diagram card. [`document_units`] lists the text of a parsed document that
+//! can be searched before its graphics are rendered, so the find bar covers
+//! a document that is still being drawn.
 
+use crate::{Block, Inline};
 use std::ops::Range;
 
 /// How a query is matched against text.
@@ -126,6 +129,80 @@ impl Matcher {
                 }
             }
         }
+    }
+}
+
+/// A searchable piece of a parsed document that exists before any graphics
+/// are rendered, so the find bar can search the whole document while it is
+/// still being drawn. Rendering-dependent text (diagram labels, and the
+/// sources of formulas or image placeholders that only appear once a graphic
+/// is drawn) is not listed here; the GUI adds that as it is rendered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unit {
+    /// The index of the block the piece is in.
+    pub block: usize,
+    /// The text to search.
+    pub text: String,
+}
+
+/// Every render-independent searchable piece of `blocks`, in document order
+/// (block order, then the order the pieces appear within a block). A text
+/// block's or table cell's span runs are split where a formula or image sits
+/// (matching how the rendered text is separated by embedded objects), and
+/// each image's alt text is a piece of its own. Diagrams are skipped: their
+/// labels only exist once the diagram is drawn.
+pub fn document_units(blocks: &[Block]) -> Vec<Unit> {
+    let mut units = Vec::new();
+    for (index, block) in blocks.iter().enumerate() {
+        match block {
+            Block::Text(inlines) => push_inline_units(index, inlines, &mut units),
+            Block::Table(table) => {
+                for cell in table.header.iter().chain(table.rows.iter().flatten()) {
+                    push_inline_units(index, cell, &mut units);
+                }
+            }
+            Block::Code(code) => {
+                if !code.text.is_empty() {
+                    units.push(Unit {
+                        block: index,
+                        text: code.text.clone(),
+                    });
+                }
+            }
+            Block::Mermaid(_) => {}
+        }
+    }
+    units
+}
+
+/// Adds the units of `inlines` to `units`: each run of consecutive text
+/// spans (split where a formula or image sits) and each image's alt text,
+/// in order.
+fn push_inline_units(block: usize, inlines: &[Inline], units: &mut Vec<Unit>) {
+    let mut run = String::new();
+    for inline in inlines {
+        match inline {
+            Inline::Text(span) => run.push_str(&span.text),
+            Inline::Math(_) | Inline::Image(_) => {
+                if !run.is_empty() {
+                    units.push(Unit {
+                        block,
+                        text: std::mem::take(&mut run),
+                    });
+                }
+                if let Inline::Image(image) = inline {
+                    if !image.alt.is_empty() {
+                        units.push(Unit {
+                            block,
+                            text: image.alt.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    if !run.is_empty() {
+        units.push(Unit { block, text: run });
     }
 }
 
@@ -266,5 +343,40 @@ mod tests {
         assert_eq!(fold_ranges("Straße", "straße"), vec![0..7]);
         assert_eq!(fold_ranges("İ", "i"), vec![0..2]);
         assert_eq!(fold_ranges("aaaaa", "aa"), vec![0..2, 2..4]);
+    }
+
+    /// `document_units` lists the render-independent text of a parsed
+    /// document in order: span runs split around a formula, an image's alt
+    /// text and a code block's code, but not a diagram's labels.
+    #[test]
+    fn document_units_cover_parsed_text() {
+        let blocks = crate::render(
+            "See $x$ and ![cat](c.png).\n\n```sh\nls\n```\n\n```mermaid\ngraph TD; A-->B\n```",
+        );
+        let units = document_units(&blocks);
+        assert!(units.windows(2).all(|pair| pair[0].block <= pair[1].block));
+        let text: Vec<&str> = units.iter().map(|unit| unit.text.as_str()).collect();
+        assert!(text.contains(&"See "), "{text:?}");
+        assert!(text.contains(&" and "), "{text:?}");
+        assert!(text.contains(&"cat"), "{text:?}");
+        assert!(text.contains(&"ls"), "{text:?}");
+        // No span run straddles the formula, and the diagram's labels are not
+        // listed (they only exist once rendered).
+        assert!(text.iter().all(|piece| !piece.contains('x')), "{text:?}");
+        let joined = text.concat();
+        assert!(!joined.contains("graph"), "{text:?}");
+        assert!(!joined.contains("A-->B"), "{text:?}");
+    }
+
+    /// Table cells contribute their text too, split around a formula like a
+    /// text block.
+    #[test]
+    fn document_units_include_table_cells() {
+        let blocks = crate::render("| a |\n|---|\n| b $y$ c |");
+        let text: Vec<String> = document_units(&blocks)
+            .into_iter()
+            .map(|unit| unit.text)
+            .collect();
+        assert_eq!(text, ["a", "b ", " c"]);
     }
 }

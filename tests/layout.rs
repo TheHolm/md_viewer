@@ -3,13 +3,39 @@
 
 use md_viewer::layout::{
     align_fraction, available_width, cell_classes, color_channel, diagram_size, font_size_px,
-    heading_scale, math_rise, pango_channel, pango_color, percent_alpha, table_size,
-    DIAGRAM_PADDING, DOCUMENT_MARGIN, MIN_DIAGRAM_WIDTH, MIN_TABLE_WIDTH,
+    heading_scale, math_rise, needs_more, pango_channel, pango_color, percent_alpha, table_size,
+    DIAGRAM_PADDING, DOCUMENT_MARGIN, FRONTIER_LOOKAHEAD, MIN_DIAGRAM_WIDTH, MIN_TABLE_WIDTH,
 };
 use md_viewer::Align;
 
 /// Pango's fixed-point scale (`pango::SCALE`), so these tests need no GTK.
 const PANGO_SCALE: i32 = 1024;
+
+/// The rendering frontier advances while the rendered content does not reach
+/// the requested lookahead past the bottom of the view.
+#[test]
+fn needs_more_by_distance() {
+    // A window 500 px tall, viewport bottom at 500; with a 2x lookahead more
+    // is needed until the content reaches 1500.
+    assert!(needs_more(100.0, 500.0, 500.0, 2.0));
+    assert!(needs_more(1499.0, 500.0, 500.0, 2.0));
+    assert!(!needs_more(1500.0, 500.0, 500.0, 2.0));
+    assert!(!needs_more(2000.0, 500.0, 500.0, 2.0));
+}
+
+/// A window not laid out yet (no page height) never needs more; it is
+/// re-checked once it is laid out.
+#[test]
+fn needs_more_requires_a_window() {
+    assert!(!needs_more(0.0, 0.0, 0.0, 2.0));
+    assert!(!needs_more(10.0, 0.0, 0.0, 2.0));
+}
+
+/// The lookahead constant is a positive number of window heights.
+#[test]
+fn frontier_lookahead_is_positive() {
+    assert!(FRONTIER_LOOKAHEAD > 0.0);
+}
 
 /// The available width is the view minus both margins and some slack.
 #[test]
