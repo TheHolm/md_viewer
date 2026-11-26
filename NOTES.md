@@ -303,7 +303,8 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   `Unsupported` with a reason), `heading_starts` (the headings inside a
   text block: a text block holds many headings, paragraphs and lists, so a
   heading is a run of spans with the same `Style::Heading`, plus formulas
-  or images next to it), `heading_slug` (GitHub-style heading anchors),
+  or images next to it), `heading_slug` and `github_slug` (heading anchors: ours collapses
+  whitespace runs, GitHub's keeps one hyphen per whitespace character),
   `Anchors` (the registry the GUI fills as blocks are appended, adding the
   duplicate `-N` suffixes in document order; fragments are percent-decoded
   by `resolve_link`, so `#%C3%BCber` finds `über`), `file_uri`, and
@@ -476,8 +477,9 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   clickable without re-parsing. A single click opens it (web/`mailto:` and
   non-Markdown local files via `GtkUriLauncher`, Markdown files in a new
   viewer window, relative paths resolved against the document); a
-  `#fragment` scrolls to the matching heading, whose anchor is a
-  GitHub-style slug (duplicates get `-1`, `-2`, ...). Every heading has its
+  `#fragment` scrolls to the matching heading, found by its slug
+  (`heading_slug`) or its GitHub spelling (`github_slug`; duplicates get
+  `-1`, `-2`, ... in each). Every heading has its
   own anchor, registered at its first character as its text block is
   appended (`links::heading_starts`). What a click does is decided by
   `links::link_action` (see "Link safety" under "Gotchas and techniques"):
@@ -691,6 +693,22 @@ Things learned the hard way; add to this list when you learn another.
   zooms); the window finding its first monitor is not a move and zooms out
   as usual. The unit tests turn following off (`follows_monitor`) and call
   `rescale` directly; a real monitor move is only checked by hand.
+- `Anchors` keeps two maps, our slugs and GitHub's, each with its own `-N`
+  duplicate counter; `lookup` tries ours first, so adding the GitHub
+  spelling never changes where an existing link goes.
+- The window's find shortcuts (`handle_key`: `/`, `n`, `N`, Escape) run in
+  the capture phase over the whole window, so they step aside
+  (`keys_belong_elsewhere`) while an `adw` dialog is shown in the window
+  (`visible_dialog`) or the focus is in a popover; otherwise they would
+  take Escape from the dialog and the menus.
+- Link click handlers (text view, table-cell labels, linked pictures) act
+  on a single click only (`layout::opens_link(n_press)`): the second
+  release of a double click would open the link again.
+- Regex search runs on each piece of text between U+FFFC object
+  placeholders (`search::regex_ranges`), so `.`/`\W`/`\S` never match an
+  embedded object and no match spans one. A leading byte-order mark is
+  stripped in `render`. `ImageRef::failure_reason` is the one place an
+  image placeholder's reason comes from (text view and table cells).
 - The spot held after a zoom (`hold_anchor`) is let go of on user input
   only: Ctrl-less wheel scrolling (the window's scroll controller), a
   scrolling key (`layout::is_scroll_key`), a press on the vertical

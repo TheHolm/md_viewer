@@ -3,7 +3,7 @@
 //! ranges, and the links inside label text.
 
 use md_viewer::links::{
-    file_uri, heading_blocks, heading_slug, heading_starts, link_action, link_tooltip,
+    file_uri, github_slug, heading_blocks, heading_slug, heading_starts, link_action, link_tooltip,
     local_file_risk, resolve_image, resolve_link, Anchors, FileFacts, LinkAction, LinkRanges,
     Resolved,
 };
@@ -189,6 +189,43 @@ fn slug_drops_trailing_hyphen() {
     assert_eq!(heading_slug("foo-"), "foo");
     assert_eq!(heading_slug("a - "), "a");
     assert_eq!(heading_slug("Hello World-"), "hello-world");
+}
+
+/// GitHub's spelling keeps every whitespace character as a hyphen (no
+/// collapsing, a trailing one kept), drops punctuation and keeps letters,
+/// digits, `_` and `-`.
+#[test]
+fn github_slugs() {
+    assert_eq!(github_slug("Install - Linux"), "install---linux");
+    assert_eq!(github_slug("  Hello   World  "), "hello---world");
+    assert_eq!(github_slug("foo -"), "foo--");
+    assert_eq!(github_slug("What? Yes."), "what-yes");
+    assert_eq!(github_slug("A_B C"), "a_b-c");
+    assert_eq!(github_slug("Café Olé"), "café-olé");
+    assert_eq!(github_slug("!!!"), "");
+}
+
+/// A heading is found by our anchor and by GitHub's; duplicates count up
+/// in each spelling; our spelling wins when it names another heading.
+#[test]
+fn anchors_accept_github_spelling() {
+    let mut anchors = Anchors::default();
+    assert_eq!(
+        anchors.register("Install - Linux", 10).as_deref(),
+        Some("install--linux")
+    );
+    assert_eq!(anchors.lookup("install--linux"), Some(10));
+    assert_eq!(anchors.lookup("install---linux"), Some(10));
+    anchors.register("Install - Linux", 20);
+    assert_eq!(anchors.lookup("install--linux-1"), Some(20));
+    assert_eq!(anchors.lookup("install---linux-1"), Some(20));
+    // `a  b` is `a-b` here and `a--b` on GitHub; a later heading that is
+    // `a--b` in our spelling keeps that anchor for itself.
+    anchors.register("a  b", 30);
+    anchors.register("a--b", 40);
+    assert_eq!(anchors.lookup("a-b"), Some(30));
+    assert_eq!(anchors.lookup("a--b"), Some(40));
+    assert_eq!(anchors.lookup("nowhere"), None);
 }
 
 // --- LinkRanges -----------------------------------------------------------

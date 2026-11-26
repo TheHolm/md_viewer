@@ -361,3 +361,13 @@ fn scroll_keys() {
         assert!(!md_viewer::layout::is_scroll_key(key), "{key}");
     }
 }
+
+/// Only a single click opens a link, not the later clicks of a double or
+/// triple click.
+#[test]
+fn single_clicks_open_links() {
+    assert!(md_viewer::layout::opens_link(1));
+    for presses in [0, 2, 3, -1] {
+        assert!(!md_viewer::layout::opens_link(presses));
+    }
+}

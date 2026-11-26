@@ -57,10 +57,6 @@ const POLL_MS: u64 = 16;
 /// milliseconds; until then they are shown stretched.
 const REZOOM_DELAY_MS: u64 = 150;
 
-/// What the placeholder for an image with a network destination says: the
-/// viewer never fetches anything, and that is not planned.
-const NETWORK_UNSUPPORTED: &str = "network loading is not supported";
-
 /// Styling for the widgets the document is built from (tables, code cards,
 /// diagrams, the loading cover). Colours derive from the theme's text
 /// colour, so light and dark themes both work; diagrams sit on a white card
@@ -1346,20 +1342,9 @@ impl Session {
     /// whose image is part of a link is clickable, and every picture's alt
     /// text is searchable.
     fn insert_image(&self, buffer: &gtk4::TextBuffer, image: &ImageRef, standalone: bool) {
-        match &image.state {
-            ImageState::Remote => {
-                self.insert_image_placeholder(buffer, image, Some(NETWORK_UNSUPPORTED));
-                return;
-            }
-            ImageState::Unsupported(reason) => {
-                self.insert_image_placeholder(buffer, image, Some(reason));
-                return;
-            }
-            ImageState::Unresolved => {
-                self.insert_image_placeholder(buffer, image, Some("not resolved"));
-                return;
-            }
-            ImageState::Local(_) => {}
+        if !matches!(image.state, ImageState::Local(_)) {
+            self.insert_image_placeholder(buffer, image, image.failure_reason());
+            return;
         }
         match &image.image {
             Some(Ok(rendered)) => {
@@ -1428,13 +1413,9 @@ impl Session {
                     );
                 }
             }
-            failed => {
+            _ => {
                 self.add_slot(None);
-                let reason = match failed {
-                    Some(Err(reason)) => reason.as_str(),
-                    _ => "not rendered",
-                };
-                self.insert_image_placeholder(buffer, image, Some(reason));
+                self.insert_image_placeholder(buffer, image, image.failure_reason());
             }
         }
     }
@@ -1949,8 +1930,8 @@ impl Session {
         {
             let weak = weak.clone();
             let links = links.clone();
-            click.connect_released(move |gesture, _, x, y| {
-                if gesture.current_button() != gdk::BUTTON_PRIMARY {
+            click.connect_released(move |gesture, presses, x, y| {
+                if gesture.current_button() != gdk::BUTTON_PRIMARY || !layout::opens_link(presses) {
                     return;
                 }
                 let Some(session) = weak.upgrade() else {
@@ -2006,8 +1987,8 @@ impl Session {
         {
             let weak = weak.clone();
             let dest = dest.clone();
-            click.connect_released(move |gesture, _, _, _| {
-                if gesture.current_button() != gdk::BUTTON_PRIMARY {
+            click.connect_released(move |gesture, presses, _, _| {
+                if gesture.current_button() != gdk::BUTTON_PRIMARY || !layout::opens_link(presses) {
                     return;
                 }
                 if let Some(session) = weak.upgrade() {
@@ -2885,6 +2866,7 @@ impl DocWindow {
                 || focus.is_ancestor(&self.search_entry)
         });
         if in_entry
+            || self.keys_belong_elsewhere()
             || modifiers.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK)
         {
             return glib::Propagation::Proceed;
@@ -2908,6 +2890,19 @@ impl DocWindow {
             }
             _ => glib::Propagation::Proceed,
         }
+    }
+
+    /// Whether keys are meant for something on top of the document rather
+    /// than the find bar shortcuts: a dialog shown in the window (the error
+    /// or link confirmation, where Escape is Cancel), or a popover holding
+    /// the focus (the search mode menu, the text's context menu).
+    fn keys_belong_elsewhere(&self) -> bool {
+        if self.window.visible_dialog().is_some() {
+            return true;
+        }
+        gtk4::prelude::RootExt::focus(&self.window).is_some_and(|focus| {
+            focus.is::<gtk4::Popover>() || focus.ancestor(gtk4::Popover::static_type()).is_some()
+        })
     }
 
     /// Steps to the next (`forward`) or previous match, if there is a query.
@@ -3160,8 +3155,8 @@ impl DocWindow {
         {
             let weak = Rc::downgrade(&session);
             let click = gtk4::GestureClick::new();
-            click.connect_released(move |gesture, _, x, y| {
-                if gesture.current_button() != gdk::BUTTON_PRIMARY {
+            click.connect_released(move |gesture, presses, x, y| {
+                if gesture.current_button() != gdk::BUTTON_PRIMARY || !layout::opens_link(presses) {
                     return;
                 }
                 if let Some(session) = weak.upgrade() {
@@ -4971,6 +4966,80 @@ mod tests {
         session.hold_anchor();
         touch.emit_by_name::<()>("drag-begin", &[&0.0f64, &0.0f64]);
         assert!(session.anchor.borrow().is_none(), "a touch drag");
+        window.window.close();
+        key_routing_checks(app);
+    }
+
+    /// The window's find shortcuts leave keys to dialogs and popovers (part
+    /// of [`gtk_helpers`]): with a dialog shown, Escape, `n` and `/` are
+    /// passed on and the find bar is left alone; once it is closed `/`
+    /// opens the find bar again; with the focus in a popover, Escape is
+    /// passed on. Also: a heading is found by its GitHub-style anchor.
+    fn key_routing_checks(app: &adw::Application) {
+        let window = DocWindow::new(app);
+        let session = window.show_document(
+            Path::new("/doc/keys.md"),
+            md_viewer::render("# Install - Linux\n\nText.\n"),
+        );
+        session.start(RasterSettings::default());
+        settle(&session);
+        let context = glib::MainContext::default();
+        let none = gdk::ModifierType::empty();
+        let passed = |key| window.handle_key(key, none) == glib::Propagation::Proceed;
+
+        show_error(&window.window, "a test error");
+        while context.iteration(false) {}
+        assert!(window.window.visible_dialog().is_some());
+        for key in [gdk::Key::Escape, gdk::Key::n, gdk::Key::N, gdk::Key::slash] {
+            assert!(passed(key), "{key:?}");
+        }
+        assert!(!window.search_bar.is_search_mode());
+        window
+            .window
+            .visible_dialog()
+            .expect("the dialog")
+            .force_close();
+        while context.iteration(false) {}
+        assert!(window.window.visible_dialog().is_none());
+        assert!(!passed(gdk::Key::slash));
+        assert!(window.search_bar.is_search_mode());
+        window.focus_view();
+        while context.iteration(false) {}
+        assert!(!passed(gdk::Key::Escape));
+        assert!(!window.search_bar.is_search_mode());
+
+        let popover = window
+            .search_mode_button
+            .popover()
+            .expect("the search mode popover");
+        window.search_bar.set_search_mode(true);
+        while context.iteration(false) {}
+        popover.popup();
+        while context.iteration(false) {}
+        let focus_in_popover = gtk4::prelude::RootExt::focus(&window.window).is_some_and(|f| {
+            f.is::<gtk4::Popover>() || f.ancestor(gtk4::Popover::static_type()).is_some()
+        });
+        if !focus_in_popover {
+            // Headless X may not move the focus; put it there.
+            popover.child().expect("popover content").grab_focus();
+            while context.iteration(false) {}
+        }
+        assert!(window.keys_belong_elsewhere());
+        assert!(passed(gdk::Key::Escape));
+        assert!(window.search_bar.is_search_mode());
+        popover.popdown();
+        while context.iteration(false) {}
+
+        // Both spellings of the heading's anchor are found on the page.
+        let anchors = session.anchors.borrow();
+        assert!(anchors.lookup("install--linux").is_some());
+        assert_eq!(
+            anchors.lookup("install---linux"),
+            anchors.lookup("install--linux")
+        );
+        drop(anchors);
+        session.click_link("#install---linux");
+        assert!(session.pending_anchor.borrow().is_none());
         window.window.close();
     }
 }

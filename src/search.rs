@@ -114,11 +114,7 @@ impl Matcher {
         }
         match self.mode {
             SearchMode::Regex => match &self.regex {
-                Some(regex) => regex
-                    .find_iter(text)
-                    .map(|found| found.range())
-                    .filter(|range| !range.is_empty())
-                    .collect(),
+                Some(regex) => regex_ranges(regex, text),
                 None => Vec::new(),
             },
             SearchMode::SmartCase | SearchMode::NoCase => {
@@ -130,6 +126,29 @@ impl Matcher {
             }
         }
     }
+}
+
+/// The character the GUI's text stands in for an embedded object (a table,
+/// code card, diagram or picture) with.
+pub const OBJECT_REPLACEMENT: char = '\u{fffc}';
+
+/// The non-empty matches of `regex` in `text`, searched separately in each
+/// piece between [`OBJECT_REPLACEMENT`] characters: a regex never matches
+/// an embedded object's placeholder (`.`, `\W` or `\S` would) nor runs
+/// across one, and `^`/`$` (with `(?m)`) see each piece's ends.
+fn regex_ranges(regex: &regex::Regex, text: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    for piece in text.split(OBJECT_REPLACEMENT) {
+        ranges.extend(
+            regex
+                .find_iter(piece)
+                .map(|found| found.start() + start..found.end() + start)
+                .filter(|range| !range.is_empty()),
+        );
+        start += piece.len() + OBJECT_REPLACEMENT.len_utf8();
+    }
+    ranges
 }
 
 /// A searchable piece of a parsed document that exists before any graphics
@@ -397,6 +416,22 @@ mod tests {
         // An uppercase query in smart case stays exact.
         let matcher = Matcher::new("STRASSE", SearchMode::SmartCase).unwrap();
         assert!(matcher.find("straße").is_empty());
+    }
+
+    /// In regex mode the object placeholder is never matched and no match
+    /// runs across it; offsets still point into the whole text, and `^`/`$`
+    /// anchor to each piece.
+    #[test]
+    fn regex_skips_object_placeholders() {
+        let find =
+            |query: &str, text: &str| Matcher::new(query, SearchMode::Regex).unwrap().find(text);
+        assert_eq!(find(".", "a\u{fffc}b"), vec![0..1, 4..5]);
+        assert_eq!(find("\\W", "a\u{fffc} b"), vec![4..5]);
+        assert_eq!(find("\\S+", "ab\u{fffc}cd"), vec![0..2, 5..7]);
+        assert!(find("a.b", "a\u{fffc}b").is_empty());
+        assert_eq!(find("^b$", "a\u{fffc}b"), vec![4..5]);
+        assert_eq!(find("é.", "xé\u{fffc}éz"), vec![6..9]);
+        assert_eq!(find("x", "\u{fffc}\u{fffc}x"), vec![6..7]);
     }
 
     /// `document_units` lists the render-independent text of a parsed

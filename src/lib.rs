@@ -284,6 +284,24 @@ impl ImageRef {
         }
     }
 
+    /// Why the image is shown as its placeholder rather than drawn, or
+    /// `None` when it is drawn (a local file rendered successfully): network
+    /// loading is not supported, the destination is unsupported (with its
+    /// reason), it was never resolved, rendering failed (with the error), or
+    /// it is not rendered yet.
+    pub fn failure_reason(&self) -> Option<&str> {
+        match &self.state {
+            ImageState::Remote => Some(NETWORK_UNSUPPORTED),
+            ImageState::Unsupported(reason) => Some(reason),
+            ImageState::Unresolved => Some("not resolved"),
+            ImageState::Local(_) => match &self.image {
+                Some(Ok(_)) => None,
+                Some(Err(reason)) => Some(reason),
+                None => Some("not rendered"),
+            },
+        }
+    }
+
     /// The text shown in place of the image: `[image: <alt>]`, with `reason`
     /// added when there is one (`[image: <alt> — <reason>]`).
     pub fn placeholder(&self, reason: Option<&str>) -> String {
@@ -293,6 +311,9 @@ impl ImageRef {
         }
     }
 }
+
+/// Why a network image is not shown: the viewer never fetches anything.
+pub const NETWORK_UNSUPPORTED: &str = "network loading is not supported";
 
 /// One element of flowing text: a run of styled text, a formula or an image.
 #[derive(Debug, Clone, PartialEq)]
@@ -625,10 +646,10 @@ pub fn label_text(inlines: &[Inline]) -> LabelText {
         let (span_text, styles, link) = match inline {
             Inline::Text(span) => (span.text.clone(), span.styles.clone(), span.link.clone()),
             Inline::Math(math) => (math.source(), vec![Style::Code], None),
-            // A label cannot show the image; show its placeholder, keeping any
-            // link so the placeholder stays clickable.
+            // A label cannot show the image; show its placeholder with the
+            // reason, keeping any link so the placeholder stays clickable.
             Inline::Image(image) => (
-                image.placeholder(None),
+                image.placeholder(image.failure_reason()),
                 vec![Style::Image],
                 image.link.clone(),
             ),
@@ -830,8 +851,12 @@ pub fn window_title(path: &Path) -> String {
 /// HTML, for instance) is shown as plain text rather than dropped. Blocks are
 /// separated by a blank line, list items by a single newline, and adjacent
 /// text with identical styles is merged into one span. See the "Rendering
-/// model" section of `NOTES.md` for the full set of rules.
+/// model" section of `NOTES.md` for the full set of rules. A UTF-8
+/// byte-order mark at the start is skipped (Markdown would otherwise see the
+/// first line as starting with an invisible character, not a heading, list
+/// or fence).
 pub fn render(source: &str) -> Vec<Block> {
+    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS

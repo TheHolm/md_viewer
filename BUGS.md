@@ -32,26 +32,20 @@ Background on the rendering crates is in `NOTES.md`.
   the render workers do not reserve their bytes before allocating, so while
   rendering the document can briefly hold up to one graphic per worker
   over the budget (accepted as not a problem).
-- A UTF-8 byte-order mark at the start of a file is not stripped, so the
-  first heading, list or fence of such a file is shown as plain text.
-- Heading anchors collapse runs of hyphens and drop trailing ones, unlike
-  GitHub (`Install - Linux` is `install--linux` here, `install---linux` on
-  GitHub), so a table of contents copied from GitHub can miss; combining
-  marks are dropped too.
 - An image file changed on disk shows the change only when the document is
   reopened or zoomed (nothing watches the file), and a change to a file an
   SVG image refers to (`<image href>`) is not noticed at all until restart.
-- In regex mode, `.`/`\W`/`\S` match the placeholder character of embedded
-  objects (tables, code cards, pictures), inflating the match count. Regex
-  mode's `(?i)` uses the regex crate's simple case folding (`ß` does not
-  match `ss` there, unlike in the other modes).
-- The window's key handler takes Escape, `n`, `N` and `/` from the error
-  dialog and popovers; a double click on a link in a table cell or on a
-  linked picture opens it twice.
-- An image in a table cell that cannot be drawn (missing, too large, ...)
-  shows `[image: <alt>]` without the reason.
+- Regex mode's `(?i)` uses the regex crate's simple case folding (`ß`
+  does not match `ss` there, unlike in the other modes).
 
 ## Limitations
+
+- Heading anchors are matched in two spellings: ours (runs of whitespace
+  collapse to one hyphen, a trailing hyphen is dropped; GitLab's rule is
+  close to it) and GitHub's (`Install - Linux` is `install---linux`).
+  Combining marks are dropped in both, so a heading in a script that uses
+  them (Devanagari vowel signs, for instance) has a different anchor than
+  on GitHub.
 
 - Lists (and, for code cards, block quotes) are indented at most
   `MAX_LIST_INDENT` (4) levels; deeper items line up at the fourth level.
@@ -123,7 +117,9 @@ Background on the rendering crates is in `NOTES.md`.
   cross-file/anchor scrolling) needs input events and a running desktop
   session, so the GUI tests do not reach it; the resolution and range logic
   is fully tested, and the interaction is checked by hand (or with `xdotool`
-  on Xvfb, see `NOTES.md`). The GUI unit tests do open a real document
+  on Xvfb, see `NOTES.md`). That only a single click opens a link (not the
+  second click of a double click) is tested through `layout::opens_link`,
+  not with real clicks. The GUI unit tests do open a real document
   session and check that every heading is registered at its own buffer
   offset and that a clicked fragment is resolved and found, but not the
   scrolling itself.

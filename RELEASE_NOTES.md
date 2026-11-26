@@ -75,6 +75,18 @@ section for the GitHub Release body.
 - Documents with very many graphics finish loading faster: each result is
   stored directly instead of searching the whole document for its place.
 - A large image used inline several times is shrunk once and shared.
+- A file starting with a UTF-8 byte-order mark shows its first heading,
+  list or code block properly instead of as plain text.
+- Double-clicking a link in a table cell or on a linked picture opens it
+  once, not twice.
+- Escape, `n`, `N` and `/` go to an open dialog or menu instead of the
+  find bar behind it (Escape now cancels the error and confirmation
+  dialogs).
+- An image in a table cell that cannot be shown says why, as elsewhere.
+- Links to headings written for GitHub work too: `#install---linux` finds
+  `## Install - Linux`, as does the viewer's own `#install--linux`.
+- Regex search no longer matches the places where tables, code blocks and
+  pictures sit (`.` used to count each of them).
 - Closing a window no longer leaves its clickable table cells and its zoom
   style behind in memory.
 
@@ -189,6 +201,18 @@ section for the GitHub Release body.
 - `Session::release_anchor_on_input`: a capture-phase key controller
   (`layout::is_scroll_key`), a press gesture on the vertical scrollbar and
   a touch-only drag gesture let go of the held spot.
+- `render` strips a leading U+FEFF; `layout::opens_link` gates every link
+  click handler on a single press; `DocWindow::keys_belong_elsewhere`
+  (a `visible_dialog`, or focus inside a `gtk4::Popover`) makes
+  `handle_key` pass keys on; `ImageRef::failure_reason` (and
+  `NETWORK_UNSUPPORTED`, moved to the library) gives placeholders their
+  reason in labels too; `links::github_slug` and a second map in `Anchors`
+  (ours looked up first); `search::regex_ranges` searches each piece
+  between U+FFFC placeholders.
+- Tests: byte-order mark handling, failure reasons and table-cell
+  placeholders, GitHub slugs and anchors in both spellings (also in the
+  GUI), regex pieces, single-click links, and key routing with a dialog
+  and a popover (fails without the guard).
 - Tests: placing by location (and refusing wrong locations), every
   location reaching its graphic in the showcase fixture, deep list caps
   (3000 levels, code cards), shared shrunk inline images, a freed

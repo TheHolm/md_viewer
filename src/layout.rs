@@ -49,6 +49,14 @@ pub fn is_scroll_key(name: &str) -> bool {
     )
 }
 
+/// Whether a primary-button release that ends click number `presses` of a
+/// series opens the link under it: only a single click does. The second
+/// release of a double click (which selects a word in text) must not open
+/// the link again.
+pub fn opens_link(presses: i32) -> bool {
+    presses == 1
+}
+
 /// How long the copy button of a code card shows its check mark after
 /// copying, in milliseconds.
 pub const COPY_FEEDBACK_MS: u64 = 1500;

@@ -330,11 +330,12 @@ fn is_markdown(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown"))
 }
 
-/// The anchor a heading with `text` is addressed by: GitHub-style
-/// lower-casing, spaces and other separators collapse to a single hyphen,
-/// and anything that is not a letter, digit, underscore or hyphen is
-/// dropped. Duplicate suffixes (`-1`, `-2`, ...) are added by the caller,
-/// which knows the order the headings appear in.
+/// The anchor a heading with `text` is addressed by: lower-cased, runs of
+/// whitespace collapse to a single hyphen, and anything that is not a
+/// letter, digit, underscore or hyphen is dropped (close to GitLab's rule).
+/// Duplicate suffixes (`-1`, `-2`, ...) are added by the caller, which
+/// knows the order the headings appear in. [`github_slug`] is the other
+/// spelling a heading is found by.
 pub fn heading_slug(text: &str) -> String {
     let mut slug = String::new();
     let mut pending_hyphen = false;
@@ -360,6 +361,28 @@ pub fn heading_slug(text: &str) -> String {
         slug.pop();
     }
     slug
+}
+
+/// The anchor GitHub gives a heading with `text` (github-slugger): trimmed
+/// and lower-cased, anything other than a letter, digit, `_`, `-` or
+/// whitespace dropped, and every whitespace character (not runs of them)
+/// turned into a hyphen, a trailing one included. `Install - Linux` is
+/// `install---linux` here and `install--linux` in [`heading_slug`];
+/// tables of contents written for GitHub use this spelling.
+pub fn github_slug(text: &str) -> String {
+    text.trim()
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter_map(|ch| {
+            if ch.is_whitespace() {
+                Some('-')
+            } else if ch.is_alphanumeric() || ch == '_' || ch == '-' {
+                Some(ch)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// The headings in a text block's `inlines`: for each, the index of its
@@ -431,37 +454,51 @@ fn heading_level(styles: &[Style]) -> Option<u8> {
 
 /// The headings of a document, by anchor, as they are appended to the page.
 ///
-/// Each heading gets the anchor [`heading_slug`] gives its text; a repeated
-/// anchor gets `-1`, `-2`, ... appended in document order, like GitHub.
-/// `offset` is wherever the caller wants to scroll to (the GUI uses the
-/// heading's first buffer character).
+/// Each heading gets the anchor [`heading_slug`] gives its text, and is
+/// also found by its GitHub spelling ([`github_slug`]); in each spelling a
+/// repeated anchor gets `-1`, `-2`, ... appended in document order, like
+/// GitHub. Our own spelling wins when both name different headings, so a
+/// link that worked keeps its meaning. `offset` is wherever the caller wants
+/// to scroll to (the GUI uses the heading's first buffer character).
 #[derive(Debug, Default)]
 pub struct Anchors {
     offsets: HashMap<String, i32>,
+    github: HashMap<String, i32>,
+}
+
+/// Adds `base` (with the first free `-N` suffix if it is taken) to `map`
+/// for `offset`, returning the anchor it got, or `None` for an empty base.
+fn register_unique(map: &mut HashMap<String, i32>, base: String, offset: i32) -> Option<String> {
+    if base.is_empty() {
+        return None;
+    }
+    let mut slug = base.clone();
+    let mut n = 1;
+    while map.contains_key(&slug) {
+        slug = format!("{base}-{n}");
+        n += 1;
+    }
+    map.insert(slug.clone(), offset);
+    Some(slug)
 }
 
 impl Anchors {
     /// Registers a heading with `text` at `offset`, returning its anchor, or
     /// `None` if the text has no anchor (it is only punctuation or spaces).
+    ///
+    /// The heading is also registered under its GitHub spelling.
     pub fn register(&mut self, text: &str, offset: i32) -> Option<String> {
-        let base = heading_slug(text);
-        if base.is_empty() {
-            return None;
-        }
-        let mut slug = base.clone();
-        let mut n = 1;
-        while self.offsets.contains_key(&slug) {
-            slug = format!("{base}-{n}");
-            n += 1;
-        }
-        self.offsets.insert(slug.clone(), offset);
-        Some(slug)
+        register_unique(&mut self.github, github_slug(text), offset);
+        register_unique(&mut self.offsets, heading_slug(text), offset)
     }
 
     /// The offset of the heading `fragment` names (a decoded link fragment,
     /// as [`resolve_link`] returns it), if it has been registered.
     pub fn lookup(&self, fragment: &str) -> Option<i32> {
-        self.offsets.get(fragment).copied()
+        self.offsets
+            .get(fragment)
+            .or_else(|| self.github.get(fragment))
+            .copied()
     }
 }
 
