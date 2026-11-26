@@ -22,6 +22,41 @@ pub const MIN_DIAGRAM_WIDTH: i32 = 50;
 /// nested in, in pixels.
 pub const CODE_INDENT: i32 = 28;
 
+/// Whether the key named `name` (GDK's key name, as `gdk::Key::name`
+/// gives it) scrolls the document: the arrows up and down, Page Up/Down,
+/// Home, End and Space, also on the keypad. Pressing one lets go of the
+/// spot held after a zoom, as the user is scrolling.
+pub fn is_scroll_key(name: &str) -> bool {
+    matches!(
+        name,
+        "Up" | "Down"
+            | "Page_Up"
+            | "Page_Down"
+            | "Prior"
+            | "Next"
+            | "Home"
+            | "End"
+            | "space"
+            | "KP_Up"
+            | "KP_Down"
+            | "KP_Page_Up"
+            | "KP_Page_Down"
+            | "KP_Prior"
+            | "KP_Next"
+            | "KP_Home"
+            | "KP_End"
+            | "KP_Space"
+    )
+}
+
+/// Whether a primary-button release that ends click number `presses` of a
+/// series opens the link under it: only a single click does. The second
+/// release of a double click (which selects a word in text) must not open
+/// the link again.
+pub fn opens_link(presses: i32) -> bool {
+    presses == 1
+}
+
 /// How long the copy button of a code card shows its check mark after
 /// copying, in milliseconds.
 pub const COPY_FEEDBACK_MS: u64 = 1500;
@@ -237,4 +272,82 @@ pub fn cell_classes(row: usize, column: usize, columns: usize, rows: usize) -> V
         classes.push("md-last-row");
     }
     classes
+}
+
+/// How tall a line of text is, as a multiple of its font size (generous:
+/// Pango's line height for common fonts is about 1.2).
+const LINE_HEIGHT_FACTOR: f64 = 1.5;
+
+/// The largest zoom at which the document's largest text (a level 1
+/// heading, `base_px` at 100%) stays within `max_px` (device pixels) at
+/// device `scale`: text obeys the same size limit as graphics. Never less
+/// than 1.0; infinite for an empty size.
+pub fn text_zoom_limit(base_px: f32, scale: f32, max_px: [u32; 2]) -> f64 {
+    let line =
+        f64::from(base_px) * heading_scale(1) * LINE_HEIGHT_FACTOR * f64::from(scale.max(1.0));
+    if !(line.is_finite() && line > 0.0) {
+        return f64::INFINITY;
+    }
+    (f64::from(max_px[1]) / line).max(1.0)
+}
+
+/// How far, in pixels, the span `top..bottom` lies outside the band
+/// `view_top..view_bottom` widened by `margin` on both sides: 0 when they
+/// overlap. Used to keep graphics near the view and drop far ones.
+pub fn distance_from_view(
+    top: f64,
+    bottom: f64,
+    view_top: f64,
+    view_bottom: f64,
+    margin: f64,
+) -> f64 {
+    let (low, high) = (view_top - margin, view_bottom + margin);
+    if bottom < low {
+        low - bottom
+    } else if top > high {
+        top - high
+    } else {
+        0.0
+    }
+}
+
+/// How many window heights above and below the view graphics are kept
+/// (never dropped to save memory, and drawn again ahead of scrolling).
+pub const KEEP_SCREENS: f64 = 1.0;
+
+/// The side of the spinner drawn in a `width` x `height` area while a
+/// graphic is dropped: at most 32 pixels and the shorter side, nothing when
+/// that is under 8 pixels.
+pub fn spinner_size(width: f64, height: f64) -> f64 {
+    let size = width.min(height).min(32.0);
+    if size >= 8.0 {
+        size
+    } else {
+        0.0
+    }
+}
+
+/// How many frames in a row with nothing to resize (and no held spot) stop
+/// the view's frame callback until something changes again.
+pub const IDLE_FRAMES: u32 = 3;
+
+/// The least time between two refreshes of an active search while a
+/// document is still loading.
+pub const SEARCH_REFRESH_MS: u64 = 200;
+
+/// When to refresh an active search after blocks were appended, given the
+/// time `since` the last refresh (`None` if there was none) and whether the
+/// whole document is on the page (`done`): `None` for now, otherwise how
+/// long to wait so refreshes are at least [`SEARCH_REFRESH_MS`] apart.
+pub fn refresh_delay(
+    since: Option<std::time::Duration>,
+    done: bool,
+) -> Option<std::time::Duration> {
+    let interval = std::time::Duration::from_millis(SEARCH_REFRESH_MS);
+    match since {
+        _ if done => None,
+        None => None,
+        Some(since) if since >= interval => None,
+        Some(since) => Some(interval - since),
+    }
 }

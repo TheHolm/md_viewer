@@ -19,7 +19,12 @@ Ctrl+W closes a window.
 
 Zoom with Ctrl+mouse wheel, Ctrl+plus / Ctrl+minus (Ctrl+0 resets to 100%)
 or a touchpad pinch, from 50% to 300%: text, tables, code, formulas and
-diagrams all grow, and the part you are reading stays in place.
+diagrams all grow, and the part you are reading stays in place. The header
+bar shows the zoom when it is not 100% (click it to reset). Nothing is
+drawn larger than ten screens: a document with a very large picture stops
+zooming in where that picture reaches the limit (the zoom then shows
+"(max)"), and a graphic too large even at 100% shows "too large" in its
+place.
 
 Find text with Ctrl+F or `/`: matches are highlighted in the text, tables
 and code, marked on the scrollbar, and a matching label inside a diagram
@@ -59,12 +64,15 @@ rules, and:
 * **Mermaid diagrams** in ` ```mermaid ` code blocks: flowcharts, sequence
   diagrams, Gantt charts, pie charts, class and state diagrams and the other
   Mermaid diagram types.
-* **Clickable links** in text and table cells: web and `mailto:` links open
-  in the desktop's default handler, local links open on disk (Markdown files
-  in the viewer), relative paths resolve against the document, and
-  `#fragment` links scroll to the matching heading. Hovering a link shows
-  its destination in a tooltip. Unsafe schemes (`javascript:`, `data:`) are
-  ignored.
+* **Clickable links** in text and table cells: web links open in the
+  browser and `mailto:` links in the mail client (the viewer itself never
+  fetches anything from the network), Markdown files open in the viewer,
+  relative paths resolve against the document, and `#fragment` links scroll
+  to the matching heading. Local images, PDFs, plain text, audio and video
+  open in their application; any other local file asks first, saying why
+  it is potentially dangerous. Other link types (`javascript:`, `data:`,
+  `ftp:`, ...) are never opened. Hovering a link says what clicking it
+  does.
 * **Local images**: `![alt](path)` is loaded from disk and shown - alone on
   a line scaled to the window width, inline with the text at about the line
   height, or inside a table cell. Relative paths resolve against the
@@ -186,7 +194,15 @@ Planned features. Known bugs are listed in `BUGS.md`.
   `adw::Application`, opens a fixture, pumps the GLib main loop and drives
   those paths by emitting signals, plus optional `xdotool` scripts on Xvfb
   for the real event path.
+* Investigate loading pictures only as the document is scrolled (and
+  dropping them again far from the view), instead of keeping every
+  rendered graphic: search still needs a light preload of what pictures
+  contribute (diagram labels could come from the laid-out SVG alone, without
+  drawing pixels).
 * Reload a document when it changes on disk.
 * An error popup instead of a message on STDERR for a bad `FILE` argument.
 * Remember the zoom level between runs.
+* An option (possibly a config setting) to keep pictures the same physical
+  size on monitors with different DPI, from the monitor's size in
+  millimetres; today they keep their logical size, as GNOME does.
 * Package as Flatpak and publish on Flathub.

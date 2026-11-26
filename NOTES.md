@@ -16,6 +16,10 @@ library and binary are all named `md_viewer`. The version is
 declared in the `VERSION` file at the repository root, the single source of
 the version (see "Versioning" below).
 
+The viewer never fetches anything from the network, and the code must not
+be able to: see "Hard decisions" in `AGENTS.md`, enforced by
+`tests/no_network.rs`. Web links are only handed to the browser.
+
 ## Stack
 
 - Rust 2021 edition, toolchain 1.98 (the version CI builds with)
@@ -199,16 +203,53 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   installed family, GNOME's Adwaita Sans first, see `pick_family`),
   `decode_image`/`load_image` for local image files (PNG/JPEG/GIF first
   frame/WebP through the `image` crate, `.svg` through `rasterize`; Exif
-  orientation is applied, straight alpha is premultiplied, and raster images
-  are decoded at the device scale with a Lanczos resize so they stay sharp on
-  HiDPI while keeping their logical size; the logical size grows with the
-  zoom like math and diagrams) and
+  orientation is applied, straight alpha is premultiplied; raster images
+  keep the file's own pixels - never enlarged for HiDPI, which adds no
+  detail and multiplied the memory - and one file pixel is one logical
+  pixel; an inline image is shrunk to the pixels it is drawn with; the
+  logical size grows with the zoom like math and diagrams) and
   `render_document`, which fills in every graphic of a rendered document one
   after another. `rasterize` also collects every SVG text node into
   `Image::labels` (usvg expands `<use>`, so a diagram's labels are found at
-  their drawn positions); math clears them because it draws outlines. `RasterSettings` carries the text size, device scale, text
-  colour and zoom (math is typeset at `font_px * zoom`, diagrams drawn
-  `zoom` times their natural size). Diagram labels are measured with the
+  their drawn positions); math clears them because it draws outlines. `RasterSettings` carries the text size, device scale (fractional with fractional scaling), text
+  colour, zoom (math is typeset at `font_px * zoom`, diagrams drawn
+  `zoom` times their natural size) and the size limit `max_px`.
+  The size limit: nothing is ever drawn larger than `SCREEN_MULTIPLE` (10)
+  times the screen in device pixels (`max_px_for`; `FALLBACK_MAX_PX` before
+  the window is on a monitor, and in tests). `zoom_limit` checks a
+  graphic's size at 100% before anything is allocated (in floating point,
+  so a huge SVG size is not wrapped into a bogus "no area" error): over the
+  limit it is refused with "too large (...)", shown in its place; otherwise
+  `Image::max_zoom` is the largest zoom it fits at, and asked for more it is
+  drawn at that zoom, never larger. A raster file is checked from its
+  header (Exif orientation applied) before its pixels are decoded, with
+  `image::Limits` as a backstop, so a decompression bomb costs nothing.
+  Files are read through `md_viewer::read_limited`: regular files only
+  (checked before opening, so a FIFO cannot block and `/dev/zero` cannot
+  fill memory) and at most `MAX_FILE_BYTES` (512 MiB). This covers the
+  document, image files and the files an SVG file's `<image href>` names;
+  those resolve against the SVG's folder (`svg_options_for`, a custom
+  usvg `ImageHrefResolver`), and formulas and diagrams cannot refer to files
+  at all. Raster images embedded in an SVG (files or `data:` URLs) are
+  checked from their header against the size limit before resvg decodes
+  them.
+- Memory: `Image::pixels` is an `Arc<Vec<u8>>` shared by the cache, the
+  document and the GTK texture (`SharedPixels`, `glib::Bytes::from_owned`,
+  no copy); a block's results are cleared from the parsed document once it
+  is on the page (`progressive::clear_graphics`). The cache maps are also
+  bounded in bytes (`CACHE_BYTES`, 96 MiB each). Each document has a budget
+  of `DOCUMENT_BUDGET` (1 GiB) of pixels on the page: a graphic needing more
+  at 100% is refused ("memory limit (...)"); otherwise, when the page holds
+  more, `Session::enforce_budget` drops the graphics farthest from the view
+  (`progressive::plan_budget`, never within `layout::KEEP_SCREENS` screens of
+  it): their texture is freed and a spinner of the same size stands in
+  (`ScaledTexture::show_spinner`, an `adw::SpinnerPaintable`), so nothing
+  moves. `Session::redraw_near` asks the pool for dropped graphics coming
+  near the view again (`Slot::held`: `Drawn`, `Dropped`, `Requested(run)`; a
+  request from a run cancelled by a zoom is made again). Both run after each
+  poll and, via `schedule_budget`, once idle after the adjustment's
+  `changed`/`value-changed` signals. A zoom re-renders only drawn graphics.
+  The budget does not limit the zoom. Diagram labels are measured with the
   same font files resvg draws them with (merman's `native-fonts`,
   `native_fonts`/`font_files`; merman's built-in estimates if no font files
   can be loaded). `Graphic` names one formula, diagram or image; `Cache` (one
@@ -235,7 +276,9 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   moment may still arrive, so the GUI tags runs with a generation).
 - `src/zoom.rs` (`md_viewer::zoom`) - zoom levels (`STEPS`, 50%-300%),
   `Zoom` (step in/out, reset, free `set` for pinches, `scroll` accumulating
-  wheel clicks), `wheel_clicks` (touchpad pixels to clicks) and the zoom CSS.
+  wheel clicks and stopping at the ends, the document's `ceiling` that every
+  change is clamped to, and the header bar `indicator` text),
+  `wheel_clicks` (touchpad pixels to clicks) and the zoom CSS.
 - `src/layout.rs` (`md_viewer::layout`) - the GUI's sizing and styling
   arithmetic as plain functions, so it is tested without a display: the
   width available to anchored widgets, table and diagram sizes, Pango font
@@ -246,8 +289,9 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   widgets.
 - `src/search.rs` (`md_viewer::search`) - the find bar's matching, pure
   and tested: `SearchMode` (smart case, ignore case, regex), `Matcher`
-  (a query compiled once; `find` returns byte ranges; Unicode case
-  folding maps each folded byte back to its source character, and
+  (a query compiled once; `find` returns byte ranges; Unicode full case
+  folding, from the table in `src/casefold.rs`, maps each folded byte back
+  to its source character, and
   zero-width regex matches are skipped), `char_ranges` (byte to
   character-offset ranges for the text buffer) and the match navigation
   helpers (`next_index`, `first_at_or_after`).
@@ -256,9 +300,15 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   `resolve_link` (a destination resolved against the document into a web,
   local-file, Markdown-file or same-document-anchor target), `resolve_image`
   (`http`/`https` -> `Remote`, `file:`/paths -> `Local`, anything else ->
-  `Unsupported` with a reason), `heading_slug`
-  (GitHub-style heading anchors; duplicate `-N` suffixes are added by the
-  GUI, which sees headings in order), `file_uri`, and `LinkRanges` (the
+  `Unsupported` with a reason), `heading_starts` (the headings inside a
+  text block: a text block holds many headings, paragraphs and lists, so a
+  heading is a run of spans with the same `Style::Heading`, plus formulas
+  or images next to it), `heading_slug` and `github_slug` (heading anchors: ours collapses
+  whitespace runs, GitHub's keeps one hyphen per whitespace character),
+  `Anchors` (the registry the GUI fills as blocks are appended, adding the
+  duplicate `-N` suffixes in document order; fragments are percent-decoded
+  by `resolve_link`, so `#%C3%BCber` finds `über`), `file_uri`, and
+  `LinkRanges` (the
   character ranges of the clickable text, accumulated as blocks are
   appended).
 - `tests/` - integration tests split by topic:
@@ -271,13 +321,17 @@ run there; runtime verification on a real FreeBSD system is a manual step.
     the Pango markup for table cells
   - `links.rs` - link resolution (web, mail, local, relative, Markdown,
     anchor, ignored schemes, a `file:` URL with a host), image destination
-    resolution (local, remote, unsupported, percent-decoding), heading slugs
-    (including dropping a trailing hyphen), `file_uri`, `LinkRanges`, and the
-    links inside label text
+    resolution (local, remote, unsupported, percent-decoding), fragment
+    decoding, heading slugs (including dropping a trailing hyphen), finding
+    the headings of a text block, the anchor registry, `file_uri`,
+    `LinkRanges`, and the links inside label text
   - `graphics.rs` - rasterizing, math and mhchem, Mermaid diagrams (several
     types, labels, scale, errors), image decoding (PNG, JPEG, SVG,
-    premultiplication, Exif orientation, device scale, zoom, the inline cap
-    and a raster image embedded in an SVG), filling in whole documents,
+    premultiplication, Exif orientation, no enlargement at a device scale,
+    zoom, the inline cap and shrinking, and a raster image embedded in an
+    SVG), the size limit (ten screens, `zoom_limit`, oversized SVGs,
+    formulas, PNGs and a PNG bomb refused, zoom stopping at the limit for
+    formulas, diagrams and images), filling in whole documents,
     that the showcase fixture renders, and that the root `showcase.md`
     renders with no fallbacks at all (every formula and diagram `Ok`)
   - `layout.rs` - the `md_viewer::layout` functions
@@ -389,21 +443,31 @@ run there; runtime verification on a real FreeBSD system is a manual step.
 - Zoom (50%-300%) scales text, tables, code cards, math and diagrams;
   graphics are re-rendered sharp at the new size, visible ones first. The
   zoom belongs to the window and carries over to the next document opened
-  in it; it is not saved between runs.
+  in it; it is not saved between runs. A document can lower the maximum:
+  the window's zoom stops where anything on the page (any graphic, or the
+  largest heading) would exceed the size limit (ten screens, see
+  `graphics`). Graphics are measured as they render, so a graphic arriving
+  later can lower the ceiling below the current zoom; the window then zooms
+  out to it (`Session::note_limit`/`report_limit` -> `DocWindow::limit_zoom`,
+  reported after a poll so nothing is borrowed). The header bar shows the
+  zoom percentage when it is not 100% ("(max)" at the ceiling); clicking it
+  resets the zoom.
 - A fenced code block whose info string starts with `mermaid`
   (case-insensitive) is a `Block::Mermaid` diagram, drawn on a white card
   in both themes (Mermaid's colours assume a light background).
 - A formula or diagram that cannot be rendered is shown as its source in
-  code style; display math and diagrams add a line with the reason. Nothing
-  is ever dropped.
+  code style; display math and diagrams add a line with the reason, inline
+  math a short "⚠ reason" after it (`Math::failure_note`). Nothing is ever
+  dropped.
 - Images: `![alt](path)` in a paragraph is loaded from a local file
   (resolved against the document, `file:` URLs allowed) and drawn. An image
   alone on its line (or after a list marker) is a standalone picture, scaled
   to the window width like a diagram; one among text is an inline paintable
   capped to a few lines high and sitting on the baseline. Raster formats go
-  through the `image` crate (Exif orientation applied, decoded at the device
-  scale for HiDPI), `.svg` through resvg (including raster images embedded in
-  the SVG). Network destinations (`http`/`https`) are
+  through the `image` crate (Exif orientation applied, the file's own
+  pixels, scaled by the screen when drawn), `.svg` through resvg (including
+  raster images embedded in the SVG). A picture larger than the size limit
+  shows `[image: <alt> — too large (...)]`. Network destinations (`http`/`https`) are
   never fetched - that is deliberately not supported and not planned - and
   an empty source, unsupported scheme, missing file or unreadable format
   shows `[image: <alt> — <reason>]`. An image in a table cell is drawn inline
@@ -413,14 +477,18 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   clickable without re-parsing. A single click opens it (web/`mailto:` and
   non-Markdown local files via `GtkUriLauncher`, Markdown files in a new
   viewer window, relative paths resolved against the document); a
-  `#fragment` scrolls to the matching heading, whose anchor is a
-  GitHub-style slug (duplicates get `-1`, `-2`, ...). Dangerous schemes
-  (`javascript:`, `data:`, ...) and empty destinations are ignored, and a
+  `#fragment` scrolls to the matching heading, found by its slug
+  (`heading_slug`) or its GitHub spelling (`github_slug`; duplicates get
+  `-1`, `-2`, ... in each). Every heading has its
+  own anchor, registered at its first character as its text block is
+  appended (`links::heading_starts`). What a click does is decided by
+  `links::link_action` (see "Link safety" under "Gotchas and techniques"):
+  other schemes are refused, empty destinations ignored, and a
   formula that is a link's only content is not clickable (it is drawn as
   pixels). An image that is a link's content *is* clickable: a standalone or
   table-cell picture gets a click controller on its box, an inline one a
-  link range over its buffer character. Hovering a link shows its raw
-  destination in a tooltip: both the
+  link range over its buffer character. Hovering a link shows what a click
+  does (`links::link_tooltip`) in a tooltip: both the
   text view and table-cell labels use `query-tooltip` (whose coordinates are
   widget-space, the same as `dest_at`/`label_link_at`) and set plain tooltip
   text, so destinations containing markup characters are safe.
@@ -463,16 +531,23 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   the `cargo-llvm-cov` subcommand). Run it with a display so the GUI is
   covered too; headless, e.g. `Xvfb :77 & DISPLAY=:77 GDK_BACKEND=x11
   GSK_RENDERER=cairo cargo llvm-cov --tests`. With a display line coverage
-  is about 80%: the library (`lib.rs`, `graphics.rs`, `links.rs`,
+  is about 94%: the library (`lib.rs`, `graphics.rs`, `links.rs`,
   `progressive.rs`, `search.rs`, `zoom.rs`, `layout.rs`) is about 98-100%,
-  and `main.rs` is about 64%. The library's few uncovered lines are
+  and `main.rs` is about 90%. The library's few uncovered lines are
   defensive branches that cannot be reached (no fonts installed, a `file:`
-  URL with a host, parser events for extensions that are not enabled, and
-  `Option` arms that cannot be `None`). Almost all of `main.rs`'s remainder
+  URL with a host, parser events for extensions that are not enabled, a
+  raster format other than PNG/JPEG/GIF/WebP referenced from an SVG - the
+  `Some(_) => None` arm of `graphics::embedded_image`, see "Gotchas and
+  techniques" - and `Option` arms that cannot be
+  `None`). Almost all of `main.rs`'s remainder
   is interactive GUI wiring that needs input events or a live window - the
-  file chooser and error dialogs, click/zoom/search gestures, hover
-  tooltips, and placing loaded images - so it is checked by hand (or with
-  `xdotool` on Xvfb, see below). The display-independent helpers
+  file chooser and error dialogs, primary-button clicks, hover tooltips,
+  monitor changes, and handing links to other applications - so it is
+  checked by hand (or with `xdotool` on Xvfb, see below); the rest are
+  defensive arms, such as a `ScaledTexture` with neither texture, message
+  nor spinner, which no constructor or setter leaves it in. Controller
+  signals the tests can emit (motion, a non-primary release, key presses)
+  are emitted in `main.rs`'s `gtk_helpers` checks. The display-independent helpers
   (`label_attributes` and friends) and the GTK-helper checks (`tag_for`/
   `create_tags`, `code_card`, `ScaledTexture::scale_size`,
   `label_link_at`) are unit-tested in `main.rs`'s test module
@@ -500,6 +575,19 @@ cargo install cargo-llvm-cov --locked
 ## Gotchas and techniques
 
 Things learned the hard way; add to this list when you learn another.
+
+- `image::guess_format` recognises every format the `image` crate knows by
+  its magic bytes, even ones whose feature is off (BMP gives `Some(Bmp)`),
+  but `ImageReader::into_dimensions` needs the format's decoder, and only
+  `png`, `jpeg`, `gif` and `webp` are enabled. So in
+  `graphics::embedded_image` any other raster format is refused by the
+  `embedded_raster_fits` size check before the `match`, and the
+  `Some(_) => None` arm is unreachable (left uncovered on purpose). It is
+  kept because enabling another decoder feature would make it reachable,
+  and it then refuses formats usvg has no image kind for. It could be
+  covered from a test only with `image::hooks` (a format-detection hook
+  plus a mock decoder), which are process-wide and cannot be unregistered;
+  that was judged not worth the global test state.
 
 - mathra returns `Ok` for LaTeX it does not understand: an unknown command
   such as `\notacommand` becomes transparent (invisible) text, not an error.
@@ -552,6 +640,117 @@ Things learned the hard way; add to this list when you learn another.
   `keydown ctrl click 4 keyup ctrl` zooms in, `key ctrl+0`); combine with
   `import` screenshots. The automated tests cannot press keys, so zoom and
   the copy button are checked this way.
+- Link safety (`links::link_action`, `local_file_risk`, `link_tooltip`):
+  `http`/`https` go to the browser (a remote `.md` too: the viewer never
+  fetches), `mailto:` to the mail client, local Markdown opens in the
+  viewer, other schemes and `file://host/...` are refused with the reason
+  in the tooltip. A local non-Markdown file opens directly only if it is a
+  regular, non-executable file whose type by name and by content (GIO's
+  `content_type_guess`, the first 4 KiB read through `read_head`, which
+  does not block on a FIFO) is an image (not SVG), PDF, plain text, audio
+  or video, and GIO does not call it executable (`text/plain` itself is
+  exempt: GIO counts every text type as a possible script); otherwise
+  `DocWindow::confirm_open` shows an `adw::AlertDialog` with the reason,
+  Cancel as the default and "Open Anyway" as destructive. Every link's
+  tooltip says what a click does. Gotcha: an `AlertDialog` heading that
+  wraps makes libadwaita print "Trying to measure GtkLabel ... needs at
+  least" warnings, so the heading is kept short ("Open Dangerous
+  Content?"); the body carries the reason.
+- Headings not on the page yet: `links::heading_blocks` maps every
+  heading's anchor (same suffixes as `Anchors`) to its block when the
+  document opens, so `Session::scroll_to_anchor` renders up to the block
+  (`render_to`) and scrolls once the heading is appended; an anchor naming
+  no heading leaves nothing pending, and `#` scrolls to the top.
+- The frame callback (`Session::wake_ticks`) runs only while there is
+  work: it stops after `layout::IDLE_FRAMES` frames that resize nothing
+  with no held spot, and is woken by the adjustments' `changed` signals
+  (the view's width shows in the horizontal one), new blocks, redrawn
+  graphics and `hold_anchor`.
+- While a document loads, an active search is refreshed at most every
+  `layout::SEARCH_REFRESH_MS` (200 ms), at once when the last block is on
+  the page, and before stepping to another match (`request_refresh`).
+- The budget counts each pixel buffer once (`progressive::held_bytes`, by
+  `Arc` pointer; a slot's texture keeps its buffer alive, so a key is not
+  reused while counted) and drops buffers whole (`plan_budget`). The cache
+  returns the entry another worker inserted first (`insert_bounded`), so
+  one formula shown many times shares one buffer. If what is near the view
+  alone exceeds the budget, the newest graphics there show "can't render:
+  document memory limit reached" (`Held::Limited`,
+  `ScaledTexture::show_message`) and are asked for again once they fit.
+  The budget is planned from an idle callback after layout (`schedule_budget`),
+  never right after appending: lines not yet laid out report positions
+  that make everything look near the view.
+- Graphics over the document limit (`Held::Limited`) are asked for again
+  wherever they are on the page as soon as they fit in the room left
+  (`Session::redraw_near`, nearest first, after counting the dropped
+  graphics near the view that are being redrawn), so the message is only
+  shown while the budget really is full.
+- The image cache key includes the file's `graphics::file_stamp` (size,
+  mtime, inode; `None` when missing), taken at each lookup, so a changed or
+  newly created image file is decoded again on reopen or the next zoom, and
+  the entry for its old version is removed. A file an SVG file refers to is
+  not stamped.
+- Case-insensitive search uses Unicode full case folding: `src/casefold.rs`
+  is the `C` and `F` lines of the UCD's `CaseFolding.txt`, generated once
+  (one `(char, &str)` pair per line, sorted, binary-searched; a character
+  not listed folds to itself). Do not mix it with `char::to_lowercase`:
+  folding maps Cherokee small letters to the capitals, the opposite of
+  lowercasing, so a mix would never match them. To update, regenerate the
+  table from a newer `CaseFolding.txt` (fetched by hand, outside the
+  viewer) and update the version in its header.
+- Monitors and scales (as GNOME does it): on Wayland each monitor has its
+  own scale (100%/200% by default, 125%/150%/175% with fractional scaling)
+  and a window keeps its logical size on every monitor; a window across two
+  monitors gets the scale of the one it is mostly on. X11 has one global
+  scale. GTK's `Widget::scale_factor` rounds a fractional scale up (1.25 and
+  1.5 both give 2) and only notifies when that integer changes, so the
+  viewer reads `gdk::Surface::scale` (`screen_scale`) and follows the
+  surface's `notify::scale` and `enter-monitor` (`DocWindow::follow_monitor`,
+  connected on realize). `Session::rescale` keeps every graphic's logical
+  size and re-renders with the new device pixels, works the zoom limit out
+  again (it can rise), and does not zoom the window out when the new limit
+  is below the zoom (`Zoom::set_ceiling_keeping_level`, until the user next
+  zooms); the window finding its first monitor is not a move and zooms out
+  as usual. The unit tests turn following off (`follows_monitor`) and call
+  `rescale` directly; a real monitor move is only checked by hand.
+- `Anchors` keeps two maps, our slugs and GitHub's, each with its own `-N`
+  duplicate counter; `lookup` tries ours first, so adding the GitHub
+  spelling never changes where an existing link goes.
+- The window's find shortcuts (`handle_key`: `/`, `n`, `N`, Escape) run in
+  the capture phase over the whole window, so they step aside
+  (`keys_belong_elsewhere`) while an `adw` dialog is shown in the window
+  (`visible_dialog`) or the focus is in a popover; otherwise they would
+  take Escape from the dialog and the menus.
+- Link click handlers (text view, table-cell labels, linked pictures) act
+  on a single click only (`layout::opens_link(n_press)`): the second
+  release of a double click would open the link again.
+- Regex search runs on each piece of text between U+FFFC object
+  placeholders (`search::regex_ranges`), so `.`/`\W`/`\S` never match an
+  embedded object and no match spans one. A leading byte-order mark is
+  stripped in `render`. `ImageRef::failure_reason` is the one place an
+  image placeholder's reason comes from (text view and table cells).
+- The spot held after a zoom (`hold_anchor`) is let go of on user input
+  only: Ctrl-less wheel scrolling (the window's scroll controller), a
+  scrolling key (`layout::is_scroll_key`), a press on the vertical
+  scrollbar and a touch drag (`Session::release_anchor_on_input`, named
+  `RELEASE_CONTROLLER` so the tests find and emit them). Do not release on
+  `value-changed`: GTK moves the value itself while a zoom resizes the page.
+- Each `Job` carries a `progressive::Location` (table cell as row and
+  column, index among the inlines), so `place` stores a result without
+  walking the document; keep `for_each_graphic`'s order and the locations
+  in step (`every_location_reaches_its_graphic`).
+- A GTK controller's closures must not capture the widget the controller
+  is added to (widget -> controller -> closure -> widget is a cycle that is
+  never freed); take it from the controller (`widget()`) or the signal's
+  arguments, as `make_label_clickable` does. A window's zoom CSS provider
+  is added to the display, so its close-request handler removes it.
+- Shrunk inline images are cached by image key and zoom
+  (`Cache::inline_images`), so repeated inline uses share one buffer and
+  the budget counts it once.
+- `read_limited` checks the path, opens with `O_NONBLOCK` (a file swapped
+  for a FIFO cannot block the open) and checks the opened file again.
+- `Session::budget` is the document budget as a field only so the GUI unit
+  test can lower it (a real 1 GiB document would be too heavy for a test).
 - Headless GUI runs: start `Xvfb :77 &` and run with `DISPLAY=:77
   GDK_BACKEND=x11 GSK_RENDERER=cairo`. GTK then warns that it cannot
   acquire a session bus (no `dbus-launch`); that warning is harmless, and

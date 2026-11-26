@@ -2,9 +2,10 @@
 //! (`md_viewer::layout`).
 
 use md_viewer::layout::{
-    align_fraction, available_width, cell_classes, color_channel, diagram_size, font_size_px,
-    heading_scale, math_rise, needs_more, pango_channel, pango_color, percent_alpha, table_size,
-    DIAGRAM_PADDING, DOCUMENT_MARGIN, FRONTIER_LOOKAHEAD, MIN_DIAGRAM_WIDTH, MIN_TABLE_WIDTH,
+    align_fraction, available_width, cell_classes, color_channel, diagram_size, distance_from_view,
+    font_size_px, heading_scale, math_rise, needs_more, pango_channel, pango_color, percent_alpha,
+    refresh_delay, spinner_size, table_size, text_zoom_limit, DIAGRAM_PADDING, DOCUMENT_MARGIN,
+    FRONTIER_LOOKAHEAD, IDLE_FRAMES, KEEP_SCREENS, MIN_DIAGRAM_WIDTH, MIN_TABLE_WIDTH,
 };
 use md_viewer::Align;
 
@@ -271,4 +272,102 @@ fn search_mark_positions() {
     // A track shorter than the mark just pins the mark to the top.
     assert_eq!(search_mark_y(1.0, 2.0, mark), 0.0);
     assert_eq!(search_mark_y(0.0, 0.0, mark), 0.0);
+}
+
+/// Text obeys the graphics size limit too: the zoom limit is how many times
+/// a level 1 heading line (twice the body size, 1.5 lines) fits the limit's
+/// height, in device pixels; never below 1.0, and infinite for no text.
+#[test]
+fn text_zoom_limit_from_largest_heading() {
+    // 15 px body: a 45 px heading line; 10,800 / 45 = 240.
+    assert!((text_zoom_limit(15.0, 1.0, [19_200, 10_800]) - 240.0).abs() < 1e-9);
+    assert!((text_zoom_limit(15.0, 2.0, [19_200, 10_800]) - 120.0).abs() < 1e-9);
+    assert_eq!(text_zoom_limit(15.0, 1.0, [10, 10]), 1.0);
+    assert_eq!(text_zoom_limit(0.0, 1.0, [10, 10]), f64::INFINITY);
+    assert_eq!(text_zoom_limit(f32::NAN, 1.0, [10, 10]), f64::INFINITY);
+}
+
+/// The distance of a span from the view widened by a margin: 0 when they
+/// overlap (touching counts), otherwise the gap above or below.
+#[test]
+fn distance_from_view_gaps() {
+    assert_eq!(distance_from_view(100.0, 200.0, 0.0, 500.0, 0.0), 0.0);
+    assert_eq!(distance_from_view(600.0, 700.0, 0.0, 500.0, 0.0), 100.0);
+    assert_eq!(distance_from_view(600.0, 700.0, 0.0, 500.0, 100.0), 0.0);
+    assert_eq!(distance_from_view(0.0, 50.0, 1000.0, 1500.0, 500.0), 450.0);
+    assert_eq!(distance_from_view(0.0, 3000.0, 1000.0, 1500.0, 0.0), 0.0);
+    assert_eq!(KEEP_SCREENS, 1.0);
+}
+
+/// The spinner of a dropped graphic is at most 32 pixels and fits the
+/// shorter side, and is left out of an area under 8 pixels.
+#[test]
+fn spinner_sizes() {
+    assert_eq!(spinner_size(400.0, 300.0), 32.0);
+    assert_eq!(spinner_size(400.0, 20.0), 20.0);
+    assert_eq!(spinner_size(7.0, 100.0), 0.0);
+}
+
+/// The frame callback stops after a few idle frames, not at once (a
+/// resize can take a frame or two to settle).
+#[test]
+fn idle_frames_before_stopping() {
+    assert!((2..=10).contains(&IDLE_FRAMES));
+}
+
+/// A search is refreshed at once the first time, once the document is
+/// fully on the page, or when the last refresh is long enough ago;
+/// otherwise after the rest of the interval.
+#[test]
+fn refresh_delays() {
+    use md_viewer::layout::SEARCH_REFRESH_MS;
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    assert_eq!(SEARCH_REFRESH_MS, 200);
+    assert_eq!(refresh_delay(None, false), None);
+    assert_eq!(refresh_delay(Some(ms(50)), true), None);
+    assert_eq!(refresh_delay(Some(ms(200)), false), None);
+    assert_eq!(refresh_delay(Some(ms(50)), false), Some(ms(150)));
+}
+
+/// The keys that scroll the document (and so let go of the spot held after
+/// a zoom), on the main block and the keypad; other keys do not.
+#[test]
+fn scroll_keys() {
+    for key in [
+        "Up",
+        "Down",
+        "Page_Up",
+        "Page_Down",
+        "Home",
+        "End",
+        "space",
+        "KP_Up",
+        "KP_Page_Down",
+        "KP_End",
+    ] {
+        assert!(md_viewer::layout::is_scroll_key(key), "{key}");
+    }
+    for key in [
+        "Left",
+        "Right",
+        "a",
+        "n",
+        "slash",
+        "Escape",
+        "Control_L",
+        "Return",
+    ] {
+        assert!(!md_viewer::layout::is_scroll_key(key), "{key}");
+    }
+}
+
+/// Only a single click opens a link, not the later clicks of a double or
+/// triple click.
+#[test]
+fn single_clicks_open_links() {
+    assert!(md_viewer::layout::opens_link(1));
+    for presses in [0, 2, 3, -1] {
+        assert!(!md_viewer::layout::opens_link(presses));
+    }
 }

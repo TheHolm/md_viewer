@@ -192,3 +192,38 @@ fn closing_while_loading() {
         }
     }
 }
+
+/// With a display, a document whose graphics are over the size limit (an
+/// SVG and a formula far wider than ten screens, a PNG whose header claims
+/// 100,000 x 100,000 pixels, and a wide picture that lowers the zoom
+/// ceiling) opens without allocating them and exits cleanly.
+#[test]
+fn oversized_graphics_open() {
+    if have_display() {
+        let dir = tempfile::tempdir().unwrap();
+        let svg = |name: &str, width: u32| {
+            let svg = format!(
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"10\"/>"
+            );
+            std::fs::write(dir.path().join(name), svg).unwrap();
+        };
+        svg("huge.svg", 1_000_000);
+        svg("wide.svg", 12_800);
+        // A PNG signature and a header chunk claiming 100,000 x 100,000
+        // pixels, with no pixel data: refused one way or another, never
+        // allocated.
+        let mut png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR".to_vec();
+        png.extend_from_slice(&100_000u32.to_be_bytes());
+        png.extend_from_slice(&100_000u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+        std::fs::write(dir.path().join("bomb.png"), png).unwrap();
+        let path = dir.path().join("big.md");
+        std::fs::write(
+            &path,
+            "# Big\n\n![huge](huge.svg)\n\n![bomb](bomb.png)\n\n![wide](wide.svg)\n\n\
+             Inline $\\rule{100000em}{1em}$ and display:\n\n$$\\rule{1em}{100000em}$$\n",
+        )
+        .unwrap();
+        run_and_close(&[path.to_str().unwrap()]);
+    }
+}

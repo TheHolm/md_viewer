@@ -5,8 +5,8 @@
 
 use md_viewer::graphics::{Graphic, RasterSettings};
 use md_viewer::progressive::{
-    for_each_graphic, jobs, place, worker_count, zoom_order, Job, Phase, Pool, Progress,
-    SPINNER_DELAY_MS,
+    clear_graphics, for_each_graphic, held_bytes, jobs, place, plan_budget, worker_count,
+    zoom_order, Held, Job, Location, Phase, Pool, Progress, SPINNER_DELAY_MS,
 };
 use md_viewer::{render, Block, Inline};
 use std::path::Path;
@@ -90,12 +90,57 @@ fn for_each_graphic_visits_slots() {
     assert_eq!(seen, ["#0", "#1", "#2", "#3", "#4"]);
 }
 
-/// `place` stores a result with the right graphic and rejects unknown ids.
+/// `place` stores a result with the graphic at a job's location, and
+/// refuses locations that hold no graphic (a missing block, cell or inline,
+/// plain text, a code block, a diagram location in a text block).
 #[test]
 fn place_stores_results() {
     let mut blocks = render(DOCUMENT);
-    assert!(place(&mut blocks, 2, Err("cell".to_string())));
-    assert!(!place(&mut blocks, 5, Err("none".to_string())));
+    let found = jobs(&mut blocks);
+    let cell = &found[2];
+    assert_eq!(cell.block, 1);
+    assert_eq!(
+        cell.location,
+        Location {
+            cell: Some((1, 0)),
+            inline: Some(0)
+        }
+    );
+    assert!(place(
+        &mut blocks,
+        cell.block,
+        cell.location,
+        Err("cell".to_string())
+    ));
+    let text = Location {
+        cell: None,
+        inline: Some(0),
+    };
+    let whole = Location {
+        cell: None,
+        inline: None,
+    };
+    let err = || Err("none".to_string());
+    assert!(!place(&mut blocks, 9, text, err()));
+    assert!(!place(&mut blocks, 0, text, err()), "plain text");
+    assert!(!place(&mut blocks, 0, whole, err()));
+    assert!(!place(&mut blocks, 5, whole, err()), "code block");
+    assert!(!place(&mut blocks, 3, text, err()), "inline in a diagram");
+    let missing_cell = Location {
+        cell: Some((5, 0)),
+        inline: Some(0),
+    };
+    assert!(!place(&mut blocks, 1, missing_cell, err()));
+    let missing_inline = Location {
+        cell: Some((1, 0)),
+        inline: Some(7),
+    };
+    assert!(!place(&mut blocks, 1, missing_inline, err()));
+    let header = Location {
+        cell: Some((0, 0)),
+        inline: Some(0),
+    };
+    assert!(!place(&mut blocks, 1, header, err()), "header text");
     let Block::Table(table) = &blocks[1] else {
         panic!("expected the table");
     };
@@ -108,6 +153,31 @@ fn place_stores_results() {
         stored += image.is_some() as usize
     });
     assert_eq!(stored, 1);
+}
+
+/// Clearing a block forgets every result stored in it (formulas, images,
+/// diagrams) and leaves the other blocks alone.
+#[test]
+fn clear_graphics_forgets_results() {
+    let mut blocks = render(DOCUMENT);
+    let mut id = 0;
+    for_each_graphic(&mut blocks, |_, _, image| {
+        *image = Some(Err(format!("r{id}")));
+        id += 1;
+    });
+    let count = |blocks: &mut [md_viewer::Block]| {
+        let mut stored = 0;
+        for_each_graphic(blocks, |_, _, image| stored += image.is_some() as usize);
+        stored
+    };
+    let before = count(&mut blocks);
+    clear_graphics(&mut blocks[1]);
+    assert_eq!(count(&mut blocks[1..2]), 0);
+    assert!(count(&mut blocks) < before);
+    for block in &mut blocks {
+        clear_graphics(block);
+    }
+    assert_eq!(count(&mut blocks), 0);
 }
 
 /// Blocks go on the page in order, each once all its graphics are in: the
@@ -397,7 +467,13 @@ fn progress_waits_for_images() {
 fn place_stores_image_result() {
     let mut blocks = render("![a](one.png)");
     md_viewer::resolve_images(&mut blocks, Path::new("/docs/notes.md"));
-    assert!(place(&mut blocks, 0, Err("broken".to_string())));
+    let job = jobs(&mut blocks).remove(0);
+    assert!(place(
+        &mut blocks,
+        job.block,
+        job.location,
+        Err("broken".to_string())
+    ));
     let Block::Text(inlines) = &blocks[0] else {
         panic!("expected a text block");
     };
@@ -405,4 +481,103 @@ fn place_stores_image_result() {
         panic!("expected an image");
     };
     assert_eq!(image.image, Some(Err("broken".to_string())));
+}
+
+/// Every job's location reaches its own graphic: placing a numbered result
+/// at each job's location stores it exactly where `for_each_graphic` finds
+/// that graphic, in the showcase fixture (text, tables, lists, diagrams,
+/// images) and the test document.
+#[test]
+fn every_location_reaches_its_graphic() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/showcase.md");
+    let showcase = std::fs::read_to_string(&fixture).expect("read the showcase fixture");
+    for source in [showcase.as_str(), DOCUMENT] {
+        let mut blocks = render(source);
+        md_viewer::resolve_images(&mut blocks, &fixture);
+        let found = jobs(&mut blocks);
+        assert!(!found.is_empty());
+        for job in &found {
+            assert!(place(
+                &mut blocks,
+                job.block,
+                job.location,
+                Err(format!("#{}", job.id))
+            ));
+        }
+        let mut seen = Vec::new();
+        for_each_graphic(&mut blocks, |_, _, image| {
+            seen.push(image.clone().unwrap().unwrap_err());
+        });
+        let expected: Vec<_> = (0..found.len()).map(|id| format!("#{id}")).collect();
+        assert_eq!(seen, expected);
+    }
+}
+
+/// A graphic for the budget tests.
+fn held(id: usize, key: usize, bytes: usize, distance: f64, arrived: u64) -> Held {
+    Held {
+        id,
+        key,
+        bytes,
+        distance,
+        arrived,
+    }
+}
+
+/// A buffer shared by several graphics counts once.
+#[test]
+fn held_bytes_counts_shared_buffers_once() {
+    let graphics = [
+        held(0, 7, 100, 0.0, 0),
+        held(1, 7, 100, 9.0, 1),
+        held(2, 8, 50, 0.0, 2),
+    ];
+    assert_eq!(held_bytes(&graphics), 150);
+    assert_eq!(held_bytes(&[]), 0);
+}
+
+/// Within the budget nothing happens; over it, the farthest buffers are
+/// dropped first until it fits, never one with a graphic near the view
+/// (distance 0) or one holding nothing.
+#[test]
+fn plan_budget_drops_farthest_first() {
+    let graphics = [
+        held(0, 0, 100, 0.0, 0),
+        held(1, 1, 100, 50.0, 1),
+        held(2, 2, 100, 900.0, 2),
+        held(3, 3, 100, 300.0, 3),
+        held(4, 4, 0, 5000.0, 4),
+    ];
+    assert_eq!(plan_budget(&graphics, 400), (vec![], vec![]));
+    assert_eq!(plan_budget(&graphics, 350), (vec![2], vec![]));
+    assert_eq!(plan_budget(&graphics, 150), (vec![2, 3, 1], vec![]));
+}
+
+/// A shared buffer is dropped whole (all its graphics), and kept whole
+/// while any of its graphics is near the view.
+#[test]
+fn plan_budget_drops_shared_buffers_whole() {
+    let graphics = [
+        held(0, 9, 100, 800.0, 0),
+        held(1, 9, 100, 700.0, 1),
+        held(2, 5, 100, 10.0, 2),
+        held(3, 6, 100, 0.0, 3),
+        held(4, 6, 100, 600.0, 4),
+    ];
+    assert_eq!(plan_budget(&graphics, 200), (vec![0, 1], vec![]));
+    assert_eq!(plan_budget(&graphics, 100), (vec![0, 1, 2], vec![]));
+}
+
+/// When what is near the view alone exceeds the budget, every far buffer
+/// is dropped and then the newest near ones are limited until it fits.
+#[test]
+fn plan_budget_limits_newest_near_buffers() {
+    let graphics = [
+        held(0, 0, 100, 0.0, 5),
+        held(1, 1, 100, 0.0, 9),
+        held(2, 2, 100, 0.0, 7),
+        held(3, 3, 100, 40.0, 1),
+    ];
+    assert_eq!(plan_budget(&graphics, 150), (vec![3], vec![1, 2]));
+    assert_eq!(plan_budget(&graphics, 0), (vec![3], vec![1, 2, 0]));
 }

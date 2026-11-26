@@ -11,8 +11,8 @@ use adw::prelude::*;
 use clap::Parser;
 use gtk4::glib::translate::IntoGlib;
 use gtk4::{gdk, gio, glib, pango};
-use md_viewer::graphics::{Image, RasterSettings, Rendered};
-use md_viewer::links::{self, LinkRanges, Resolved};
+use md_viewer::graphics::{self, Image, RasterSettings, Rendered};
+use md_viewer::links::{self, Anchors, LinkAction, LinkRanges};
 use md_viewer::progressive::{self, Job, Phase, Pool, Progress};
 use md_viewer::search::{self, Matcher, SearchMode, Unit};
 use md_viewer::zoom::{self, Zoom};
@@ -22,7 +22,6 @@ use md_viewer::{
 };
 use md_viewer::{layout, CodeBlock};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::{mpsc, Mutex};
@@ -57,10 +56,6 @@ const POLL_MS: u64 = 16;
 /// How long after the last zoom step graphics are re-rendered, in
 /// milliseconds; until then they are shown stretched.
 const REZOOM_DELAY_MS: u64 = 150;
-
-/// What the placeholder for an image with a network destination says: the
-/// viewer never fetches anything, and that is not planned.
-const NETWORK_UNSUPPORTED: &str = "network loading is not supported";
 
 /// Styling for the widgets the document is built from (tables, code cards,
 /// diagrams, the loading cover). Colours derive from the theme's text
@@ -183,6 +178,10 @@ fn quit_on_signals(app: &adw::Application) {
     }
 }
 
+/// The name of the controllers that let go of the spot held after a zoom
+/// (see `Session::release_anchor_on_input`), so the tests can find them.
+const RELEASE_CONTROLLER: &str = "md-release-anchor";
+
 /// Installs `css` for the whole application through `provider`.
 fn add_css(provider: &gtk4::CssProvider, css: &str) {
     provider.load_from_string(css);
@@ -192,6 +191,15 @@ fn add_css(provider: &gtk4::CssProvider, css: &str) {
             provider,
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
+    }
+}
+
+/// Removes a provider added with [`add_css`] from the display (a closed
+/// window's zoom CSS), so it is freed rather than kept for the rest of the
+/// run.
+fn remove_css(provider: &gtk4::CssProvider) {
+    if let Some(display) = gdk::Display::default() {
+        gtk4::style_context_remove_provider_for_display(&display, provider);
     }
 }
 
@@ -222,8 +230,10 @@ struct Resizable {
 }
 
 impl Resizable {
-    /// Re-sizes every registered widget for a view `width` pixels wide.
-    fn update(&self, width: i32) {
+    /// Re-sizes every registered widget for a view `width` pixels wide;
+    /// returns true if any size changed.
+    fn update(&self, width: i32) -> bool {
+        let mut changed = false;
         for scroller in self.tables.borrow().iter() {
             let Some(grid) = scroller.child() else {
                 continue;
@@ -237,20 +247,24 @@ impl Resizable {
             let size = layout::table_size(natural, height, width);
             if scroller.size_request() != size {
                 scroller.set_size_request(size.0, size.1);
+                changed = true;
             }
         }
         for (picture, natural_width, natural_height) in self.pictures.borrow().iter() {
             let size = layout::diagram_size(*natural_width, *natural_height, width);
             if picture.size_request() != size {
                 picture.set_size_request(size.0, size.1);
+                changed = true;
             }
         }
         for (card, indent) in self.codes.borrow().iter() {
             let card_width = layout::code_card_width(width, *indent);
             if card.size_request() != (card_width, -1) {
                 card.set_size_request(card_width, -1);
+                changed = true;
             }
         }
+        changed
     }
 }
 
@@ -268,7 +282,39 @@ struct Slot {
     offset: i32,
     /// How far the graphic reaches below the baseline, in pixels.
     depth: Cell<f32>,
+    /// The bytes of pixels the graphic holds (0 once dropped).
+    bytes: Cell<usize>,
+    /// The bytes of its pixels when last drawn (kept when dropped).
+    size: Cell<usize>,
+    /// Identifies its pixel buffer (shared between graphics showing the
+    /// same rendering, which the budget counts once).
+    key: Cell<usize>,
+    /// When it was last drawn (see [`Session::arrivals`]).
+    arrived: Cell<u64>,
+    /// Whether it holds its pixels, or was dropped to stay within the
+    /// document's memory budget.
+    held: Cell<Held>,
 }
+
+/// Whether a graphic on the page holds its pixels (see
+/// [`Session::enforce_budget`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
+    /// Drawn with its pixels.
+    Drawn,
+    /// Dropped: a spinner of the same size stands in until it is near the
+    /// view again.
+    Dropped,
+    /// Dropped, and asked to be rendered again in the run with this
+    /// generation.
+    Requested(u64),
+    /// Not drawn because the graphics near the view already fill the
+    /// document's budget; says so in its place.
+    Limited,
+}
+
+/// What a graphic over the document's memory budget shows in its place.
+const DOCUMENT_LIMIT_MESSAGE: &str = "can't render: document memory limit reached";
 
 impl Slot {
     /// Shows `image` in place of the current picture.
@@ -470,16 +516,53 @@ struct Session {
     /// The clickable ranges of the text buffer, in character offsets.
     links: RefCell<LinkRanges>,
     /// Each heading's anchor and the buffer offset of its first character.
-    anchors: RefCell<HashMap<String, i32>>,
+    anchors: RefCell<Anchors>,
     /// An anchor requested before its heading was appended; scrolled to as
     /// soon as the heading appears.
     pending_anchor: RefCell<Option<String>>,
+    /// When the search was last refreshed (see [`Session::request_refresh`]).
+    last_refresh: Cell<Option<std::time::Instant>>,
+    /// True while a delayed search refresh is waiting.
+    refresh_waiting: Cell<bool>,
+    /// True while the frame callback runs (see [`Session::wake_ticks`]).
+    ticking: Cell<bool>,
+    /// How many frames in a row the frame callback found nothing to do.
+    idle_frames: Cell<u32>,
+    /// Every heading of the document by anchor, with its block index (see
+    /// `links::heading_blocks`), so a link can render up to a heading not
+    /// on the page yet.
+    heading_blocks: Anchors,
+    /// The largest zoom every graphic shown so far can be drawn at (see
+    /// `Image::max_zoom`); infinite until one is shown.
+    zoom_limit: Cell<f64>,
+    /// True when `zoom_limit` was lowered and the window has not been told.
+    limit_dirty: Cell<bool>,
+    /// True after the window moved to a monitor with another scale (see
+    /// [`Session::rescale`]) until the user next changes the zoom: while
+    /// set, a lower zoom limit stops zooming in further but never zooms
+    /// the window out.
+    keep_zoom: Cell<bool>,
+    /// The bytes of pixels the graphics on the page hold (see
+    /// [`Session::enforce_budget`]).
+    held_bytes: Cell<usize>,
+    /// The most bytes of pixels the page may hold: always
+    /// [`graphics::DOCUMENT_BUDGET`], except in tests.
+    budget: Cell<usize>,
+    /// True while a [`Session::schedule_budget`] run is waiting.
+    budget_pending: Cell<bool>,
+    /// How many times a graphic was drawn, numbering them for the budget
+    /// (newest first when limiting).
+    arrivals: Cell<u64>,
+    /// Tells the window the document's new zoom limit, and whether it must
+    /// keep its zoom level even if that is above the limit (see
+    /// `keep_zoom`).
+    limit_changed: Box<dyn Fn(f64, bool)>,
     /// A block (searched before it was rendered) to scroll to once it is on
     /// the page.
     pending_scroll: RefCell<Option<usize>>,
     /// Opens a resolved link that is not a same-document anchor (the window
     /// launches external links and opens linked Markdown documents).
-    open_link: Box<dyn Fn(Resolved)>,
+    open_link: Box<dyn Fn(LinkAction)>,
     /// A weak handle to this session, set once it is wrapped in `Rc`, so
     /// callbacks attached to child widgets (table-cell labels) can reach it.
     weak_self: RefCell<Option<Weak<Session>>>,
@@ -492,6 +575,11 @@ impl Session {
     /// end of what is rendered, see [`Session::advance_frontier`]).
     fn start(self: &Rc<Self>, settings: RasterSettings) {
         self.settings.set(settings);
+        let text_limit = layout::text_zoom_limit(settings.font_px, settings.scale, settings.max_px);
+        if text_limit < self.zoom_limit.get() {
+            self.zoom_limit.set(text_limit);
+        }
+        self.limit_dirty.set(true);
         self.shown_zoom.set(settings.zoom);
         self.frontier.set(0);
         self.generation.set(self.generation.get() + 1);
@@ -500,6 +588,7 @@ impl Session {
         self.append_ready();
         self.update_status();
         self.advance_frontier();
+        self.report_limit();
     }
 
     /// Submits `jobs` to the worker pool (creating the pool if this run has
@@ -626,19 +715,29 @@ impl Session {
                 .set(self.outstanding.get().saturating_sub(1));
             if self.progress.borrow().is_shown(id) {
                 if let (Ok(image), Some(Some(slot))) = (&rendered, self.slots.borrow().get(id)) {
-                    slot.apply(image, &self.resizable);
+                    self.redraw_slot(slot, image);
                     if self.anchor.borrow().is_some() {
                         self.hold_anchor();
                     }
                 }
             } else {
-                progressive::place(&mut self.blocks.borrow_mut(), id, rendered);
+                let job = &self.jobs[id];
+                progressive::place(
+                    &mut self.blocks.borrow_mut(),
+                    job.block,
+                    job.location,
+                    rendered,
+                );
                 self.progress.borrow_mut().complete(id);
             }
         }
         self.append_ready();
+        // Once the new lines are laid out, so distances from the view are
+        // real.
+        self.schedule_budget();
         self.update_status();
         self.advance_frontier();
+        self.report_limit();
     }
 
     /// Appends every block that is complete and follows the ones shown.
@@ -647,9 +746,11 @@ impl Session {
         if ready.is_empty() {
             return;
         }
+        self.wake_ticks();
         for index in ready {
             let offset = self.view.buffer().end_iter().offset();
             self.insert_block(index);
+            progressive::clear_graphics(&mut self.blocks.borrow_mut()[index]);
             if self.pending_scroll.borrow().as_ref() == Some(&index) {
                 self.pending_scroll.replace(None);
                 let mut iter = self.view.buffer().iter_at_offset(offset);
@@ -657,6 +758,38 @@ impl Session {
             }
         }
         self.resizable.update(self.view.width());
+        self.request_refresh();
+    }
+
+    /// Refreshes an active search after blocks were appended, at most once
+    /// every [`layout::SEARCH_REFRESH_MS`] while the document loads (each
+    /// refresh redoes the whole search) and at once when the last block is
+    /// on the page; requests in between are merged into one later refresh.
+    fn request_refresh(&self) {
+        if self.search.borrow().query.is_empty() {
+            return;
+        }
+        let done = self.progress.borrow().all_shown();
+        let since = self.last_refresh.get().map(|at| at.elapsed());
+        match layout::refresh_delay(since, done) {
+            None => self.refresh_now(),
+            Some(_) if self.refresh_waiting.get() => {}
+            Some(delay) => {
+                self.refresh_waiting.set(true);
+                let weak = self.weak_self.borrow().clone();
+                glib::timeout_add_local_once(delay, move || {
+                    if let Some(session) = weak.as_ref().and_then(Weak::upgrade) {
+                        session.refresh_waiting.set(false);
+                        session.refresh_now();
+                    }
+                });
+            }
+        }
+    }
+
+    /// Refreshes the search now, noting when.
+    fn refresh_now(&self) {
+        self.last_refresh.set(Some(std::time::Instant::now()));
         self.refresh_search();
     }
 
@@ -685,6 +818,7 @@ impl Session {
     /// far into it), unless a spot is already being held, and keeps it in
     /// place for [`layout::ANCHOR_HOLD_MS`] from now (see `keep_anchor`).
     fn hold_anchor(&self) {
+        self.wake_ticks();
         let until = std::time::Instant::now() + Duration::from_millis(layout::ANCHOR_HOLD_MS);
         if let Some(anchor) = self.anchor.borrow_mut().as_mut() {
             anchor.2 = until;
@@ -721,10 +855,285 @@ impl Session {
         }
     }
 
+    /// Runs the per-frame work (sizing tables, pictures and code cards to
+    /// the view, keeping the held spot in place) from the next frame on,
+    /// until [`layout::IDLE_FRAMES`] frames in a row change nothing and no
+    /// spot is held; then the frame callback stops, so an idle window costs
+    /// nothing. Called whenever something it acts on may have changed: the
+    /// view's size or content, a new or redrawn graphic, a zoom.
+    fn wake_ticks(&self) {
+        self.idle_frames.set(0);
+        if self.ticking.replace(true) {
+            return;
+        }
+        let weak = self.weak_self.borrow().clone();
+        self.view.add_tick_callback(move |view, _| {
+            let Some(session) = weak.as_ref().and_then(Weak::upgrade) else {
+                return glib::ControlFlow::Break;
+            };
+            let resized = session.resizable.update(view.width());
+            session.keep_anchor();
+            let busy = resized || session.anchor.borrow().is_some();
+            let idle = if busy {
+                0
+            } else {
+                session.idle_frames.get() + 1
+            };
+            session.idle_frames.set(idle);
+            if idle >= layout::IDLE_FRAMES {
+                session.ticking.set(false);
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
+            }
+        });
+    }
+
+    /// Lets go of the held spot as soon as the user scrolls by other means
+    /// than the mouse wheel (which the window's zoom controller handles): a
+    /// scrolling key, pressing on the scrollbar (dragging it, clicking its
+    /// trough or arrows), or a touch drag on the page. Only input counts:
+    /// GTK moving the scroll value itself (as a zoom changes the page
+    /// height) must not let go.
+    fn release_anchor_on_input(self: &Rc<Self>) {
+        let keys = gtk4::EventControllerKey::new();
+        keys.set_name(Some(RELEASE_CONTROLLER));
+        keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let weak = Rc::downgrade(self);
+        keys.connect_key_pressed(move |_, key, _, _| {
+            let scrolls = key.name().is_some_and(|name| layout::is_scroll_key(&name));
+            if let (true, Some(session)) = (scrolls, weak.upgrade()) {
+                session.release_anchor();
+            }
+            glib::Propagation::Proceed
+        });
+        self.scrolled.add_controller(keys);
+
+        let bar = gtk4::GestureClick::new();
+        bar.set_name(Some(RELEASE_CONTROLLER));
+        bar.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let weak = Rc::downgrade(self);
+        bar.connect_pressed(move |_, _, _, _| {
+            if let Some(session) = weak.upgrade() {
+                session.release_anchor();
+            }
+        });
+        self.scrolled.vscrollbar().add_controller(bar);
+
+        let touch = gtk4::GestureDrag::new();
+        touch.set_name(Some(RELEASE_CONTROLLER));
+        touch.set_touch_only(true);
+        touch.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let weak = Rc::downgrade(self);
+        touch.connect_drag_begin(move |_, _, _| {
+            if let Some(session) = weak.upgrade() {
+                session.release_anchor();
+            }
+        });
+        self.scrolled.add_controller(touch);
+    }
+
     /// Lets go of the held spot at once (the user scrolled).
     fn release_anchor(&self) {
         if let Some((mark, _, _)) = self.anchor.take() {
             self.view.buffer().delete_mark(&mark);
+        }
+    }
+
+    /// Records where the next graphic, rendered as `image`, is shown, and
+    /// lowers the document's zoom limit to the image's.
+    fn add_graphic(&self, image: &Image, slot: Slot) {
+        self.note_limit(image);
+        self.hold_pixels(&slot, image);
+        self.add_slot(Some(slot));
+    }
+
+    /// Notes that `slot` now shows `image`'s pixels (see
+    /// [`Session::enforce_budget`]).
+    fn hold_pixels(&self, slot: &Slot, image: &Image) {
+        slot.bytes.set(image.pixels.len());
+        slot.size.set(image.pixels.len());
+        slot.key.set(std::sync::Arc::as_ptr(&image.pixels) as usize);
+        let arrived = self.arrivals.get() + 1;
+        self.arrivals.set(arrived);
+        slot.arrived.set(arrived);
+        slot.held.set(Held::Drawn);
+    }
+
+    /// Shows `image` (a re-render) in `slot`.
+    fn redraw_slot(&self, slot: &Slot, image: &Image) {
+        self.wake_ticks();
+        self.note_limit(image);
+        slot.apply(image, &self.resizable);
+        self.hold_pixels(slot, image);
+    }
+
+    /// The graphics on the page holding their pixels, as the budget sees
+    /// them (`progressive::Held`).
+    fn held_graphics(&self) -> Vec<progressive::Held> {
+        self.slots
+            .borrow()
+            .iter()
+            .enumerate()
+            .filter_map(|(id, slot)| {
+                let slot = slot.as_ref()?;
+                (slot.held.get() == Held::Drawn).then(|| progressive::Held {
+                    id,
+                    key: slot.key.get(),
+                    bytes: slot.bytes.get(),
+                    distance: self.distance_from_view(slot.offset),
+                    arrived: slot.arrived.get(),
+                })
+            })
+            .collect()
+    }
+
+    /// Keeps the page's pixels within the document's budget
+    /// ([`graphics::DOCUMENT_BUDGET`]), each shared buffer counted once
+    /// (`progressive::plan_budget`): the graphics farthest from the view
+    /// are dropped, keeping their size and showing a spinner until they are
+    /// near the view again ([`Session::redraw_near`]); graphics on or
+    /// within [`layout::KEEP_SCREENS`] screens of the view are never
+    /// dropped. If those alone exceed the budget, the newest of them show
+    /// "can't render: document memory limit reached" instead, and are tried
+    /// again once there is room.
+    fn enforce_budget(&self) {
+        let held = self.held_graphics();
+        self.held_bytes.set(progressive::held_bytes(&held));
+        if self.held_bytes.get() <= self.budget.get() {
+            return;
+        }
+        let (drops, limited) = progressive::plan_budget(&held, self.budget.get());
+        {
+            let slots = self.slots.borrow();
+            let release = |id: usize, state: Held| {
+                if let Some(Some(slot)) = slots.get(id) {
+                    match state {
+                        Held::Limited => slot
+                            .texture
+                            .show_message(self.view.upcast_ref(), DOCUMENT_LIMIT_MESSAGE),
+                        _ => slot.texture.show_spinner(self.view.upcast_ref()),
+                    }
+                    slot.bytes.set(0);
+                    slot.held.set(state);
+                }
+            };
+            for id in drops {
+                release(id, Held::Dropped);
+            }
+            for id in limited {
+                release(id, Held::Limited);
+            }
+        }
+        self.held_bytes
+            .set(progressive::held_bytes(&self.held_graphics()));
+    }
+
+    /// Runs [`Session::enforce_budget`] and [`Session::redraw_near`] once
+    /// the main loop is idle: the page's layout (and so where each graphic
+    /// is) settles after scrolling and as lines are measured, and the
+    /// adjustment signals that report it may come in the middle of a
+    /// layout pass. Several requests before then run once.
+    fn schedule_budget(self: &Rc<Self>) {
+        if self.budget_pending.replace(true) {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        glib::idle_add_local_once(move || {
+            if let Some(session) = weak.upgrade() {
+                session.budget_pending.set(false);
+                session.enforce_budget();
+                session.redraw_near();
+            }
+        });
+    }
+
+    /// Asks again for the dropped graphics that are now on or near the
+    /// view (within [`layout::KEEP_SCREENS`] screens), so they are drawn
+    /// before they are seen, and for graphics over the document limit
+    /// wherever they are, as soon as they fit in the room left once the
+    /// near ones are counted (the nearest first). A request from an earlier
+    /// run (since cancelled by a zoom) is made again.
+    fn redraw_near(self: &Rc<Self>) {
+        if self.rezoom.borrow().is_some() {
+            return;
+        }
+        let generation = self.generation.get();
+        let mut room = self.budget.get().saturating_sub(self.held_bytes.get());
+        let mut ids = Vec::new();
+        let mut limited = Vec::new();
+        {
+            let slots = self.slots.borrow();
+            for (id, slot) in slots.iter().enumerate() {
+                let Some(slot) = slot else {
+                    continue;
+                };
+                let again = match slot.held.get() {
+                    Held::Drawn => false,
+                    Held::Dropped => true,
+                    Held::Requested(asked) => asked != generation,
+                    Held::Limited => {
+                        limited.push((self.distance_from_view(slot.offset), id, slot.size.get()));
+                        false
+                    }
+                };
+                if again && self.distance_from_view(slot.offset) == 0.0 {
+                    room = room.saturating_sub(slot.size.get());
+                    ids.push(id);
+                }
+            }
+            // Only once it fits, so it is not refused again.
+            limited.sort_by(|a, b| a.0.total_cmp(&b.0));
+            for (_, id, size) in limited {
+                if room >= size {
+                    room -= size;
+                    ids.push(id);
+                }
+            }
+            for id in &ids {
+                if let Some(Some(slot)) = slots.get(*id) {
+                    slot.held.set(Held::Requested(generation));
+                }
+            }
+        }
+        let jobs = ids.into_iter().map(|id| self.jobs[id].clone()).collect();
+        self.submit_batch(jobs);
+    }
+
+    /// How far (in pixels) the line at buffer `offset` is from the view
+    /// widened by [`layout::KEEP_SCREENS`] window heights each way; 0 when
+    /// it is within that.
+    fn distance_from_view(&self, offset: i32) -> f64 {
+        let adjustment = self.scrolled.vadjustment();
+        let page = adjustment.page_size();
+        let (top, height) = self
+            .view
+            .line_yrange(&self.view.buffer().iter_at_offset(offset));
+        layout::distance_from_view(
+            f64::from(top),
+            f64::from(top + height),
+            adjustment.value(),
+            adjustment.value() + page,
+            page * layout::KEEP_SCREENS,
+        )
+    }
+
+    /// Lowers the document's zoom limit to `image`'s, if that is lower; the
+    /// window hears of it from [`Session::report_limit`].
+    fn note_limit(&self, image: &Image) {
+        let limit = f64::from(image.max_zoom);
+        if limit < self.zoom_limit.get() {
+            self.zoom_limit.set(limit);
+            self.limit_dirty.set(true);
+        }
+    }
+
+    /// Tells the window the document's zoom limit if it changed since the
+    /// last report. Called once nothing on the page is borrowed (the window
+    /// may zoom out at once, which re-renders and restretches the graphics).
+    fn report_limit(&self) {
+        if self.limit_dirty.replace(false) {
+            (self.limit_changed)(self.zoom_limit.get(), self.keep_zoom.get());
         }
     }
 
@@ -744,8 +1153,6 @@ impl Session {
         let buffer = self.view.buffer();
         match &blocks[index] {
             Block::Text(inlines) => {
-                let offset = buffer.end_iter().offset();
-                self.record_heading(inlines, offset);
                 self.insert_inlines(&buffer, inlines);
             }
             Block::Table(table) => {
@@ -788,13 +1195,21 @@ impl Session {
                     .join("\n");
                 self.add_diagram_entry(&card, labels, offset);
                 let mut pictures = self.resizable.pictures.borrow_mut();
-                self.add_slot(Some(Slot {
-                    texture,
-                    rise: None,
-                    picture: Some(pictures.len()),
-                    offset,
-                    depth: Cell::new(0.0),
-                }));
+                self.add_graphic(
+                    image,
+                    Slot {
+                        texture,
+                        rise: None,
+                        picture: Some(pictures.len()),
+                        offset,
+                        depth: Cell::new(0.0),
+                        bytes: Cell::new(0),
+                        size: Cell::new(0),
+                        key: Cell::new(0),
+                        arrived: Cell::new(0),
+                        held: Cell::new(Held::Drawn),
+                    },
+                );
                 pictures.push((picture, image.logical_width(), image.logical_height()));
             }
             failed => {
@@ -844,7 +1259,11 @@ impl Session {
                     && md_viewer::image_is_standalone(inlines, at)
             })
             .collect();
+        let mut headings = links::heading_starts(inlines).into_iter().peekable();
         for (at, inline) in inlines.iter().enumerate() {
+            if let Some((_, text)) = headings.next_if(|(start, _)| *start == at) {
+                self.record_heading(&text, buffer.end_iter().offset());
+            }
             match inline {
                 Inline::Text(span) => {
                     let start = buffer.end_iter().offset();
@@ -865,7 +1284,7 @@ impl Session {
     /// Inserts a rendered formula at the end of `buffer`: inline math is
     /// lowered so its baseline lines up with the text, display math is
     /// centred. A formula that could not be rendered is shown as its source
-    /// in code style, display math with a note saying why.
+    /// in code style, followed by a note saying why (`Math::failure_note`).
     fn insert_math(&self, buffer: &gtk4::TextBuffer, math: &Math) {
         match &math.image {
             Some(Ok(image)) => {
@@ -881,13 +1300,21 @@ impl Session {
                 if math.display {
                     buffer.apply_tag_by_name(DISPLAY_MATH_TAG, &range.0, &range.1);
                 }
-                self.add_slot(Some(Slot {
-                    texture,
-                    rise: Some(rise),
-                    picture: None,
-                    offset: start,
-                    depth: Cell::new(image.depth),
-                }));
+                self.add_graphic(
+                    image,
+                    Slot {
+                        texture,
+                        rise: Some(rise),
+                        picture: None,
+                        offset: start,
+                        depth: Cell::new(image.depth),
+                        bytes: Cell::new(0),
+                        size: Cell::new(0),
+                        key: Cell::new(0),
+                        arrived: Cell::new(0),
+                        held: Cell::new(Held::Drawn),
+                    },
+                );
             }
             failed => {
                 self.add_slot(None);
@@ -895,16 +1322,13 @@ impl Session {
                     Some(Err(reason)) => reason.as_str(),
                     _ => "not rendered",
                 };
-                if math.display {
-                    insert_styled(buffer, &math.source(), &[Style::CodeBlock]);
-                    insert_styled(
-                        buffer,
-                        &format!("\n⚠ formula could not be rendered: {reason}"),
-                        &[Style::Image],
-                    );
+                let style = if math.display {
+                    Style::CodeBlock
                 } else {
-                    insert_styled(buffer, &math.source(), &[Style::Code]);
-                }
+                    Style::Code
+                };
+                insert_styled(buffer, &math.source(), &[style]);
+                insert_styled(buffer, &math.failure_note(reason), &[Style::Image]);
             }
         }
     }
@@ -918,20 +1342,9 @@ impl Session {
     /// whose image is part of a link is clickable, and every picture's alt
     /// text is searchable.
     fn insert_image(&self, buffer: &gtk4::TextBuffer, image: &ImageRef, standalone: bool) {
-        match &image.state {
-            ImageState::Remote => {
-                self.insert_image_placeholder(buffer, image, Some(NETWORK_UNSUPPORTED));
-                return;
-            }
-            ImageState::Unsupported(reason) => {
-                self.insert_image_placeholder(buffer, image, Some(reason));
-                return;
-            }
-            ImageState::Unresolved => {
-                self.insert_image_placeholder(buffer, image, Some("not resolved"));
-                return;
-            }
-            ImageState::Local(_) => {}
+        if !matches!(image.state, ImageState::Local(_)) {
+            self.insert_image_placeholder(buffer, image, image.failure_reason());
+            return;
         }
         match &image.image {
             Some(Ok(rendered)) => {
@@ -954,13 +1367,21 @@ impl Session {
                     }
                     let mut pictures = self.resizable.pictures.borrow_mut();
                     let index = pictures.len();
-                    self.add_slot(Some(Slot {
-                        texture,
-                        rise: None,
-                        picture: Some(index),
-                        offset,
-                        depth: Cell::new(0.0),
-                    }));
+                    self.add_graphic(
+                        rendered,
+                        Slot {
+                            texture,
+                            rise: None,
+                            picture: Some(index),
+                            offset,
+                            depth: Cell::new(0.0),
+                            bytes: Cell::new(0),
+                            size: Cell::new(0),
+                            key: Cell::new(0),
+                            arrived: Cell::new(0),
+                            held: Cell::new(Held::Drawn),
+                        },
+                    );
                     pictures.push((picture, rendered.logical_width(), rendered.logical_height()));
                 } else {
                     let start = buffer.end_iter().offset();
@@ -975,22 +1396,26 @@ impl Session {
                         );
                     }
                     self.add_image_entry(&image.alt, start, SearchTarget::Unhighlighted);
-                    self.add_slot(Some(Slot {
-                        texture,
-                        rise: None,
-                        picture: None,
-                        offset: start,
-                        depth: Cell::new(0.0),
-                    }));
+                    self.add_graphic(
+                        rendered,
+                        Slot {
+                            texture,
+                            rise: None,
+                            picture: None,
+                            offset: start,
+                            depth: Cell::new(0.0),
+                            bytes: Cell::new(0),
+                            size: Cell::new(0),
+                            key: Cell::new(0),
+                            arrived: Cell::new(0),
+                            held: Cell::new(Held::Drawn),
+                        },
+                    );
                 }
             }
-            failed => {
+            _ => {
                 self.add_slot(None);
-                let reason = match failed {
-                    Some(Err(reason)) => reason.as_str(),
-                    _ => "not rendered",
-                };
-                self.insert_image_placeholder(buffer, image, Some(reason));
+                self.insert_image_placeholder(buffer, image, image.failure_reason());
             }
         }
     }
@@ -1126,13 +1551,21 @@ impl Session {
                     picture.set_can_shrink(false);
                     picture.set_valign(gtk4::Align::Center);
                     row.append(&picture);
-                    self.add_slot(Some(Slot {
-                        texture,
-                        rise: None,
-                        picture: None,
-                        offset,
-                        depth: Cell::new(image.depth),
-                    }));
+                    self.add_graphic(
+                        image,
+                        Slot {
+                            texture,
+                            rise: None,
+                            picture: None,
+                            offset,
+                            depth: Cell::new(image.depth),
+                            bytes: Cell::new(0),
+                            size: Cell::new(0),
+                            key: Cell::new(0),
+                            arrived: Cell::new(0),
+                            held: Cell::new(Held::Drawn),
+                        },
+                    );
                 }
                 // A formula that could not be rendered is a graphic (it has a
                 // job), so it needs a slot even though it shows its source.
@@ -1160,13 +1593,21 @@ impl Session {
                         if let Some(dest) = &image.link {
                             self.make_picture_clickable(&card, dest);
                         }
-                        self.add_slot(Some(Slot {
-                            texture,
-                            rise: None,
-                            picture: None,
-                            offset,
-                            depth: Cell::new(0.0),
-                        }));
+                        self.add_graphic(
+                            rendered,
+                            Slot {
+                                texture,
+                                rise: None,
+                                picture: None,
+                                offset,
+                                depth: Cell::new(0.0),
+                                bytes: Cell::new(0),
+                                size: Cell::new(0),
+                                key: Cell::new(0),
+                                arrived: Cell::new(0),
+                                held: Cell::new(Held::Drawn),
+                            },
+                        );
                     }
                     (ImageState::Local(_), _) => {
                         self.add_slot(None);
@@ -1206,6 +1647,8 @@ impl Session {
     /// the rendering run stops, and a new one starts once zooming has
     /// settled for [`REZOOM_DELAY_MS`].
     fn zoom_to(self: &Rc<Self>, level: f32) {
+        // The user chose a zoom: lower limits may zoom out again.
+        self.keep_zoom.set(false);
         let ratio = f64::from(level) / f64::from(self.shown_zoom.get());
         self.shown_zoom.set(level);
         for slot in self.slots.borrow().iter().flatten() {
@@ -1232,15 +1675,59 @@ impl Session {
         self.poll_regularly();
     }
 
-    /// Re-renders the graphics of the current run at the new zoom: the ones
-    /// already submitted (those on the page plus those waiting below it), in
-    /// the order visible first, then below, then above the window. Graphics
-    /// beyond the frontier are left for later, rendered lazily when scrolled
-    /// near.
+    /// Re-renders the graphics of the current run at the new zoom (with the
+    /// size limit of the monitor the window is on now), see
+    /// [`Session::restart_run`].
     fn rerender(self: &Rc<Self>) {
         let mut settings = self.settings.get();
         settings.zoom = self.shown_zoom.get();
+        // The window may have moved to another monitor since.
+        settings.max_px = screen_max_px(&self.view);
         self.settings.set(settings);
+        self.restart_run();
+    }
+
+    /// Follows a move to a monitor with another device `scale` (fractional
+    /// with fractional scaling) or size limit `max_px`; does nothing if
+    /// neither changed. As GNOME does for every window, graphics keep their
+    /// logical size: the ones drawn (and those not on the page yet) are
+    /// rendered again with as many device pixels as the new scale needs.
+    /// The zoom limit is worked out again from the text and the graphics
+    /// as they are redrawn, and it can rise; while it is below the current
+    /// zoom, the window is not zoomed out (see `keep_zoom`). Returns true if
+    /// anything changed.
+    ///
+    /// `keep` is false when the window only now found its first monitor:
+    /// the limit then applies as usual, zooming out if needed.
+    fn rescale(self: &Rc<Self>, scale: f32, max_px: [u32; 2], keep: bool) -> bool {
+        let mut settings = self.settings.get();
+        if settings.scale == scale && settings.max_px == max_px {
+            return false;
+        }
+        settings.scale = scale;
+        settings.max_px = max_px;
+        self.settings.set(settings);
+        self.keep_zoom.set(keep);
+        self.zoom_limit.set(layout::text_zoom_limit(
+            settings.font_px,
+            settings.scale,
+            settings.max_px,
+        ));
+        self.limit_dirty.set(true);
+        self.report_limit();
+        // A zoom still settling re-renders with these settings shortly.
+        if self.rezoom.borrow().is_none() {
+            self.restart_run();
+        }
+        true
+    }
+
+    /// Starts a new rendering run with the current settings, cancelling the
+    /// one in progress: the graphics already submitted (those on the page
+    /// plus those waiting below it) are rendered again, in the order
+    /// visible first, then below, then above the window. Graphics beyond
+    /// the frontier are left for later, rendered lazily when scrolled near.
+    fn restart_run(self: &Rc<Self>) {
         let frontier = self.frontier.get();
         let unshown = self.progress.borrow_mut().reset_unshown(frontier);
         let shown: Vec<(usize, i32)> = self
@@ -1248,7 +1735,20 @@ impl Session {
             .borrow()
             .iter()
             .enumerate()
-            .filter_map(|(id, slot)| slot.as_ref().map(|slot| (id, slot.offset)))
+            .filter_map(|(id, slot)| {
+                let slot = slot.as_ref()?;
+                match slot.held.get() {
+                    Held::Drawn => {}
+                    // Asked for again when near the view (and, if limited,
+                    // once there is room).
+                    Held::Requested(_) => {
+                        slot.held.set(Held::Dropped);
+                        return None;
+                    }
+                    Held::Dropped | Held::Limited => return None,
+                }
+                Some((id, slot.offset))
+            })
             .collect();
         let order = progressive::zoom_order(&shown, self.first_visible_offset(), &unshown);
         let jobs = order.into_iter().map(|id| self.jobs[id].clone()).collect();
@@ -1256,6 +1756,7 @@ impl Session {
         self.outstanding.set(0);
         self.pool.replace(None);
         self.submit_batch(jobs);
+        self.redraw_near();
         self.update_status();
     }
 
@@ -1318,35 +1819,12 @@ impl Session {
         });
     }
 
-    /// Registers the heading of `inlines` (a text block that carries a
-    /// heading style) under its anchor slug at buffer `offset`, scrolled to
-    /// if a pending anchor names it.
-    fn record_heading(&self, inlines: &[Inline], offset: i32) {
-        let is_heading = inlines.iter().any(|inline| {
-            matches!(inline, Inline::Text(span) if span.styles.iter().any(|s| matches!(s, Style::Heading(_))))
-        });
-        if !is_heading {
+    /// Registers a heading with `text`, starting at buffer `offset`, under
+    /// its anchor; scrolls to it if a pending anchor names it.
+    fn record_heading(&self, text: &str, offset: i32) {
+        let Some(slug) = self.anchors.borrow_mut().register(text, offset) else {
             return;
-        }
-        let base = links::heading_slug(&inlines.iter().map(Inline::text).collect::<String>());
-        if base.is_empty() {
-            return;
-        }
-        let mut anchors = self.anchors.borrow_mut();
-        let slug = if anchors.contains_key(&base) {
-            let mut n = 1;
-            loop {
-                let candidate = format!("{base}-{n}");
-                if !anchors.contains_key(&candidate) {
-                    break candidate;
-                }
-                n += 1;
-            }
-        } else {
-            base
         };
-        anchors.insert(slug.clone(), offset);
-        drop(anchors);
         if self.pending_anchor.borrow().as_deref() == Some(slug.as_str()) {
             self.pending_anchor.borrow_mut().take();
             let mut iter = self.view.buffer().iter_at_offset(offset);
@@ -1388,22 +1866,46 @@ impl Session {
     /// Acts on a link `dest`: a same-document anchor scrolls to its heading,
     /// everything else is handed to the window.
     fn click_link(&self, dest: &str) {
-        match links::resolve_link(&self.document, dest) {
-            Resolved::Anchor(fragment) => self.scroll_to_anchor(&fragment),
+        match self.link_action(dest) {
+            LinkAction::Anchor(fragment) => {
+                let this = self.weak_self.borrow().as_ref().and_then(Weak::upgrade);
+                if let Some(this) = this {
+                    this.scroll_to_anchor(&fragment);
+                }
+            }
             other => (self.open_link.as_ref())(other),
         }
     }
 
-    /// Scrolls to the heading named `fragment`, or remembers it to scroll to
-    /// when that heading is appended.
-    fn scroll_to_anchor(&self, fragment: &str) {
-        let anchors = self.anchors.borrow();
-        if let Some(&offset) = anchors.get(fragment) {
-            drop(anchors);
+    /// What clicking the link `dest` does, looking at the file it names
+    /// (see [`file_facts`]).
+    fn link_action(&self, dest: &str) -> LinkAction {
+        links::link_action(links::resolve_link(&self.document, dest), file_facts)
+    }
+
+    /// The tooltip of the link `dest`: what a click does, including why a
+    /// link is refused or asks first.
+    fn link_tooltip(&self, dest: &str) -> String {
+        links::link_tooltip(dest, &self.link_action(dest))
+    }
+
+    /// Scrolls to the heading named `fragment`; an empty fragment (`#`)
+    /// scrolls to the top. A heading not on the page yet is rendered up to
+    /// and scrolled to once appended; a fragment naming no heading at all
+    /// does nothing (and leaves nothing pending).
+    fn scroll_to_anchor(self: &Rc<Self>, fragment: &str) {
+        self.pending_anchor.replace(None);
+        if fragment.is_empty() {
+            self.scrolled.vadjustment().set_value(0.0);
+            return;
+        }
+        let offset = self.anchors.borrow().lookup(fragment);
+        if let Some(offset) = offset {
             let mut iter = self.view.buffer().iter_at_offset(offset);
             self.view.scroll_to_iter(&mut iter, 0.15, true, 0.0, 0.3);
-        } else {
+        } else if let Some(block) = self.heading_blocks.lookup(fragment) {
             *self.pending_anchor.borrow_mut() = Some(fragment.to_string());
+            self.render_to(usize::try_from(block).unwrap_or(0));
         }
     }
 
@@ -1420,18 +1922,22 @@ impl Session {
             .borrow()
             .clone()
             .expect("session weak handle set after construction");
-        let label_for_click = label.clone();
+        // The handlers get the label from their controller: holding it in
+        // the closures would make label -> controller -> closure -> label a
+        // cycle that keeps every clickable label alive after its window.
         let links = content.links.clone();
         let click = gtk4::GestureClick::new();
         {
             let weak = weak.clone();
-            let label = label_for_click.clone();
             let links = links.clone();
-            click.connect_released(move |gesture, _, x, y| {
-                if gesture.current_button() != gdk::BUTTON_PRIMARY {
+            click.connect_released(move |gesture, presses, x, y| {
+                if gesture.current_button() != gdk::BUTTON_PRIMARY || !layout::opens_link(presses) {
                     return;
                 }
                 let Some(session) = weak.upgrade() else {
+                    return;
+                };
+                let Some(label) = gesture.widget().and_downcast::<gtk4::Label>() else {
                     return;
                 };
                 if let Some(dest) = label_link_at(&label, &links, x, y) {
@@ -1442,9 +1948,11 @@ impl Session {
         label.add_controller(click);
         let motion = gtk4::EventControllerMotion::new();
         {
-            let label = label_for_click.clone();
             let links = links.clone();
-            motion.connect_motion(move |_, x, y| {
+            motion.connect_motion(move |controller, x, y| {
+                let Some(label) = controller.widget().and_downcast::<gtk4::Label>() else {
+                    return;
+                };
                 let over_link = label_link_at(&label, &links, x, y).is_some();
                 label.set_cursor_from_name(if over_link { Some("pointer") } else { None });
             });
@@ -1452,9 +1960,12 @@ impl Session {
         label.add_controller(motion);
         label.set_has_tooltip(true);
         label.connect_query_tooltip(move |label, x, y, _, tooltip| {
+            let Some(session) = weak.upgrade() else {
+                return false;
+            };
             match label_link_at(label, &links, f64::from(x), f64::from(y)) {
                 Some(dest) if !dest.is_empty() => {
-                    tooltip.set_text(Some(dest.as_str()));
+                    tooltip.set_text(Some(&session.link_tooltip(&dest)));
                     true
                 }
                 _ => false,
@@ -1476,8 +1987,8 @@ impl Session {
         {
             let weak = weak.clone();
             let dest = dest.clone();
-            click.connect_released(move |gesture, _, _, _| {
-                if gesture.current_button() != gdk::BUTTON_PRIMARY {
+            click.connect_released(move |gesture, presses, _, _| {
+                if gesture.current_button() != gdk::BUTTON_PRIMARY || !layout::opens_link(presses) {
                     return;
                 }
                 if let Some(session) = weak.upgrade() {
@@ -1487,7 +1998,7 @@ impl Session {
         }
         card.add_controller(click);
         card.set_cursor_from_name(Some("pointer"));
-        card.set_tooltip_text(Some(&dest));
+        card.set_tooltip_text(Some(&self.link_tooltip(&dest)));
     }
 
     /// Runs a search for `query` in `mode`, replacing the current one, and
@@ -1524,6 +2035,11 @@ impl Session {
 
     /// Steps the current match forward or backward, wrapping around.
     fn navigate(self: &Rc<Self>, forward: bool) -> SearchSummary {
+        // Step through up-to-date matches, not ones from before blocks
+        // that were appended since.
+        if self.refresh_waiting.get() {
+            self.refresh_now();
+        }
         {
             let mut search = self.search.borrow_mut();
             search.current = search::next_index(search.current, search.matches.len(), forward);
@@ -1840,7 +2356,7 @@ fn code_card(code: &CodeBlock) -> (gtk4::Box, gtk4::Label) {
         .orientation(gtk4::Orientation::Vertical)
         .css_classes(["md-code"])
         .halign(gtk4::Align::Start)
-        .margin_start(layout::CODE_INDENT * code.indent.min(16) as i32)
+        .margin_start(layout::CODE_INDENT * code.indent.min(md_viewer::MAX_LIST_INDENT) as i32)
         .overflow(gtk4::Overflow::Hidden)
         .build();
     card.append(&header);
@@ -1885,6 +2401,9 @@ struct DocWindow {
     toolbar: adw::ToolbarView,
     /// The header bar spinner, shown while a document is still loading.
     spinner: adw::Spinner,
+    /// The header bar's zoom percentage (hidden at 100%); clicking it resets
+    /// the zoom.
+    zoom_indicator: gtk4::Button,
     /// The document shown, or `None` while the window shows the start page.
     document: RefCell<Option<PathBuf>>,
     /// The document being shown, if any.
@@ -1910,6 +2429,11 @@ struct DocWindow {
     /// The find bar's matching mode, kept for the window (and its future
     /// documents); a new window starts with smart case.
     mode: Cell<SearchMode>,
+    /// Whether the window re-renders its document for a new monitor (see
+    /// [`DocWindow::follow_monitor`]); off in the unit tests.
+    follows_monitor: Cell<bool>,
+    /// Whether the window was on a known monitor when last checked.
+    on_monitor: Cell<bool>,
 }
 
 impl DocWindow {
@@ -1928,9 +2452,16 @@ impl DocWindow {
             .width_request(16)
             .height_request(16)
             .build();
+        let zoom_indicator = gtk4::Button::builder()
+            .tooltip_text("Reset Zoom (Ctrl+0)")
+            .action_name("win.zoom-reset")
+            .css_classes(["flat"])
+            .visible(false)
+            .build();
         let header = adw::HeaderBar::new();
         header.pack_start(&open_button);
         header.pack_end(&spinner);
+        header.pack_end(&zoom_indicator);
         let toolbar = adw::ToolbarView::new();
         toolbar.add_top_bar(&header);
         toolbar.set_content(Some(&start_page()));
@@ -1997,6 +2528,7 @@ impl DocWindow {
             window,
             toolbar,
             spinner,
+            zoom_indicator,
             document: RefCell::new(None),
             session: RefCell::new(None),
             zoom: Cell::new(Zoom::default()),
@@ -2011,6 +2543,10 @@ impl DocWindow {
             search_next,
             search_mode_button,
             mode: Cell::new(SearchMode::SmartCase),
+            // The unit tests render with fixed settings and call
+            // `Session::rescale` themselves.
+            follows_monitor: Cell::new(!cfg!(test)),
+            on_monitor: Cell::new(false),
         });
         add_css(
             &this.zoom_css,
@@ -2027,12 +2563,43 @@ impl DocWindow {
         this.window.add_action(&open);
         this.install_zoom();
         this.install_search();
-        this.window.connect_close_request(|window| {
+        this.follow_monitors();
+        let zoom_css = this.zoom_css.clone();
+        this.window.connect_close_request(move |window| {
             window.remove_action("open");
+            remove_css(&zoom_css);
             glib::Propagation::Proceed
         });
         this.window.present();
         this
+    }
+
+    /// Follows the window's monitor: once the window has a surface, a change
+    /// of its scale (moving to a monitor with another scale) or entering
+    /// another monitor re-renders the document's graphics for it (see
+    /// [`DocWindow::follow_monitor`]).
+    fn follow_monitors(self: &Rc<Self>) {
+        let state = Rc::downgrade(self);
+        self.window.connect_realize(move |window| {
+            let Some(surface) = window.surface() else {
+                return;
+            };
+            let weak = state.clone();
+            surface.connect_scale_notify(move |_| {
+                if let Some(state) = weak.upgrade() {
+                    state.follow_monitor();
+                }
+            });
+            let weak = state.clone();
+            surface.connect_enter_monitor(move |_, _| {
+                if let Some(state) = weak.upgrade() {
+                    state.follow_monitor();
+                }
+            });
+            if let Some(state) = state.upgrade() {
+                state.follow_monitor();
+            }
+        });
     }
 
     /// Installs the find action (Ctrl+F), the mode popover and the key
@@ -2213,11 +2780,12 @@ impl DocWindow {
     /// of the window in place.
     fn change_zoom(&self, change: impl FnOnce(&mut Zoom) -> bool) {
         let mut zoom = self.zoom.get();
-        if !change(&mut zoom) {
-            self.zoom.set(zoom);
+        let changed = change(&mut zoom);
+        self.zoom.set(zoom);
+        self.update_zoom_indicator();
+        if !changed {
             return;
         }
-        self.zoom.set(zoom);
         let session = self.session.borrow().clone();
         if let Some(session) = &session {
             session.hold_anchor();
@@ -2226,6 +2794,56 @@ impl DocWindow {
             .load_from_string(&zoom::css(&self.zoom_class, self.base_px, zoom.level()));
         if let Some(session) = session {
             session.zoom_to(zoom.level() as f32);
+        }
+    }
+
+    /// Sets the zoom ceiling to `limit`, the largest zoom the document's
+    /// graphics allow; if the window is zoomed in further, it zooms out to
+    /// the ceiling (keeping the line at the top of the window in place),
+    /// unless `keep` is set (after a move to a monitor with another scale),
+    /// in which case the ceiling stops at the current level instead.
+    fn limit_zoom(&self, limit: f64, keep: bool) {
+        if keep {
+            let mut zoom = self.zoom.get();
+            zoom.set_ceiling_keeping_level(limit);
+            self.zoom.set(zoom);
+            self.update_zoom_indicator();
+        } else {
+            self.change_zoom(|zoom| zoom.set_ceiling(limit));
+        }
+    }
+
+    /// Re-renders the current document's graphics for the scale and size
+    /// limit of the monitor the window is on now, if either changed (see
+    /// [`Session::rescale`]). Only a move from a known monitor keeps the
+    /// zoom level: the window finding its first monitor (the document may
+    /// have started with the fallback size limit) is not a move.
+    fn follow_monitor(&self) {
+        if !self.follows_monitor.get() {
+            return;
+        }
+        let was_on_monitor = self.on_monitor.get();
+        let session = self.session.borrow().clone();
+        if let Some(session) = session {
+            self.on_monitor.set(window_monitor(&session.view).is_some());
+            session.rescale(
+                screen_scale(&session.view),
+                screen_max_px(&session.view),
+                was_on_monitor,
+            );
+        } else {
+            self.on_monitor.set(window_monitor(&self.window).is_some());
+        }
+    }
+
+    /// Shows the zoom percentage in the header bar, or hides it at 100%.
+    fn update_zoom_indicator(&self) {
+        match self.zoom.get().indicator() {
+            Some(text) => {
+                self.zoom_indicator.set_label(&text);
+                self.zoom_indicator.set_visible(true);
+            }
+            None => self.zoom_indicator.set_visible(false),
         }
     }
 
@@ -2248,6 +2866,7 @@ impl DocWindow {
                 || focus.is_ancestor(&self.search_entry)
         });
         if in_entry
+            || self.keys_belong_elsewhere()
             || modifiers.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK)
         {
             return glib::Propagation::Proceed;
@@ -2271,6 +2890,19 @@ impl DocWindow {
             }
             _ => glib::Propagation::Proceed,
         }
+    }
+
+    /// Whether keys are meant for something on top of the document rather
+    /// than the find bar shortcuts: a dialog shown in the window (the error
+    /// or link confirmation, where Escape is Cancel), or a popover holding
+    /// the focus (the search mode menu, the text's context menu).
+    fn keys_belong_elsewhere(&self) -> bool {
+        if self.window.visible_dialog().is_some() {
+            return true;
+        }
+        gtk4::prelude::RootExt::focus(&self.window).is_some_and(|focus| {
+            focus.is::<gtk4::Popover>() || focus.ancestor(gtk4::Popover::static_type()).is_some()
+        })
     }
 
     /// Steps to the next (`forward`) or previous match, if there is a query.
@@ -2354,6 +2986,11 @@ impl DocWindow {
         if let Some(old) = self.session.take() {
             old.pool.replace(None);
         }
+        // The new document sets its own ceiling as its graphics arrive.
+        let mut zoom = self.zoom.get();
+        zoom.set_ceiling(f64::INFINITY);
+        self.zoom.set(zoom);
+        self.update_zoom_indicator();
         self.search_bar.set_search_mode(false);
         let view = gtk4::TextView::builder()
             .editable(false)
@@ -2435,6 +3072,15 @@ impl DocWindow {
                 }
             })
         };
+        let limit_changed = {
+            let window = Rc::downgrade(self);
+            Box::new(move |limit, keep| {
+                if let Some(window) = window.upgrade() {
+                    window.limit_zoom(limit, keep);
+                }
+            })
+        };
+        let heading_blocks = links::heading_blocks(&blocks);
         let session = Rc::new(Session {
             view,
             scrolled,
@@ -2468,21 +3114,34 @@ impl DocWindow {
             search_changed,
             document: path.to_path_buf(),
             links: RefCell::new(LinkRanges::default()),
-            anchors: RefCell::new(HashMap::new()),
+            anchors: RefCell::new(Anchors::default()),
             pending_anchor: RefCell::new(None),
+            last_refresh: Cell::new(None),
+            refresh_waiting: Cell::new(false),
+            ticking: Cell::new(false),
+            idle_frames: Cell::new(0),
+            heading_blocks,
+            zoom_limit: Cell::new(f64::INFINITY),
+            limit_dirty: Cell::new(false),
+            keep_zoom: Cell::new(false),
+            held_bytes: Cell::new(0),
+            budget: Cell::new(graphics::DOCUMENT_BUDGET),
+            budget_pending: Cell::new(false),
+            arrivals: Cell::new(0),
+            limit_changed,
             pending_scroll: RefCell::new(None),
             open_link,
             weak_self: RefCell::new(None),
         });
         session.weak_self.replace(Some(Rc::downgrade(&session)));
         {
+            session.wake_ticks();
+            // The view's width shows in the horizontal adjustment.
             let weak = Rc::downgrade(&session);
-            session.view.add_tick_callback(move |view, _| {
+            session.scrolled.hadjustment().connect_changed(move |_| {
                 if let Some(session) = weak.upgrade() {
-                    session.resizable.update(view.width());
-                    session.keep_anchor();
+                    session.wake_ticks();
                 }
-                glib::ControlFlow::Continue
             });
         }
         {
@@ -2496,8 +3155,8 @@ impl DocWindow {
         {
             let weak = Rc::downgrade(&session);
             let click = gtk4::GestureClick::new();
-            click.connect_released(move |gesture, _, x, y| {
-                if gesture.current_button() != gdk::BUTTON_PRIMARY {
+            click.connect_released(move |gesture, presses, x, y| {
+                if gesture.current_button() != gdk::BUTTON_PRIMARY || !layout::opens_link(presses) {
                     return;
                 }
                 if let Some(session) = weak.upgrade() {
@@ -2527,21 +3186,36 @@ impl DocWindow {
                     };
                     match session.dest_at(f64::from(x), f64::from(y)) {
                         Some(dest) if !dest.is_empty() => {
-                            tooltip.set_text(Some(dest.as_str()));
+                            tooltip.set_text(Some(&session.link_tooltip(&dest)));
                             true
                         }
                         _ => false,
                     }
                 });
         }
+        session.release_anchor_on_input();
         {
             let weak = Rc::downgrade(&session);
             session.scrolled.vadjustment().connect_changed(move |_| {
                 if let Some(session) = weak.upgrade() {
                     session.marks.queue_draw();
+                    session.wake_ticks();
                     session.advance_frontier();
+                    session.schedule_budget();
                 }
             });
+            // Plain scrolling only changes the value: render more, and draw
+            // dropped graphics coming near the view again.
+            let weak = Rc::downgrade(&session);
+            session
+                .scrolled
+                .vadjustment()
+                .connect_value_changed(move |_| {
+                    if let Some(session) = weak.upgrade() {
+                        session.advance_frontier();
+                        session.schedule_budget();
+                    }
+                });
         }
         let weak: Weak<Session> = Rc::downgrade(&session);
         glib::timeout_add_local_once(
@@ -2564,40 +3238,127 @@ impl DocWindow {
     }
 
     /// The settings graphics are rendered with for `view`: the window's
-    /// text size, the display's scale factor, the theme's text colour and
-    /// the window's zoom.
+    /// text size, the display's (possibly fractional) scale, the theme's
+    /// text colour and the window's zoom.
     fn raster_settings(&self, view: &gtk4::TextView) -> RasterSettings {
         let color = view.color();
         let channel = layout::color_channel;
         RasterSettings {
             font_px: self.base_px,
-            scale: view.scale_factor().max(1) as f32,
+            scale: screen_scale(view),
             color: [
                 channel(color.red()),
                 channel(color.green()),
                 channel(color.blue()),
             ],
             zoom: self.zoom.get().level() as f32,
+            max_px: screen_max_px(view),
         }
     }
 
     /// Opens a resolved link: web, mail and file destinations are handed to
     /// the desktop's default handler, a Markdown document opens in the
     /// viewer (a new window, scrolled to its fragment if any).
-    fn open_link(self: &Rc<Self>, resolved: Resolved) {
-        match resolved {
-            Resolved::Web(uri) => launch_uri(&self.window, &uri),
-            Resolved::File(path) => {
-                if let Some(uri) = links::file_uri(&path) {
-                    launch_uri(&self.window, &uri);
-                }
-            }
-            Resolved::Markdown(path, fragment) => {
+    fn open_link(self: &Rc<Self>, action: LinkAction) {
+        match action {
+            LinkAction::Browse(uri) | LinkAction::Mail(uri) => launch_uri(&self.window, &uri),
+            LinkAction::OpenFile(path) => launch_file(&self.window, &path),
+            LinkAction::AskFile(path, reason) => self.confirm_open(path, &reason),
+            LinkAction::Markdown(path, fragment) => {
                 open_file_to(self, path, Origin::Chooser, fragment);
             }
-            Resolved::Anchor(_) | Resolved::Ignored => {}
+            LinkAction::Anchor(_)
+            | LinkAction::Missing(_)
+            | LinkAction::Refused(_)
+            | LinkAction::Nothing => {}
         }
     }
+
+    /// Asks before opening the potentially dangerous local file `path`,
+    /// saying why it is considered dangerous (`reason`); opens it only if
+    /// the user chooses "Open Anyway" (Cancel is the default).
+    fn confirm_open(&self, path: PathBuf, reason: &str) {
+        let dialog = confirm_dialog(&path, reason);
+        let window = self.window.clone();
+        dialog.connect_response(None, move |_, response| {
+            if response == OPEN_ANYWAY {
+                launch_file(&window, &path);
+            }
+        });
+        dialog.present(Some(&self.window));
+    }
+}
+
+/// The response id of the confirmation dialog's "Open Anyway" button.
+const OPEN_ANYWAY: &str = "open";
+
+/// The dialog asking before a potentially dangerous local file is opened:
+/// the reason, the path, Cancel as the default and "Open Anyway" styled as
+/// destructive.
+fn confirm_dialog(path: &Path, reason: &str) -> adw::AlertDialog {
+    let dialog = adw::AlertDialog::new(
+        Some("Open Dangerous Content?"),
+        Some(&confirm_body(path, reason)),
+    );
+    dialog.add_responses(&[("cancel", "_Cancel"), (OPEN_ANYWAY, "_Open Anyway")]);
+    dialog.set_response_appearance(OPEN_ANYWAY, adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    dialog
+}
+
+/// The text of the confirmation dialog: why the file is considered
+/// dangerous (`reason`, as `links::local_file_risk` words it), what opening
+/// it means, and its path.
+fn confirm_body(path: &Path, reason: &str) -> String {
+    format!(
+        "This link opens potentially dangerous content: {reason}.\n\n\
+         It will be opened by another application, outside MD Viewer. Only \
+         continue if you trust this document and where it came from.\n\n{}",
+        path.display()
+    )
+}
+
+/// Opens the local file at `path` in its default application.
+fn launch_file(window: &adw::ApplicationWindow, path: &Path) {
+    if let Some(uri) = links::file_uri(path) {
+        launch_uri(window, &uri);
+    }
+}
+
+/// What is known about the local file at `path` for deciding whether it is
+/// safe to open (see `links::local_file_risk`); `None` if it does not
+/// exist. The content types come from GIO, from the name and from the
+/// first bytes (read without blocking, regular files only).
+fn file_facts(path: &Path) -> Option<links::FileFacts> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = std::fs::metadata(path).ok()?;
+    let regular = metadata.is_file();
+    let (name_type, _) = gio::content_type_guess(Some(path), None);
+    let head = if regular {
+        md_viewer::read_head(path, 4096).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let data_type = if head.is_empty() {
+        None
+    } else {
+        let (sniffed, uncertain) = gio::content_type_guess(None::<&Path>, Some(head.as_slice()));
+        (!uncertain && sniffed != "application/octet-stream").then(|| sniffed.to_string())
+    };
+    // GIO counts every text type as possibly executable (a script); plain
+    // text itself is fine, its subtypes (scripts, source) are not.
+    let executable = |content_type: &str| {
+        content_type != "text/plain" && gio::content_type_can_be_executable(content_type)
+    };
+    let can_be_executable = executable(&name_type) || data_type.as_deref().is_some_and(executable);
+    Some(links::FileFacts {
+        regular,
+        executable_bit: metadata.permissions().mode() & 0o111 != 0,
+        name_type: name_type.to_string(),
+        data_type,
+        can_be_executable,
+    })
 }
 
 /// Hands `uri` to the desktop's default handler (a browser, mail client or
@@ -2734,8 +3495,10 @@ fn open_file_to(window: &Rc<DocWindow>, path: PathBuf, origin: Origin, fragment:
             Target::NewWindow => DocWindow::new(&window.app),
         };
         let session = target.show_document(&path, blocks);
-        session.pending_anchor.replace(fragment);
         session.start(target.raster_settings(&session.view));
+        if let Some(fragment) = fragment {
+            session.scroll_to_anchor(&fragment);
+        }
     });
 }
 
@@ -2754,6 +3517,50 @@ fn label_link_at(label: &gtk4::Label, links: &[LabelLink], x: f64, y: f64) -> Op
         .iter()
         .find(|link| link.range.contains(&(index as usize)))
         .map(|link| link.dest.clone())
+}
+
+/// The device scale of the window `widget` is in: the surface's fractional
+/// scale (1.25, 1.5, ... with fractional scaling; GTK's integer scale factor
+/// rounds those up to 2), or the widget's scale factor before the window has
+/// a surface; never below 1.
+fn screen_scale(widget: &impl IsA<gtk4::Widget>) -> f32 {
+    let scale = widget
+        .native()
+        .and_then(|native| native.surface())
+        .map_or_else(
+            || f64::from(widget.scale_factor()),
+            |surface| surface.scale(),
+        );
+    if scale.is_finite() {
+        scale.max(1.0) as f32
+    } else {
+        1.0
+    }
+}
+
+/// The monitor (most of) the window `widget` is in is shown on, if known.
+fn window_monitor(widget: &impl IsA<gtk4::Widget>) -> Option<gdk::Monitor> {
+    widget
+        .native()
+        .and_then(|native| native.surface())
+        .and_then(|surface| surface.display().monitor_at_surface(&surface))
+}
+
+/// The size limit for graphics shown in `widget`: [`graphics::SCREEN_MULTIPLE`]
+/// times the monitor its window is on, in device pixels, or
+/// [`graphics::FALLBACK_MAX_PX`] before the window is on a monitor.
+fn screen_max_px(widget: &impl IsA<gtk4::Widget>) -> [u32; 2] {
+    match window_monitor(widget) {
+        Some(monitor) => {
+            let geometry = monitor.geometry();
+            graphics::max_px_for(
+                geometry.width(),
+                geometry.height(),
+                f64::from(screen_scale(widget)),
+            )
+        }
+        None => graphics::FALLBACK_MAX_PX,
+    }
 }
 
 /// Inserts `text` at the end of `buffer` with the tags for `styles`.
@@ -2979,8 +3786,14 @@ mod scaled_texture {
     /// The instance state: the texture and its logical size.
     #[derive(Default)]
     pub struct Imp {
-        /// The device-pixel texture.
+        /// The device-pixel texture (`None` while a spinner stands in).
         pub texture: RefCell<Option<gdk::Texture>>,
+        /// The spinner drawn instead of a dropped texture, with the handler
+        /// forwarding its animation frames.
+        pub spinner: RefCell<Option<(gdk::Paintable, glib::SignalHandlerId)>>,
+        /// The message drawn instead of a texture the document's memory
+        /// budget had no room for, in the widget's text colour (dimmed).
+        pub message: RefCell<Option<(gtk4::pango::Layout, gdk::RGBA)>>,
         /// The logical width, in pixels.
         pub width: Cell<f64>,
         /// The logical height, in pixels.
@@ -3007,17 +3820,51 @@ mod scaled_texture {
             self.height.get().ceil() as i32
         }
 
-        /// Draws the texture scaled into the requested area.
+        /// Draws the texture scaled into the requested area, or the spinner
+        /// centred in it (at most 32 pixels, and not at all in a tiny area).
         fn snapshot(&self, snapshot: &gdk::Snapshot, width: f64, height: f64) {
-            let (Some(texture), Some(snapshot)) = (
-                self.texture.borrow().clone(),
-                snapshot.downcast_ref::<gtk4::Snapshot>(),
-            ) else {
+            let Some(gtk_snapshot) = snapshot.downcast_ref::<gtk4::Snapshot>() else {
                 return;
             };
-            let bounds = graphene::Rect::new(0.0, 0.0, width as f32, height as f32);
-            snapshot.append_texture(&texture, &bounds);
+            if let Some(texture) = self.texture.borrow().clone() {
+                let bounds = graphene::Rect::new(0.0, 0.0, width as f32, height as f32);
+                gtk_snapshot.append_texture(&texture, &bounds);
+            } else if let Some((layout, color)) = &*self.message.borrow() {
+                let bounds = graphene::Rect::new(0.0, 0.0, width as f32, height as f32);
+                gtk_snapshot.push_clip(&bounds);
+                layout.set_width((width * f64::from(gtk4::pango::SCALE)) as i32);
+                let (_, text_height) = layout.pixel_size();
+                gtk_snapshot.save();
+                gtk_snapshot.translate(&graphene::Point::new(
+                    0.0,
+                    ((height - f64::from(text_height)) / 2.0).max(0.0) as f32,
+                ));
+                gtk_snapshot.append_layout(layout, color);
+                gtk_snapshot.restore();
+                gtk_snapshot.pop();
+            } else if let Some((spinner, _)) = &*self.spinner.borrow() {
+                let size = super::layout::spinner_size(width, height);
+                if size > 0.0 {
+                    gtk_snapshot.save();
+                    gtk_snapshot.translate(&graphene::Point::new(
+                        ((width - size) / 2.0) as f32,
+                        ((height - size) / 2.0) as f32,
+                    ));
+                    spinner.snapshot(snapshot, size, size);
+                    gtk_snapshot.restore();
+                }
+            }
         }
+    }
+}
+
+/// An image's shared pixel buffer, handed to GDK without copying it.
+struct SharedPixels(std::sync::Arc<Vec<u8>>);
+
+impl AsRef<[u8]> for SharedPixels {
+    /// The pixels.
+    fn as_ref(&self) -> &[u8] {
+        &self.0
     }
 }
 
@@ -3042,10 +3889,14 @@ impl ScaledTexture {
             image.width as i32,
             image.height as i32,
             gdk::MemoryFormat::R8g8b8a8Premultiplied,
-            &glib::Bytes::from(&image.pixels),
+            &glib::Bytes::from_owned(SharedPixels(image.pixels.clone())),
             image.width as usize * 4,
         );
         let imp = self.imp();
+        if let Some((spinner, handler)) = imp.spinner.take() {
+            spinner.disconnect(handler);
+        }
+        imp.message.replace(None);
         imp.texture.replace(Some(texture.upcast()));
         imp.width.set(image.logical_width() as f64);
         imp.height.set(image.logical_height() as f64);
@@ -3056,6 +3907,69 @@ impl ScaledTexture {
         self.store(image);
         self.invalidate_size();
         self.invalidate_contents();
+    }
+
+    /// Frees the texture, keeping the logical size, and draws a spinner
+    /// (animated while `widget` is mapped) in its place until
+    /// [`ScaledTexture::set_image`] gives it pixels again.
+    fn show_spinner(&self, widget: &gtk4::Widget) {
+        use gtk4::subclass::prelude::ObjectSubclassIsExt;
+        let spinner = adw::SpinnerPaintable::new(Some(widget));
+        let weak = self.downgrade();
+        let handler = spinner.connect_invalidate_contents(move |_| {
+            if let Some(texture) = weak.upgrade() {
+                texture.invalidate_contents();
+            }
+        });
+        let imp = self.imp();
+        imp.texture.replace(None);
+        imp.message.replace(None);
+        if let Some((old, handler)) = imp.spinner.replace(Some((spinner.upcast(), handler))) {
+            old.disconnect(handler);
+        }
+        self.invalidate_contents();
+    }
+
+    /// Frees the texture, keeping the logical size, and draws `text` (laid
+    /// out with `widget`'s font, centred, wrapping, dimmed) in its place
+    /// until [`ScaledTexture::set_image`] gives it pixels again.
+    fn show_message(&self, widget: &gtk4::Widget, text: &str) {
+        use gtk4::subclass::prelude::ObjectSubclassIsExt;
+        let layout = widget.create_pango_layout(Some(text));
+        layout.set_alignment(gtk4::pango::Alignment::Center);
+        layout.set_wrap(gtk4::pango::WrapMode::WordChar);
+        let color = widget.color();
+        let dimmed = gdk::RGBA::new(
+            color.red(),
+            color.green(),
+            color.blue(),
+            color.alpha() * 0.55,
+        );
+        let imp = self.imp();
+        imp.texture.replace(None);
+        if let Some((spinner, handler)) = imp.spinner.take() {
+            spinner.disconnect(handler);
+        }
+        imp.message.replace(Some((layout, dimmed)));
+        self.invalidate_contents();
+    }
+
+    /// The message shown in place of the texture, if any.
+    #[cfg(test)]
+    fn message(&self) -> Option<String> {
+        use gtk4::subclass::prelude::ObjectSubclassIsExt;
+        self.imp()
+            .message
+            .borrow()
+            .as_ref()
+            .map(|(layout, _)| layout.text().to_string())
+    }
+
+    /// True while a spinner stands in for a dropped texture.
+    #[cfg(test)]
+    fn shows_spinner(&self) -> bool {
+        use gtk4::subclass::prelude::ObjectSubclassIsExt;
+        self.imp().spinner.borrow().is_some()
     }
 
     /// Scales the logical size by `ratio`, stretching the current texture,
@@ -3168,8 +4082,10 @@ mod tests {
     /// aligned with buffer offsets (an embedded child anchor becomes U+FFFC
     /// via `slice`), replacing a plain-text label's attributes drops its
     /// previous highlights, every style gets a text tag, code cards show
-    /// their code and language, a scaled texture stretches its logical size,
-    /// and a label's link hit-testing finds the destination under a point.
+    /// their code and language, a scaled texture stretches its logical size
+    /// and swaps its spinner or message without losing it, a widget not yet
+    /// in a window has scale 1, and a label's link hit-testing finds the
+    /// destination under a point.
     #[test]
     fn gtk_helpers() {
         if !gtk_ready() {
@@ -3257,11 +4173,37 @@ mod tests {
             height: 20,
             scale: 2.0,
             depth: 0.0,
-            pixels: vec![0; 40 * 20 * 4],
+            pixels: vec![0; 40 * 20 * 4].into(),
             labels: Vec::new(),
+            max_zoom: 1.0,
         };
         let texture = ScaledTexture::new(&image);
         assert_eq!(texture.scale_size(2.0), (40.0, 20.0));
+
+        // A spinner replaces an earlier spinner, and a message replaces a
+        // spinner; neither changes the logical size.
+        let owner = gtk4::Label::new(None);
+        let width = texture.intrinsic_width();
+        texture.show_spinner(owner.upcast_ref());
+        texture.show_spinner(owner.upcast_ref());
+        assert!(texture.shows_spinner());
+        texture.show_message(owner.upcast_ref(), "limit");
+        assert!(!texture.shows_spinner());
+        assert_eq!(texture.message().as_deref(), Some("limit"));
+        assert_eq!(texture.intrinsic_width(), width);
+        // A spinner is drawn into an area big enough for it, and left out
+        // of one too small (under 8 pixels), drawing nothing at all.
+        texture.show_spinner(owner.upcast_ref());
+        let drawn = |size: f64| {
+            let snapshot = gtk4::Snapshot::new();
+            texture.snapshot(snapshot.upcast_ref::<gdk::Snapshot>(), size, size);
+            snapshot.to_node().is_some()
+        };
+        assert!(drawn(40.0));
+        assert!(!drawn(4.0));
+
+        // A widget in no window yet has its own scale factor (1 here).
+        assert_eq!(screen_scale(&owner), 1.0);
 
         // A click inside the first characters finds a link covering them; a
         // point in a gap or with no links finds nothing.
@@ -3282,5 +4224,1059 @@ mod tests {
         }];
         assert_eq!(label_link_at(&link_label, &gap, 0.5, y), None);
         assert_eq!(label_link_at(&link_label, &[], 0.5, y), None);
+
+        session_checks();
+    }
+
+    /// Checks on a real window and document session (part of
+    /// [`gtk_helpers`], which owns the GTK thread): every heading of a text
+    /// block is registered at the buffer offset of its own first character,
+    /// with repeats suffixed, so `#fragment` links find each of them; an
+    /// anchor requested before its heading is appended is remembered.
+    fn session_checks() {
+        adw::init().expect("libadwaita initializes once GTK does");
+        let app = adw::Application::builder()
+            .application_id("io.github.TheHolm.md_viewer.Tests")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gio::Cancellable>)
+            .expect("the test application registers");
+        let window = DocWindow::new(&app);
+        let markdown = "# Intro\n\nSome text.\n\n## Usage\n\n- item\n\n## Usage\n\n## Über uns\n";
+        let session =
+            window.show_document(Path::new("/doc/readme.md"), md_viewer::render(markdown));
+        session.start(RasterSettings::default());
+        let buffer = session.view.buffer();
+        let text_at = |fragment: &str| {
+            let offset = session.anchors.borrow().lookup(fragment)?;
+            let start = buffer.iter_at_offset(offset);
+            let mut end = start;
+            end.forward_to_line_end();
+            Some(buffer.text(&start, &end, false).to_string())
+        };
+        assert_eq!(text_at("intro").as_deref(), Some("Intro"));
+        assert_eq!(text_at("usage").as_deref(), Some("Usage"));
+        assert_eq!(text_at("usage-1").as_deref(), Some("Usage"));
+        assert_eq!(text_at("über-uns").as_deref(), Some("Über uns"));
+        let first = session.anchors.borrow().lookup("usage");
+        let second = session.anchors.borrow().lookup("usage-1");
+        assert!(first < second, "{first:?} {second:?}");
+        // A clicked fragment is resolved, decoded and found.
+        session.click_link("#%C3%BCber-uns");
+        assert!(session.pending_anchor.borrow().is_none());
+        // A fragment naming no heading leaves nothing pending; `#` alone
+        // scrolls to the top.
+        session.click_link("#later");
+        assert!(session.pending_anchor.borrow().is_none());
+        session.click_link("#");
+        assert_eq!(session.scrolled.vadjustment().value(), 0.0);
+        // Once the page has settled, the frame callback stops; a change
+        // (here a held spot, as a zoom makes) starts it again.
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while session.ticking.get() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the frame callback stops"
+            );
+            context.iteration(false);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        session.hold_anchor();
+        assert!(session.ticking.get());
+        session.release_anchor();
+        window.window.close();
+        dropped_session_checks(&app);
+        resize_after_idle_checks(&app);
+        far_heading_checks(&app);
+        size_limit_checks(&app);
+        link_safety_checks(&app);
+    }
+
+    /// Checks of link safety with GIO's real type detection (part of
+    /// [`gtk_helpers`]): images, PDFs and plain text are safe; scripts,
+    /// executables, launchers, a text file that is really a script and a
+    /// file whose name lies are potentially dangerous; clicking one shows
+    /// the confirmation dialog (and opens nothing), whose text gives the
+    /// reason; tooltips say what a click does.
+    fn link_safety_checks(app: &adw::Application) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let write = |name: &str, bytes: &[u8]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).expect("write file");
+            path
+        };
+        let mut png = Vec::new();
+        image::RgbaImage::new(2, 2)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("encode PNG");
+        let risk = |path: &Path| {
+            let facts = file_facts(path).expect("file exists");
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            links::local_file_risk(&name, &facts)
+        };
+        assert_eq!(risk(&write("pic.png", &png)), None);
+        assert_eq!(risk(&write("notes.txt", b"just some notes\n")), None);
+        assert_eq!(
+            risk(&write("doc.pdf", b"%PDF-1.4\n%\xe2\xe3\n1 0 obj\n")),
+            None
+        );
+        let script = write("run.sh", b"#!/bin/sh\necho hi\n");
+        assert!(risk(&script).is_some());
+        let tool = write(
+            "tool",
+            b"\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+        );
+        assert!(risk(&tool).is_some());
+        let marked = write("marked.png", &png);
+        std::fs::set_permissions(&marked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(risk(&marked).unwrap().contains("executable"));
+        let launcher = write("app.desktop", b"[Desktop Entry]\nExec=rm -rf ~\n");
+        assert!(risk(&launcher).unwrap().contains("launcher"));
+        let fake = write("fake.txt", b"#!/bin/sh\nrm -rf ~\n");
+        assert!(risk(&fake).is_some());
+        let disguised = write(
+            "cat.png",
+            b"\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+        );
+        assert!(risk(&disguised).is_some());
+        assert_eq!(file_facts(&dir.path().join("missing")), None);
+        let fifo = dir.path().join("pipe.png");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        assert!(risk(&fifo).unwrap().contains("not a regular file"));
+
+        let body = confirm_body(Path::new("/d/run.sh"), "it is a program or script");
+        assert!(body.starts_with(
+            "This link opens potentially dangerous content: it is a program or script."
+        ));
+        assert!(body.ends_with("/d/run.sh"));
+
+        // Clicking a dangerous file asks; a missing one or a refused link
+        // does nothing; tooltips tell them apart.
+        let document = write("doc.md", b"[run](run.sh)\n");
+        let window = DocWindow::new(app);
+        let session = window.show_document(&document, md_viewer::render("[run](run.sh)\n"));
+        session.start(RasterSettings::default());
+        assert!(window.window.visible_dialog().is_none());
+        session.click_link("missing.zip");
+        session.click_link("ftp://example.com/x");
+        assert!(window.window.visible_dialog().is_none());
+        session.click_link("run.sh");
+        let dialog = window
+            .window
+            .visible_dialog()
+            .expect("the confirmation dialog");
+        let dialog = dialog
+            .downcast::<adw::AlertDialog>()
+            .expect("an alert dialog");
+        assert_eq!(dialog.heading().as_deref(), Some("Open Dangerous Content?"));
+        assert!(dialog.body().contains("could run code"));
+        assert_eq!(dialog.default_response().as_deref(), Some("cancel"));
+        assert_eq!(dialog.close_response(), "cancel");
+        dialog.close();
+        assert!(session
+            .link_tooltip("run.sh")
+            .starts_with("⚠ Potentially dangerous: "));
+        assert!(session
+            .link_tooltip("pic.png")
+            .starts_with("Open with the default application: "));
+        assert!(session
+            .link_tooltip("missing.zip")
+            .starts_with("File not found: "));
+        assert!(session
+            .link_tooltip("ftp://example.com/x")
+            .starts_with("Not opened: "));
+        window.window.close();
+    }
+
+    /// A frame callback that outlives its session (the view still on screen,
+    /// the session freed) stops at its next frame instead of acting on
+    /// the freed session (part of [`gtk_helpers`]).
+    fn dropped_session_checks(app: &adw::Application) {
+        let window = DocWindow::new(app);
+        let session =
+            window.show_document(Path::new("/doc/drop.md"), md_viewer::render("Some text.\n"));
+        session.start(RasterSettings::default());
+        settle(&session);
+        let view = session.view.clone();
+        let context = glib::MainContext::default();
+        assert!(view.is_mapped(), "the view is on screen");
+        // A callback runs only on a later frame: wake it, then free the
+        // session while the view stays in the window.
+        session.ticking.set(false);
+        session.wake_ticks();
+        let weak = Rc::downgrade(&session);
+        window.session.replace(None);
+        drop(session);
+        assert!(weak.upgrade().is_none(), "the session is freed");
+        // The callback stops (removing itself): a fresh one added after it
+        // still sees its frames.
+        let frames = Rc::new(Cell::new(0));
+        {
+            let frames = frames.clone();
+            view.add_tick_callback(move |_, _| {
+                frames.set(frames.get() + 1);
+                glib::ControlFlow::Continue
+            });
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while frames.get() < 3 {
+            assert!(std::time::Instant::now() < deadline, "frames are drawn");
+            context.iteration(false);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        window.window.close();
+    }
+
+    /// A change of the view's width wakes the stopped frame callback
+    /// (part of [`gtk_helpers`]): GTK reports a new width through the
+    /// horizontal adjustment's `changed` signal, and the callback then
+    /// re-sizes tables, pictures and code cards. (Headless X without a
+    /// window manager does not resize windows, so the signal is emitted
+    /// directly.)
+    fn resize_after_idle_checks(app: &adw::Application) {
+        let window = DocWindow::new(app);
+        let session = window.show_document(
+            Path::new("/doc/table.md"),
+            md_viewer::render("| a | b |\n|---|---|\n| 1 | 2 |\n"),
+        );
+        session.start(RasterSettings::default());
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !(session.progress.borrow().all_shown() && !session.ticking.get()) {
+            assert!(std::time::Instant::now() < deadline, "the page goes idle");
+            context.iteration(false);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        session
+            .scrolled
+            .hadjustment()
+            .emit_by_name::<()>("changed", &[]);
+        assert!(session.ticking.get());
+        window.window.close();
+    }
+
+    /// A link to a heading far beyond what lazy rendering has put on the
+    /// page renders up to it and scrolls there (part of [`gtk_helpers`]).
+    /// While it loads, a search refresh requested within
+    /// [`layout::SEARCH_REFRESH_MS`] of the last one is delayed (further
+    /// requests merge into it), stepping to the next match refreshes at
+    /// once, and the delayed refresh still runs.
+    fn far_heading_checks(app: &adw::Application) {
+        let mut markdown = String::from("# Top\n\n[far](#far-away)\n\n");
+        for i in 0..400 {
+            markdown += &format!("Formula $x_{{{i}}}$ here.\n\n");
+        }
+        markdown += "## Far away\n\nThe end.\n";
+        let window = DocWindow::new(app);
+        let session = window.show_document(Path::new("/doc/far.md"), md_viewer::render(&markdown));
+        session.start(RasterSettings::default());
+        let context = glib::MainContext::default();
+        for _ in 0..20 {
+            context.iteration(false);
+        }
+        assert!(session.anchors.borrow().lookup("far-away").is_none());
+        let summary = session.search("Formula", SearchMode::SmartCase);
+        assert_eq!(summary.total, 400);
+        // Blocks appended soon after a refresh wait for one later refresh:
+        // a second request meanwhile is merged into it, and stepping
+        // through the matches refreshes them first.
+        assert!(!session.progress.borrow().all_shown());
+        let recently = std::time::Instant::now() - Duration::from_millis(20);
+        session.last_refresh.set(Some(recently));
+        session.request_refresh();
+        assert!(session.refresh_waiting.get(), "the refresh is delayed");
+        session.request_refresh();
+        assert!(session.refresh_waiting.get());
+        let before = session.last_refresh.get().expect("refreshed");
+        let stepped = session.navigate(true);
+        assert!(
+            session.last_refresh.get().expect("refreshed") > before,
+            "navigating refreshes"
+        );
+        assert_eq!(stepped.total, 400);
+        session.click_link("#far-away");
+        assert_eq!(session.pending_anchor.borrow().as_deref(), Some("far-away"));
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while session.pending_anchor.borrow().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the heading is reached"
+            );
+            context.iteration(false);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(session.anchors.borrow().lookup("far-away").is_some());
+        // The search, refreshed in throttled steps while the blocks came in,
+        // still finds every match, now all on the page.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while session.refresh_waiting.get() {
+            assert!(std::time::Instant::now() < deadline, "the refresh runs");
+            context.iteration(false);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let summary = session.summary();
+        assert_eq!(summary.total, 400);
+        assert!(!summary.pending);
+        window.window.close();
+    }
+
+    /// Checks of the graphics size limit on a real window (part of
+    /// [`gtk_helpers`]): an image and an inline formula too large at 100%
+    /// show why in their place; a window zoomed in further than a wide
+    /// picture allows zooms out to the picture's limit once it arrives, and
+    /// the header bar shows the zoom with "(max)".
+    fn size_limit_checks(app: &adw::Application) {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let svg = |name: &str, width: u32| {
+            let path = dir.path().join(name);
+            let svg = format!(
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"10\"/>"
+            );
+            std::fs::write(&path, svg).expect("write SVG");
+            path
+        };
+        // Ten 1920 px screens are 19,200 px: this one allows 150%.
+        svg("wide.svg", 12_800);
+        svg("huge.svg", 30_000);
+        let document = dir.path().join("doc.md");
+        let markdown = "![wide](wide.svg)\n\n![huge](huge.svg)\n\nA $\\rule{100000em}{1em}$ b\n";
+        let window = DocWindow::new(app);
+        window.change_zoom(|zoom| zoom.set(2.0));
+        let mut blocks = md_viewer::render(markdown);
+        md_viewer::resolve_images(&mut blocks, &document);
+        let session = window.show_document(&document, blocks);
+        session.start(RasterSettings {
+            zoom: 2.0,
+            ..RasterSettings::default()
+        });
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !(session.progress.borrow().all_shown() && session.outstanding.get() == 0) {
+            assert!(std::time::Instant::now() < deadline, "the document loads");
+            context.iteration(false);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let buffer = session.view.buffer();
+        let text = searchable_text(&buffer);
+        assert!(text.contains("[image: huge — too large"), "{text}");
+        assert!(
+            text.contains("$\\rule{100000em}{1em}$ ⚠ too large"),
+            "{text}"
+        );
+        assert!((window.zoom.get().level() - 1.5).abs() < 1e-3);
+        assert!((window.zoom.get().max() - 1.5).abs() < 1e-3);
+        assert!(window.zoom_indicator.is_visible());
+        assert_eq!(window.zoom_indicator.label().as_deref(), Some("150% (max)"));
+        // Zooming in further is refused; back at 100% the indicator hides.
+        window.change_zoom(Zoom::zoom_in);
+        assert!((window.zoom.get().level() - 1.5).abs() < 1e-3);
+        window.change_zoom(Zoom::reset);
+        assert!(!window.zoom_indicator.is_visible());
+        window.window.close();
+        budget_checks(app);
+    }
+
+    /// Runs the main loop until `session` has every block on the page and
+    /// no render outstanding.
+    fn settle(session: &Session) {
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            while context.iteration(false) {}
+            if session.progress.borrow().all_shown()
+                && session.outstanding.get() == 0
+                && !session.budget_pending.get()
+                && session.rezoom.borrow().is_none()
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "the document settles");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Checks of the memory budget on a real window (part of
+    /// [`gtk_helpers`]), with the budget lowered to fit four pictures: a
+    /// long document with many pictures loads completely while holding no
+    /// more than the budget; pictures far from the view are dropped, keeping
+    /// their size and showing a spinner; a request left over from an earlier
+    /// rendering run for a far picture is dropped by a new run; scrolling to
+    /// the end draws the pictures there again, and the ones at the top are
+    /// dropped instead.
+    fn budget_checks(app: &adw::Application) {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let mut markdown = String::new();
+        for i in 0..12 {
+            let path = dir.path().join(format!("p{i}.png"));
+            image::RgbaImage::from_pixel(200, 100, image::Rgba([0, 0, 200, 255]))
+                .save(&path)
+                .expect("write picture");
+            markdown += &format!("![p{i}](p{i}.png)\n\n");
+            for line in 0..60 {
+                markdown += &format!("Filler {i}.{line}\n\n");
+            }
+        }
+        let document = dir.path().join("doc.md");
+        let mut blocks = md_viewer::render(&markdown);
+        md_viewer::resolve_images(&mut blocks, &document);
+        let window = DocWindow::new(app);
+        let session = window.show_document(&document, blocks);
+        let picture_bytes = 200 * 100 * 4;
+        session.budget.set(4 * picture_bytes);
+        session.start(RasterSettings::default());
+        settle(&session);
+        // Render everything (as a search would) and settle again.
+        session.render_to(usize::MAX);
+        settle(&session);
+        let count = |held: fn(Held) -> bool| {
+            session
+                .slots
+                .borrow()
+                .iter()
+                .flatten()
+                .filter(|slot| held(slot.held.get()))
+                .count()
+        };
+        assert_eq!(count(|_| true), 12);
+        assert!(session.held_bytes.get() <= session.budget.get());
+        assert!(count(|held| held != Held::Drawn) >= 8);
+        {
+            let slots = session.slots.borrow();
+            let first = slots[0].as_ref().expect("first picture");
+            assert_eq!(first.held.get(), Held::Drawn);
+            let last = slots[11].as_ref().expect("last picture");
+            assert_ne!(last.held.get(), Held::Drawn);
+            assert!(last.texture.shows_spinner());
+            assert_eq!(last.bytes.get(), 0);
+            assert_eq!(last.texture.intrinsic_width(), 200);
+            assert_eq!(last.texture.intrinsic_height(), 100);
+        }
+        // A new rendering run forgets a request from the old one for a
+        // picture far from the view: it is dropped, to be asked for again
+        // once it is near.
+        session.slots.borrow()[11]
+            .as_ref()
+            .expect("last picture")
+            .held
+            .set(Held::Requested(session.generation.get()));
+        session.restart_run();
+        assert_eq!(
+            session.slots.borrow()[11]
+                .as_ref()
+                .expect("last")
+                .held
+                .get(),
+            Held::Dropped
+        );
+        settle(&session);
+        // Scroll to the last picture: it is drawn again, the first one
+        // dropped, and the budget still holds.
+        let offset = session.slots.borrow()[11].as_ref().expect("last").offset;
+        let (top, _) = session
+            .view
+            .line_yrange(&session.view.buffer().iter_at_offset(offset));
+        session.scrolled.vadjustment().set_value(f64::from(top));
+        settle(&session);
+        {
+            let slots = session.slots.borrow();
+            let last = slots[11].as_ref().expect("last picture");
+            assert_eq!(last.held.get(), Held::Drawn);
+            assert!(!last.texture.shows_spinner());
+            assert_eq!(last.bytes.get(), picture_bytes);
+            assert_ne!(slots[0].as_ref().expect("first").held.get(), Held::Drawn);
+        }
+        assert!(session.held_bytes.get() <= session.budget.get());
+        // A zoom re-renders only what is drawn; dropped pictures keep their
+        // spinner and are stretched with the page.
+        session.zoom_to(1.5);
+        settle(&session);
+        {
+            let slots = session.slots.borrow();
+            let last = slots[11].as_ref().expect("last picture");
+            assert_eq!(last.held.get(), Held::Drawn);
+            assert_eq!(last.texture.intrinsic_width(), 300);
+            let first = slots[0].as_ref().expect("first picture");
+            assert!(first.texture.shows_spinner());
+            assert_eq!(first.texture.intrinsic_width(), 300);
+        }
+        assert!(session.held_bytes.get() <= session.budget.get());
+        window.window.close();
+        shared_and_limited_checks(app);
+    }
+
+    /// Budget checks on a real window (part of [`gtk_helpers`]): one
+    /// formula shown many times shares its pixels and counts (about) once;
+    /// pictures near the view that alone exceed the budget show the
+    /// document limit message in their place (keeping their size), and are
+    /// drawn once there is room.
+    fn shared_and_limited_checks(app: &adw::Application) {
+        let markdown = "Same $x^2+y^2$ formula. ".repeat(50);
+        let window = DocWindow::new(app);
+        let session = window.show_document(Path::new("/doc/same.md"), md_viewer::render(&markdown));
+        session.start(RasterSettings::default());
+        settle(&session);
+        let one = {
+            let slots = session.slots.borrow();
+            assert_eq!(slots.iter().flatten().count(), 50);
+            slots
+                .iter()
+                .flatten()
+                .map(|slot| slot.size.get())
+                .max()
+                .unwrap()
+        };
+        session.enforce_budget();
+        assert!(session.held_bytes.get() > 0);
+        assert_eq!(session.held_bytes.get(), one);
+        window.window.close();
+
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let mut markdown = String::new();
+        for i in 0..3 {
+            let path = dir.path().join(format!("p{i}.png"));
+            image::RgbaImage::from_pixel(100, 50, image::Rgba([0, 120, 0, 255]))
+                .save(&path)
+                .expect("write picture");
+            markdown += &format!("![p{i}](p{i}.png)\n\n");
+        }
+        let document = dir.path().join("doc.md");
+        let mut blocks = md_viewer::render(&markdown);
+        md_viewer::resolve_images(&mut blocks, &document);
+        let window = DocWindow::new(app);
+        let session = window.show_document(&document, blocks);
+        let picture_bytes = 100 * 50 * 4;
+        session.budget.set(picture_bytes);
+        session.start(RasterSettings::default());
+        settle(&session);
+        let states = || {
+            session
+                .slots
+                .borrow()
+                .iter()
+                .flatten()
+                .map(|slot| slot.held.get())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            states().iter().filter(|held| **held == Held::Drawn).count(),
+            1
+        );
+        assert_eq!(
+            states()
+                .iter()
+                .filter(|held| **held == Held::Limited)
+                .count(),
+            2
+        );
+        for slot in session.slots.borrow().iter().flatten() {
+            if slot.held.get() == Held::Limited {
+                assert_eq!(
+                    slot.texture.message().as_deref(),
+                    Some(DOCUMENT_LIMIT_MESSAGE)
+                );
+                assert_eq!(slot.texture.intrinsic_width(), 100);
+            }
+        }
+        assert!(session.held_bytes.get() <= picture_bytes);
+        // With room for all three, the limited ones are drawn.
+        session.budget.set(3 * picture_bytes);
+        session.schedule_budget();
+        settle(&session);
+        assert!(
+            states().iter().all(|held| *held == Held::Drawn),
+            "{:?}",
+            states()
+        );
+        assert!(session
+            .slots
+            .borrow()
+            .iter()
+            .flatten()
+            .all(|slot| slot.texture.message().is_none()));
+        window.window.close();
+        limited_far_checks(app);
+    }
+
+    /// Graphics over the document limit are retried wherever they are
+    /// (part of [`gtk_helpers`]): with the view scrolled far below them,
+    /// they stay limited (and are not asked for again) while there is no
+    /// room, and are drawn without scrolling back once there is.
+    fn limited_far_checks(app: &adw::Application) {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let mut markdown = String::new();
+        for i in 0..3 {
+            let path = dir.path().join(format!("p{i}.png"));
+            image::RgbaImage::from_pixel(100, 50, image::Rgba([120, 0, 0, 255]))
+                .save(&path)
+                .expect("write picture");
+            markdown += &format!("![p{i}](p{i}.png)\n\n");
+        }
+        for line in 0..400 {
+            markdown += &format!("Filler {line}\n\n");
+        }
+        let document = dir.path().join("doc.md");
+        let mut blocks = md_viewer::render(&markdown);
+        md_viewer::resolve_images(&mut blocks, &document);
+        let window = DocWindow::new(app);
+        let session = window.show_document(&document, blocks);
+        let picture_bytes = 100 * 50 * 4;
+        session.budget.set(picture_bytes);
+        session.start(RasterSettings::default());
+        settle(&session);
+        session.render_to(usize::MAX);
+        settle(&session);
+        let states = || {
+            session
+                .slots
+                .borrow()
+                .iter()
+                .flatten()
+                .map(|slot| slot.held.get())
+                .collect::<Vec<_>>()
+        };
+        let limited = |states: &[Held]| states.iter().filter(|h| **h == Held::Limited).count();
+        assert_eq!(limited(&states()), 2, "{:?}", states());
+        // Scroll to the end, far from the pictures.
+        let end = session.view.buffer().end_iter();
+        let (top, _) = session.view.line_yrange(&end);
+        session.scrolled.vadjustment().set_value(f64::from(top));
+        settle(&session);
+        let offset = session.slots.borrow()[0].as_ref().expect("first").offset;
+        assert!(session.distance_from_view(offset) > 0.0);
+        // No room: still limited, not asked for again.
+        session.schedule_budget();
+        settle(&session);
+        assert_eq!(limited(&states()), 2, "{:?}", states());
+        // Room for all three: drawn where they are.
+        session.budget.set(3 * picture_bytes);
+        session.schedule_budget();
+        settle(&session);
+        assert!(
+            states().iter().all(|held| *held == Held::Drawn),
+            "{:?}",
+            states()
+        );
+        assert!(session.distance_from_view(offset) > 0.0);
+        window.window.close();
+        rescale_checks(app);
+    }
+
+    /// Moving to a monitor with another scale (part of [`gtk_helpers`];
+    /// `Session::rescale` is called directly, as headless X has one
+    /// monitor): graphics keep their logical size while their device pixels
+    /// follow the new, possibly fractional, scale (a raster image keeps its
+    /// file's pixels); the same values again change nothing; a zoom limit
+    /// that drops below the current zoom stops zooming in without zooming
+    /// the window out, until the user zooms.
+    fn rescale_checks(app: &adw::Application) {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        std::fs::write(
+            dir.path().join("v.svg"),
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"50\">\
+             <rect width=\"100\" height=\"50\" fill=\"teal\"/></svg>",
+        )
+        .expect("write SVG");
+        image::RgbaImage::from_pixel(100, 50, image::Rgba([9, 9, 9, 255]))
+            .save(dir.path().join("r.png"))
+            .expect("write picture");
+        let document = dir.path().join("doc.md");
+        let mut blocks = md_viewer::render("Formula $x^2$ here.\n\n![v](v.svg)\n\n![r](r.png)\n");
+        md_viewer::resolve_images(&mut blocks, &document);
+        let window = DocWindow::new(app);
+        let session = window.show_document(&document, blocks);
+        session.start(RasterSettings::default());
+        settle(&session);
+        let sizes = || {
+            session
+                .slots
+                .borrow()
+                .iter()
+                .flatten()
+                .map(|slot| {
+                    (
+                        slot.texture.intrinsic_width(),
+                        slot.texture.intrinsic_height(),
+                        slot.size.get(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = sizes();
+        assert_eq!(before.len(), 3);
+        assert_eq!(before[1], (100, 50, 100 * 50 * 4));
+        assert_eq!(before[2], (100, 50, 100 * 50 * 4));
+        let same_logical = |now: &[(i32, i32, usize)]| {
+            for (old, new) in before.iter().zip(now) {
+                assert!(old.0.abs_diff(new.0) <= 1, "{before:?} {now:?}");
+                assert!(old.1.abs_diff(new.1) <= 1, "{before:?} {now:?}");
+            }
+        };
+        let max_px = graphics::FALLBACK_MAX_PX;
+        assert!(session.rescale(2.0, max_px, true));
+        settle(&session);
+        let double = sizes();
+        same_logical(&double);
+        assert_eq!(double[1].2, 200 * 100 * 4);
+        assert_eq!(double[2].2, 100 * 50 * 4);
+        assert!(double[0].2 > 3 * before[0].2);
+        // Fractional: 1.5 times the pixels on each side, not 2.
+        assert!(session.rescale(1.5, max_px, true));
+        settle(&session);
+        let fractional = sizes();
+        same_logical(&fractional);
+        assert_eq!(fractional[1].2, 150 * 75 * 4);
+        assert_eq!(fractional[2].2, 100 * 50 * 4);
+        assert!(fractional[0].2 < double[0].2);
+        assert!(!session.rescale(1.5, max_px, true));
+        assert_eq!(session.settings.get().scale, 1.5);
+        // At 200% on a monitor whose limit allows only 150% for the
+        // pictures, the window keeps its zoom; zooming in is refused.
+        window.change_zoom(|zoom| zoom.set(2.0));
+        settle(&session);
+        assert!(session.rescale(2.0, [300, 1_000_000], true));
+        settle(&session);
+        assert!((session.zoom_limit.get() - 1.5).abs() < 1e-3);
+        assert!((window.zoom.get().level() - 2.0).abs() < 1e-3);
+        assert!((window.zoom.get().max() - 2.0).abs() < 1e-3);
+        assert_eq!(window.zoom_indicator.label().as_deref(), Some("200% (max)"));
+        window.change_zoom(Zoom::zoom_in);
+        assert!((window.zoom.get().level() - 2.0).abs() < 1e-3);
+        // The user zooming out ends that: limits apply as usual again.
+        window.change_zoom(Zoom::zoom_out);
+        assert!(!session.keep_zoom.get());
+        assert!((window.zoom.get().level() - 1.75).abs() < 1e-3);
+        settle(&session);
+        // A monitor that allows more raises the limit again.
+        assert!(session.rescale(1.0, max_px, true));
+        settle(&session);
+        assert!(session.zoom_limit.get() > 2.0);
+        // Without `keep` (the window finding its first monitor), a lower
+        // limit zooms out as usual.
+        assert!(session.rescale(1.0, [150, 1_000_000], false));
+        settle(&session);
+        assert!((window.zoom.get().level() - 1.5).abs() < 1e-3);
+        // Following the real (headless) monitor: its scale and size limit
+        // are taken, and the window is then known to be on a monitor.
+        window.follows_monitor.set(true);
+        window.follow_monitor();
+        settle(&session);
+        assert!(window.on_monitor.get());
+        assert_eq!(session.settings.get().max_px, screen_max_px(&session.view));
+        assert_eq!(session.settings.get().scale, screen_scale(&session.view));
+        window.window.close();
+        leak_checks(app);
+    }
+
+    /// Nothing of a closed window outlives it (part of [`gtk_helpers`]): a
+    /// clickable label (a table cell with a link) is freed once dropped,
+    /// its controllers not keeping it alive; and a closed window's zoom CSS
+    /// no longer applies to anything.
+    fn leak_checks(app: &adw::Application) {
+        let blocks = md_viewer::render("| [link](other.md) |\n|---|\n| x |\n");
+        let window = DocWindow::new(app);
+        let session = window.show_document(Path::new("/doc/leak.md"), blocks.clone());
+        let Block::Table(table) = &blocks[0] else {
+            panic!("expected a table");
+        };
+        let content = label_text(&table.header[0]);
+        assert!(!content.links.is_empty());
+        let label = gtk4::Label::new(Some(&content.text));
+        session.make_label_clickable(&label, &content);
+        let weak = label.downgrade();
+        drop(label);
+        assert!(weak.upgrade().is_none(), "a clickable label is freed");
+
+        // A label carrying the window's zoom class is zoomed while the
+        // window is open, and not once it is closed.
+        window.change_zoom(|zoom| zoom.set(2.0));
+        let probe_window = gtk4::Window::new();
+        let probe = gtk4::Label::new(Some("probe"));
+        probe.add_css_class(&window.zoom_class);
+        probe_window.set_child(Some(&probe));
+        probe_window.present();
+        let context = glib::MainContext::default();
+        while context.iteration(false) {}
+        let size = |label: &gtk4::Label| {
+            label
+                .pango_context()
+                .font_description()
+                .map_or(0, |font| font.size())
+        };
+        let zoomed = size(&probe);
+        let expected = (f64::from(window.base_px) * 2.0 * f64::from(pango::SCALE)) as i32;
+        assert!(
+            (zoomed - expected).abs() <= pango::SCALE,
+            "{zoomed} {expected}"
+        );
+        window.window.close();
+        while context.iteration(false) {}
+        let fresh = gtk4::Label::new(Some("fresh"));
+        fresh.add_css_class(&window.zoom_class);
+        probe_window.set_child(Some(&fresh));
+        while context.iteration(false) {}
+        assert!(size(&fresh) < zoomed * 3 / 4, "{} {zoomed}", size(&fresh));
+        probe_window.close();
+        release_checks(app);
+    }
+
+    /// The spot held after a zoom is let go of on any scrolling input
+    /// (part of [`gtk_helpers`]; the controllers' signals are emitted, as
+    /// the tests cannot press keys): a scrolling key, a press on the
+    /// scrollbar and a touch drag release it; another key does not.
+    fn release_checks(app: &adw::Application) {
+        use glib::translate::IntoGlib;
+        let window = DocWindow::new(app);
+        let session =
+            window.show_document(Path::new("/doc/r.md"), md_viewer::render("Some text.\n"));
+        session.start(RasterSettings::default());
+        settle(&session);
+        let find = |widget: &gtk4::Widget| -> Vec<gtk4::EventController> {
+            let controllers = widget.observe_controllers();
+            (0..controllers.n_items())
+                .filter_map(|at| controllers.item(at).and_downcast::<gtk4::EventController>())
+                .filter(|controller| controller.name().as_deref() == Some(RELEASE_CONTROLLER))
+                .collect()
+        };
+        let on_view = find(session.scrolled.upcast_ref());
+        let keys = on_view
+            .iter()
+            .find_map(|c| c.clone().downcast::<gtk4::EventControllerKey>().ok())
+            .expect("key controller");
+        let touch = on_view
+            .iter()
+            .find_map(|c| c.clone().downcast::<gtk4::GestureDrag>().ok())
+            .expect("touch controller");
+        assert!(touch.is_touch_only());
+        let bar = find(&session.scrolled.vscrollbar())
+            .into_iter()
+            .find_map(|c| c.downcast::<gtk4::GestureClick>().ok())
+            .expect("scrollbar controller");
+        let press = |key: gdk::Key| {
+            keys.emit_by_name::<bool>(
+                "key-pressed",
+                &[&key.into_glib(), &0u32, &gdk::ModifierType::empty()],
+            )
+        };
+        session.hold_anchor();
+        assert!(!press(gdk::Key::n));
+        assert!(session.anchor.borrow().is_some(), "another key keeps it");
+        assert!(!press(gdk::Key::Page_Down));
+        assert!(session.anchor.borrow().is_none(), "a scrolling key");
+        session.hold_anchor();
+        bar.emit_by_name::<()>("pressed", &[&1i32, &0.0f64, &0.0f64]);
+        assert!(session.anchor.borrow().is_none(), "the scrollbar");
+        session.hold_anchor();
+        touch.emit_by_name::<()>("drag-begin", &[&0.0f64, &0.0f64]);
+        assert!(session.anchor.borrow().is_none(), "a touch drag");
+        window.window.close();
+        key_routing_checks(app);
+    }
+
+    /// The window's find shortcuts leave keys to dialogs and popovers (part
+    /// of [`gtk_helpers`]): with a dialog shown, Escape, `n` and `/` are
+    /// passed on and the find bar is left alone; once it is closed `/`
+    /// opens the find bar again; with the focus in a popover, Escape is
+    /// passed on. Also: a heading is found by its GitHub-style anchor.
+    fn key_routing_checks(app: &adw::Application) {
+        let window = DocWindow::new(app);
+        let session = window.show_document(
+            Path::new("/doc/keys.md"),
+            md_viewer::render("# Install - Linux\n\nText.\n"),
+        );
+        session.start(RasterSettings::default());
+        settle(&session);
+        let context = glib::MainContext::default();
+        let none = gdk::ModifierType::empty();
+        let passed = |key| window.handle_key(key, none) == glib::Propagation::Proceed;
+
+        show_error(&window.window, "a test error");
+        while context.iteration(false) {}
+        assert!(window.window.visible_dialog().is_some());
+        for key in [gdk::Key::Escape, gdk::Key::n, gdk::Key::N, gdk::Key::slash] {
+            assert!(passed(key), "{key:?}");
+        }
+        assert!(!window.search_bar.is_search_mode());
+        window
+            .window
+            .visible_dialog()
+            .expect("the dialog")
+            .force_close();
+        while context.iteration(false) {}
+        assert!(window.window.visible_dialog().is_none());
+        assert!(!passed(gdk::Key::slash));
+        assert!(window.search_bar.is_search_mode());
+        window.focus_view();
+        while context.iteration(false) {}
+        assert!(!passed(gdk::Key::Escape));
+        assert!(!window.search_bar.is_search_mode());
+
+        let popover = window
+            .search_mode_button
+            .popover()
+            .expect("the search mode popover");
+        window.search_bar.set_search_mode(true);
+        while context.iteration(false) {}
+        popover.popup();
+        while context.iteration(false) {}
+        let focus_in_popover = gtk4::prelude::RootExt::focus(&window.window).is_some_and(|f| {
+            f.is::<gtk4::Popover>() || f.ancestor(gtk4::Popover::static_type()).is_some()
+        });
+        if !focus_in_popover {
+            // Headless X may not move the focus; put it there.
+            popover.child().expect("popover content").grab_focus();
+            while context.iteration(false) {}
+        }
+        assert!(window.keys_belong_elsewhere());
+        assert!(passed(gdk::Key::Escape));
+        assert!(window.search_bar.is_search_mode());
+        popover.popdown();
+        while context.iteration(false) {}
+
+        // Both spellings of the heading's anchor are found on the page.
+        let anchors = session.anchors.borrow();
+        assert!(anchors.lookup("install--linux").is_some());
+        assert_eq!(
+            anchors.lookup("install---linux"),
+            anchors.lookup("install--linux")
+        );
+        drop(anchors);
+        session.click_link("#install---linux");
+        assert!(session.pending_anchor.borrow().is_none());
+        window.window.close();
+        picture_link_checks(app);
+    }
+
+    /// Every widget below `widget`, depth first.
+    fn descendants(widget: &gtk4::Widget) -> Vec<gtk4::Widget> {
+        let mut found = Vec::new();
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            found.push(current.clone());
+            found.extend(descendants(&current));
+            child = current.next_sibling();
+        }
+        found
+    }
+
+    /// The first controller of type `T` on `widget`.
+    fn controller<T: IsA<gtk4::EventController> + IsA<glib::Object>>(widget: &gtk4::Widget) -> T {
+        let controllers = widget.observe_controllers();
+        (0..controllers.n_items())
+            .find_map(|at| controllers.item(at).and_downcast::<T>())
+            .expect("the controller")
+    }
+
+    /// Links, images and searching on a real window (part of
+    /// [`gtk_helpers`]; controller signals are emitted, as the tests cannot
+    /// click): a linked picture, standalone or in a table cell, gets a
+    /// pointer cursor and the link's tooltip, and a release that is not a
+    /// primary-button click opens nothing; a remote image is shown as a
+    /// placeholder saying why; moving over a link in a table cell shows the
+    /// pointer cursor, which goes away off the link; an invalid regular
+    /// expression is reported as a search error with no matches.
+    fn picture_link_checks(app: &adw::Application) {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        image::RgbaImage::from_pixel(20, 10, image::Rgba([0, 0, 0, 255]))
+            .save(dir.path().join("p.png"))
+            .expect("write picture");
+        let document = dir.path().join("doc.md");
+        let markdown = "[![pic](p.png)](other.md)\n\n\
+                        | cell | text |\n|---|---|\n\
+                        | [![cell](p.png)](other.md) | [link](other.md) and more |\n\n\
+                        ![remote](https://example.com/x.png)\n";
+        let mut blocks = md_viewer::render(markdown);
+        md_viewer::resolve_images(&mut blocks, &document);
+        let window = DocWindow::new(app);
+        let session = window.show_document(&document, blocks);
+        session.start(RasterSettings::default());
+        settle(&session);
+        let windows = app.windows().len();
+        let widgets = descendants(session.view.upcast_ref());
+        let cards: Vec<&gtk4::Widget> = widgets
+            .iter()
+            .filter(|widget| widget.has_css_class("md-image"))
+            .collect();
+        assert_eq!(cards.len(), 2, "a standalone and a cell picture");
+        let tooltip = session.link_tooltip("other.md");
+        for card in cards {
+            assert_eq!(card.tooltip_text().as_deref(), Some(tooltip.as_str()));
+            let cursor = card.cursor().and_then(|cursor| cursor.name());
+            assert_eq!(cursor.as_deref(), Some("pointer"));
+            controller::<gtk4::GestureClick>(card)
+                .emit_by_name::<()>("released", &[&1i32, &1.0f64, &1.0f64]);
+        }
+        let text = searchable_text(&session.view.buffer());
+        assert!(
+            text.contains(&format!(
+                "[image: remote — {}]",
+                md_viewer::NETWORK_UNSUPPORTED
+            )),
+            "{text}"
+        );
+
+        let label = widgets
+            .iter()
+            .filter_map(|widget| widget.clone().downcast::<gtk4::Label>().ok())
+            .find(|label| label.text().starts_with("link and more"))
+            .expect("the cell label with a link");
+        let (_, height) = label.layout().pixel_size();
+        let y = f64::from(height) / 2.0;
+        let motion = controller::<gtk4::EventControllerMotion>(label.upcast_ref());
+        let cursor = || label.cursor().and_then(|cursor| cursor.name());
+        motion.emit_by_name::<()>("motion", &[&0.5f64, &y]);
+        assert_eq!(cursor().as_deref(), Some("pointer"));
+        let (width, _) = label.layout().pixel_size();
+        motion.emit_by_name::<()>("motion", &[&(f64::from(width) - 0.5), &y]);
+        assert_eq!(cursor(), None);
+        controller::<gtk4::GestureClick>(label.upcast_ref())
+            .emit_by_name::<()>("released", &[&1i32, &0.5f64, &y]);
+        while glib::MainContext::default().iteration(false) {}
+        assert_eq!(app.windows().len(), windows, "nothing was opened");
+
+        let summary = session.search("(", SearchMode::Regex);
+        assert!(summary.error);
+        assert_eq!(summary.total, 0);
+        window.window.close();
+        open_fragment_checks(app);
+    }
+
+    /// Opening a document at a fragment (as following `other.md#heading`
+    /// does) shows it and goes to that heading once it is on the page (part
+    /// of [`gtk_helpers`]).
+    fn open_fragment_checks(app: &adw::Application) {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let mut markdown = String::from("# Top\n\n");
+        for i in 0..300 {
+            markdown += &format!("Paragraph {i}.\n\n");
+        }
+        markdown += "## Far away\n\nThe end.\n";
+        let path = dir.path().join("far.md");
+        std::fs::write(&path, markdown).expect("write document");
+        let window = DocWindow::new(app);
+        open_file_to(
+            &window,
+            path.clone(),
+            Origin::Chooser,
+            Some("far-away".into()),
+        );
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while window.session.borrow().is_none() {
+            assert!(std::time::Instant::now() < deadline, "the document opens");
+            context.iteration(false);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(window.document.borrow().as_deref(), Some(path.as_path()));
+        let session = window.session.borrow().clone().expect("the session");
+        settle(&session);
+        assert!(session.anchors.borrow().lookup("far-away").is_some());
+        assert!(session.pending_anchor.borrow().is_none());
+        window.window.close();
     }
 }

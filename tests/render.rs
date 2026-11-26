@@ -269,6 +269,48 @@ fn nested_lists() {
     assert_eq!(plain_text(&r(source)), "1. a\n    • b\n        • c\n2. d");
 }
 
+/// Indentation stops at `MAX_LIST_INDENT` (4) levels: deeper items line up
+/// there, so a list nested thousands deep (`- - - ... x` on one line) costs
+/// text linear in its depth, not quadratic; code cards stop at that depth
+/// too.
+#[test]
+fn deep_lists_are_capped() {
+    assert_eq!(md_viewer::MAX_LIST_INDENT, 4);
+    let deep = |depth: usize| plain_text(&r(&format!("{}x", "- ".repeat(depth))));
+    let six = deep(6);
+    let lines: Vec<&str> = six.lines().collect();
+    assert_eq!(lines.len(), 6);
+    assert_eq!(lines[3], format!("{}• ", " ".repeat(12)));
+    assert_eq!(lines[4], format!("{}• ", " ".repeat(16)));
+    assert_eq!(lines[5], format!("{}• x", " ".repeat(16)));
+    let depth = 3000;
+    let text = deep(depth);
+    assert!(text.len() < depth * 25, "{} bytes", text.len());
+    let mut nested = String::new();
+    for level in 0..6 {
+        nested += &format!("{}- l{level}\n", "  ".repeat(level));
+    }
+    let fence = "  ".repeat(6);
+    nested += &format!("\n{fence}```\n{fence}y\n{fence}```\n");
+    assert_eq!(code_blocks(&nested), vec![code(None, "y", 4)]);
+}
+
+/// A byte-order mark at the start of a file is skipped, so the first line
+/// can still be a heading, a list item or a code fence; one later in the
+/// text is kept as it is.
+#[test]
+fn leading_byte_order_mark_is_skipped() {
+    let heading = r("\u{feff}# Title");
+    assert_eq!(plain_text(&heading), "Title");
+    assert_eq!(heading[0].styles, vec![Style::Heading(1)]);
+    assert_eq!(plain_text(&r("\u{feff}- a")), "• a");
+    assert_eq!(
+        code_blocks("\u{feff}```sh\nls\n```"),
+        vec![code(Some("sh"), "ls", 0)]
+    );
+    assert_eq!(plain_text(&r("a\u{feff}b")), "a\u{feff}b");
+}
+
 /// Task list items show `[x]` or `[ ]` after the bullet.
 #[test]
 fn task_list() {
@@ -1064,6 +1106,21 @@ fn math_source() {
     assert_eq!(Math::new("x", true).source(), "$$x$$");
 }
 
+/// A formula that could not be rendered says why after its source: on a
+/// line of its own under display math, briefly on the same line after
+/// inline math.
+#[test]
+fn math_failure_note() {
+    assert_eq!(
+        Math::new("x", true).failure_note("too large"),
+        "\n⚠ formula could not be rendered: too large"
+    );
+    assert_eq!(
+        Math::new("x", false).failure_note("too large"),
+        " ⚠ too large"
+    );
+}
+
 /// In Pango markup (table cells) a formula is shown as its source, in code
 /// style.
 #[test]
@@ -1254,18 +1311,66 @@ fn label_text_math_source() {
     );
 }
 
-/// An image in a label becomes its placeholder, since a label cannot show it.
+/// An image in a label becomes its placeholder with the reason it is not
+/// drawn, since a label cannot show it.
 #[test]
 fn label_text_image_placeholder() {
     let content = label_text(&[Inline::Image(image("i.png", "a cat"))]);
-    assert_eq!(content.text, "[image: a cat]");
+    assert_eq!(content.text, "[image: a cat — not resolved]");
     assert_eq!(
         content.runs,
         vec![md_viewer::StyledRun {
-            range: 0..14,
+            range: 0..content.text.len(),
             styles: vec![Style::Image],
         }]
     );
+}
+
+/// A table cell's image placeholder says why the image is missing: a
+/// missing file's error, network loading, or not rendered yet.
+#[test]
+fn label_text_image_reasons() {
+    let mut blocks =
+        render("| ![a](missing.png) | ![b](https://x.org/b.png) | ![c](c.png) |\n|---|---|---|\n");
+    resolve_images(&mut blocks, std::path::Path::new("/nowhere/doc.md"));
+    let Block::Table(table) = &mut blocks[0] else {
+        panic!("expected a table");
+    };
+    let Inline::Image(missing) = &mut table.header[0][0] else {
+        panic!("expected an image");
+    };
+    missing.image = Some(Err("missing file".to_string()));
+    let text = |cell: &Cell| label_text(cell).text;
+    assert_eq!(text(&table.header[0]), "[image: a — missing file]");
+    assert_eq!(
+        text(&table.header[1]),
+        "[image: b — network loading is not supported]"
+    );
+    assert_eq!(text(&table.header[2]), "[image: c — not rendered]");
+}
+
+/// `failure_reason` for every state of an image, and none once drawn.
+#[test]
+fn image_failure_reasons() {
+    use md_viewer::ImageState;
+    let mut image = ImageRef::new("x.png", "x");
+    assert_eq!(image.failure_reason(), Some("not resolved"));
+    image.state = ImageState::Remote;
+    assert_eq!(image.failure_reason(), Some(md_viewer::NETWORK_UNSUPPORTED));
+    image.state = ImageState::Unsupported("data: URLs are not supported".into());
+    assert_eq!(image.failure_reason(), Some("data: URLs are not supported"));
+    image.state = ImageState::Local("/x.png".into());
+    assert_eq!(image.failure_reason(), Some("not rendered"));
+    image.image = Some(Err("broken".into()));
+    assert_eq!(image.failure_reason(), Some("broken"));
+    let pixels = md_viewer::graphics::rasterize(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"/>"#,
+        15.0,
+        1.0,
+    )
+    .unwrap();
+    image.image = Some(Ok(pixels));
+    assert_eq!(image.failure_reason(), None);
 }
 
 /// An image placeholder in a label keeps the image's link, so a placeholder
@@ -1275,11 +1380,11 @@ fn label_text_image_placeholder_link() {
     let mut image = ImageRef::new("i.png", "a cat");
     image.link = Some("https://example.com".to_string());
     let content = label_text(&[Inline::Image(image)]);
-    assert_eq!(content.text, "[image: a cat]");
+    assert_eq!(content.text, "[image: a cat — not resolved]");
     assert_eq!(
         content.links,
         vec![md_viewer::LabelLink {
-            range: 0..14,
+            range: 0..content.text.len(),
             dest: "https://example.com".to_string(),
         }]
     );

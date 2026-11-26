@@ -6,6 +6,7 @@
 //! walks the blocks in order: text blocks are inserted into a text buffer with
 //! one text tag per [`Style`], and tables become grid widgets.
 
+mod casefold;
 pub mod graphics;
 pub mod layout;
 pub mod links;
@@ -93,6 +94,12 @@ const VERSION_FILE: &str = include_str!("../VERSION");
 pub fn version() -> &'static str {
     VERSION_FILE.trim()
 }
+
+/// The most levels of indentation written for nested lists (and block
+/// quotes, for code cards): deeper items line up at this depth. Without a
+/// cap, every item of an N-deep list would carry N indentation steps, so
+/// the text (and its memory) would grow with the square of the depth.
+pub const MAX_LIST_INDENT: usize = 4;
 
 /// The text a horizontal rule is rendered as.
 pub const RULE_TEXT: &str = "────────────────────────────────────────";
@@ -217,6 +224,17 @@ impl Math {
         let fence = if self.display { "$$" } else { "$" };
         format!("{fence}{}{fence}", self.tex)
     }
+
+    /// The note shown after the source of a formula that could not be
+    /// rendered, saying why: on a line of its own under display math, a
+    /// short one on the same line after inline math.
+    pub fn failure_note(&self, reason: &str) -> String {
+        if self.display {
+            format!("\n⚠ formula could not be rendered: {reason}")
+        } else {
+            format!(" ⚠ {reason}")
+        }
+    }
 }
 
 /// Where an image's destination points after it has been resolved against the
@@ -266,6 +284,24 @@ impl ImageRef {
         }
     }
 
+    /// Why the image is shown as its placeholder rather than drawn, or
+    /// `None` when it is drawn (a local file rendered successfully): network
+    /// loading is not supported, the destination is unsupported (with its
+    /// reason), it was never resolved, rendering failed (with the error), or
+    /// it is not rendered yet.
+    pub fn failure_reason(&self) -> Option<&str> {
+        match &self.state {
+            ImageState::Remote => Some(NETWORK_UNSUPPORTED),
+            ImageState::Unsupported(reason) => Some(reason),
+            ImageState::Unresolved => Some("not resolved"),
+            ImageState::Local(_) => match &self.image {
+                Some(Ok(_)) => None,
+                Some(Err(reason)) => Some(reason),
+                None => Some("not rendered"),
+            },
+        }
+    }
+
     /// The text shown in place of the image: `[image: <alt>]`, with `reason`
     /// added when there is one (`[image: <alt> — <reason>]`).
     pub fn placeholder(&self, reason: Option<&str>) -> String {
@@ -275,6 +311,9 @@ impl ImageRef {
         }
     }
 }
+
+/// Why a network image is not shown: the viewer never fetches anything.
+pub const NETWORK_UNSUPPORTED: &str = "network loading is not supported";
 
 /// One element of flowing text: a run of styled text, a formula or an image.
 #[derive(Debug, Clone, PartialEq)]
@@ -607,10 +646,10 @@ pub fn label_text(inlines: &[Inline]) -> LabelText {
         let (span_text, styles, link) = match inline {
             Inline::Text(span) => (span.text.clone(), span.styles.clone(), span.link.clone()),
             Inline::Math(math) => (math.source(), vec![Style::Code], None),
-            // A label cannot show the image; show its placeholder, keeping any
-            // link so the placeholder stays clickable.
+            // A label cannot show the image; show its placeholder with the
+            // reason, keeping any link so the placeholder stays clickable.
             Inline::Image(image) => (
-                image.placeholder(None),
+                image.placeholder(image.failure_reason()),
                 vec![Style::Image],
                 image.link.clone(),
             ),
@@ -654,12 +693,100 @@ fn markup_attributes(style: Style) -> String {
     }
 }
 
+/// The largest file the viewer reads: a document, an image, or an image an
+/// SVG refers to.
+pub const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Reads the file at `path`, refusing anything that is not a regular file
+/// (a FIFO would block the reader forever, a device like `/dev/zero` never
+/// ends) and anything larger than `limit` bytes. The type and size are
+/// checked before the file is opened, and at most `limit + 1` bytes are read,
+/// so a file growing meanwhile is refused too. Errors are `InvalidInput`
+/// with a message saying why.
+pub fn read_limited(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let refuse = |message: String| io::Error::new(io::ErrorKind::InvalidInput, message);
+    let too_large = |size: u64| {
+        refuse(format!(
+            "file too large ({}, limit {})",
+            size_text(size),
+            size_text(limit)
+        ))
+    };
+    let check = |metadata: &fs::Metadata| {
+        if !metadata.is_file() {
+            return Err(refuse("not a regular file".to_string()));
+        }
+        if metadata.len() > limit {
+            return Err(too_large(metadata.len()));
+        }
+        Ok(())
+    };
+    check(&fs::metadata(path)?)?;
+    let file = open_nonblocking(path)?;
+    // The path may have been replaced since it was checked: check what was
+    // actually opened.
+    let metadata = file.metadata()?;
+    check(&metadata)?;
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(too_large(bytes.len() as u64));
+    }
+    Ok(bytes)
+}
+
+/// Reads at most the first `len` bytes of the regular file at `path`
+/// (enough to tell its type from its content), without blocking on a FIFO;
+/// anything but a regular file is refused like [`read_limited`] does.
+pub fn read_head(path: &Path, len: usize) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let file = open_nonblocking(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let mut head = Vec::with_capacity(len);
+    file.take(len as u64).read_to_end(&mut head)?;
+    Ok(head)
+}
+
+/// Opens `path` for reading without blocking: opening a FIFO with no writer
+/// would otherwise wait forever (the flag has no effect on reading regular
+/// files, the only kind read further).
+fn open_nonblocking(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+}
+
+/// A byte count for messages: whole MiB from 1 MiB up, bytes below.
+fn size_text(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    if bytes >= MIB {
+        format!("{} MiB", bytes / MIB)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
 /// Reads the document at `path` into a string.
 ///
-/// The file is only ever opened for reading. Fails if the file cannot be read
-/// or is not valid UTF-8.
+/// The file is only ever opened for reading. Fails if the file cannot be
+/// read, is not a regular file, is larger than [`MAX_FILE_BYTES`] (see
+/// [`read_limited`]) or is not valid UTF-8 (`InvalidData`).
 pub fn read_document(path: &Path) -> io::Result<String> {
-    fs::read_to_string(path)
+    let bytes = read_limited(path, MAX_FILE_BYTES)?;
+    String::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        )
+    })
 }
 
 /// Reads the document at `path` and renders it, ready for display.
@@ -724,8 +851,12 @@ pub fn window_title(path: &Path) -> String {
 /// HTML, for instance) is shown as plain text rather than dropped. Blocks are
 /// separated by a blank line, list items by a single newline, and adjacent
 /// text with identical styles is merged into one span. See the "Rendering
-/// model" section of `NOTES.md` for the full set of rules.
+/// model" section of `NOTES.md` for the full set of rules. A UTF-8
+/// byte-order mark at the start is skipped (Markdown would otherwise see the
+/// first line as starting with an invisible character, not a heading, list
+/// or fence).
 pub fn render(source: &str) -> Vec<Block> {
+    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
@@ -1040,7 +1171,7 @@ impl Renderer {
             }
             _ => "• ".to_string(),
         };
-        let indent = "    ".repeat(depth);
+        let indent = "    ".repeat(depth.min(MAX_LIST_INDENT));
         self.push(&format!("{indent}{marker}"), Vec::new());
         self.item_fresh = true;
     }
@@ -1103,7 +1234,7 @@ impl Renderer {
             self.item_fresh = false;
         } else if !self.lists.is_empty() {
             self.ensure_newlines(1);
-            let indent = "    ".repeat(self.lists.len());
+            let indent = "    ".repeat(self.lists.len().min(MAX_LIST_INDENT));
             self.push(&indent, Vec::new());
         } else {
             self.ensure_newlines(2);
@@ -1126,7 +1257,7 @@ impl Renderer {
             .iter()
             .filter(|style| **style == Style::Quote)
             .count();
-        quotes + self.lists.len()
+        (quotes + self.lists.len()).min(MAX_LIST_INDENT)
     }
 
     /// Makes the output end with at least `count` newlines, unless the output
@@ -1244,6 +1375,38 @@ fn trailing_newlines(blocks: &[Block]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Opening without blocking returns at once even for a FIFO with no
+    /// writer (which a plain open would wait on forever), and the opened
+    /// file is seen to be no regular file; a regular file opens normally.
+    #[test]
+    fn open_nonblocking_does_not_wait_for_a_fifo() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let opened = open_nonblocking(&fifo).unwrap();
+        assert!(!opened.metadata().unwrap().is_file());
+        let file = dir.path().join("file");
+        fs::write(&file, "x").unwrap();
+        assert!(open_nonblocking(&file)
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .is_file());
+    }
+
+    /// Sizes in messages are bytes below 1 MiB, whole MiB above.
+    #[test]
+    fn size_text_units() {
+        assert_eq!(size_text(0), "0 bytes");
+        assert_eq!(size_text(1024 * 1024 - 1), "1048575 bytes");
+        assert_eq!(size_text(1024 * 1024), "1 MiB");
+        assert_eq!(size_text(MAX_FILE_BYTES), "512 MiB");
+    }
 
     /// Builds a text block of unstyled spans, for brevity.
     fn text_block(parts: &[&str]) -> Block {

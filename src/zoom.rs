@@ -17,21 +17,26 @@ pub const MAX: f64 = 3.0;
 const EPSILON: f64 = 1e-6;
 
 /// A window's zoom level, plus the scroll distance not yet turned into a
-/// step (touchpads scroll in small fractions of a wheel click).
+/// step (touchpads scroll in small fractions of a wheel click), and the
+/// ceiling the document shown sets on it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Zoom {
     /// The current zoom factor, 1.0 = 100%.
     level: f64,
     /// Accumulated vertical scroll, in wheel clicks.
     scrolled: f64,
+    /// The largest zoom the document allows (its largest graphic would
+    /// otherwise exceed the size limit), between 1.0 and [`MAX`].
+    ceiling: f64,
 }
 
 impl Default for Zoom {
-    /// 100%.
+    /// 100%, with no ceiling below [`MAX`].
     fn default() -> Self {
         Zoom {
             level: 1.0,
             scrolled: 0.0,
+            ceiling: MAX,
         }
     }
 }
@@ -40,6 +45,61 @@ impl Zoom {
     /// The current zoom factor, 1.0 = 100%.
     pub fn level(&self) -> f64 {
         self.level
+    }
+
+    /// The largest zoom allowed: [`MAX`], or less if the document's ceiling
+    /// is lower.
+    pub fn max(&self) -> f64 {
+        self.ceiling
+    }
+
+    /// Sets the ceiling the document imposes (`limit`, clamped to
+    /// 1.0..=[`MAX`]; a non-finite limit means none), lowering the level to
+    /// it if the level is above it. Returns true if the level changed.
+    pub fn set_ceiling(&mut self, limit: f64) -> bool {
+        self.ceiling = if limit.is_nan() {
+            MAX
+        } else {
+            limit.clamp(1.0, MAX)
+        };
+        if self.level > self.ceiling + EPSILON {
+            self.level = self.ceiling;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Sets the ceiling like [`Zoom::set_ceiling`], but never lowers the
+    /// level: if the level is above `limit`, the ceiling stays at the level
+    /// instead, so zooming in is refused there and zooming out works as
+    /// usual. Used when the window moved to a monitor with another scale,
+    /// where the text the user is reading should not shrink.
+    pub fn set_ceiling_keeping_level(&mut self, limit: f64) {
+        let limit = if limit.is_nan() {
+            MAX
+        } else {
+            limit.clamp(1.0, MAX)
+        };
+        self.ceiling = limit.max(self.level).min(MAX);
+    }
+
+    /// True when the level is at the largest zoom allowed.
+    pub fn at_max(&self) -> bool {
+        self.level >= self.ceiling - EPSILON
+    }
+
+    /// The text of the zoom indicator: the percentage, with "(max)" at the
+    /// largest zoom allowed; `None` at 100%, where no indicator is shown.
+    pub fn indicator(&self) -> Option<String> {
+        if self.percent() == 100 {
+            return None;
+        }
+        Some(if self.at_max() {
+            format!("{}% (max)", self.percent())
+        } else {
+            format!("{}%", self.percent())
+        })
     }
 
     /// The zoom as a whole percentage, for display.
@@ -54,7 +114,7 @@ impl Zoom {
             .iter()
             .copied()
             .find(|step| *step > self.level + EPSILON);
-        self.set(next.unwrap_or(MAX))
+        self.set(next.unwrap_or(self.ceiling))
     }
 
     /// Moves to the next smaller step. Returns true if the level changed.
@@ -72,11 +132,12 @@ impl Zoom {
         self.set(1.0)
     }
 
-    /// Sets any level, clamped to [`MIN`]..=[`MAX`] (a pinch gesture zooms
-    /// smoothly rather than in steps). Returns true if the level changed.
+    /// Sets any level, clamped to [`MIN`] and the largest zoom allowed
+    /// ([`Zoom::max`]; a pinch gesture zooms smoothly rather than in steps).
+    /// Returns true if the level changed.
     pub fn set(&mut self, level: f64) -> bool {
         let level = if level.is_finite() { level } else { 1.0 };
-        let level = level.clamp(MIN, MAX);
+        let level = level.clamp(MIN, self.ceiling);
         let changed = (level - self.level).abs() > EPSILON;
         self.level = level;
         changed
@@ -84,8 +145,9 @@ impl Zoom {
 
     /// Feeds a Ctrl+scroll of `dy` wheel clicks (negative: away from the
     /// user, which zooms in). Every whole click accumulated moves one step;
-    /// a change of direction drops the remainder. Returns true if the level
-    /// changed.
+    /// a change of direction drops the remainder; scrolling on at either
+    /// end of the range drops it too, so a huge `dy` takes no longer than
+    /// the steps there are. Returns true if the level changed.
     pub fn scroll(&mut self, dy: f64) -> bool {
         if !dy.is_finite() {
             return false;
@@ -97,11 +159,19 @@ impl Zoom {
         let mut changed = false;
         while self.scrolled <= -1.0 {
             self.scrolled += 1.0;
-            changed |= self.zoom_in();
+            if !self.zoom_in() {
+                self.scrolled = 0.0;
+                break;
+            }
+            changed = true;
         }
         while self.scrolled >= 1.0 {
             self.scrolled -= 1.0;
-            changed |= self.zoom_out();
+            if !self.zoom_out() {
+                self.scrolled = 0.0;
+                break;
+            }
+            changed = true;
         }
         changed
     }

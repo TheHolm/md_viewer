@@ -6,6 +6,219 @@ changes** summary (what also appears in the GitHub Release body) and a
 added at the top. `scripts/extract-release-notes.sh` prints just one release's
 section for the GitHub Release body.
 
+## v0.8.1 — Heading links and a size limit for graphics
+
+### User-facing changes
+
+- Links to headings (`[Usage](#usage)`, a table of contents,
+  `other.md#section`) now work for every heading. Before, only a heading
+  that happened to sit alone between two tables, code blocks or diagrams
+  could be linked to; most such links did nothing. Headings with non-ASCII
+  text (`#über-uns`) can be linked too. A link to a heading further down a
+  long document that is still loading now renders up to it and scrolls
+  there; `#` alone goes to the top.
+- Safer links. Web links (`http`/`https`, remote Markdown files included)
+  open in the browser and `mailto:` links in the mail client; the viewer
+  itself never fetches anything from the network. Local images, PDFs, plain
+  text, audio and video open in their application; any other local file
+  (programs, scripts, launchers, files marked executable, or files whose
+  name does not match their content) asks first, saying why it is
+  potentially dangerous, and opens only if you choose "Open Anyway". Other
+  link types are never opened. Hovering a link says what clicking it does.
+- Very large graphics no longer crash the viewer or eat gigabytes of
+  memory. Nothing is drawn larger than ten screens: an image, SVG, formula
+  or diagram too large even at 100% shows "too large" with its size in its
+  place (also for inline formulas, which now say why they could not be
+  drawn), and a small PNG that claims a huge size is refused without being
+  decoded.
+- A document with a very large picture limits how far it can be zoomed in:
+  the zoom stops where the picture reaches the limit, and if such a picture
+  appears while you are zoomed in further, the window zooms out to it.
+- The header bar shows the zoom percentage whenever it is not 100%
+  ("(max)" at the largest zoom allowed); click it to reset to 100%.
+- Raster images are no longer enlarged on HiDPI screens (that added no
+  detail but multiplied their memory), and a large image used inline in the
+  text keeps only the pixels it is drawn with.
+- A document's pictures, formulas and diagrams hold at most 1 GiB of memory:
+  when a document needs more, graphics far from the view are dropped (a
+  spinner of the same size stands in) and drawn again as you scroll back to
+  them. A single graphic needing more than that shows "can't render: object
+  memory limit reached"; when the graphics on screen alone fill the budget,
+  the newest show "can't render: document memory limit reached" until there
+  is room. A formula repeated many times now shares one copy of its pixels.
+- An idle window no longer does work every frame, and searching while a
+  large document loads no longer slows it down.
+- A document, image or picture referred to by an SVG that is not a regular
+  file (a pipe, a device such as `/dev/zero`) or is larger than 512 MiB is
+  refused instead of hanging or exhausting memory. Pictures inside an SVG
+  file now load relative to the SVG's own folder.
+- A bug in one of the rendering libraries no longer stops a document from
+  finishing loading: the graphic shows "renderer failed" instead.
+- Moving a window to a monitor with another scale redraws its pictures,
+  formulas and diagrams sharp for that monitor, at the same size (as GNOME
+  does for every window); the text you are reading is never zoomed out by
+  the move. With fractional scaling (125%, 150%, ...) graphics are drawn
+  with exactly the pixels needed instead of at 200%, which also saves
+  memory.
+- An image file changed on disk, or one that was missing and now exists, is
+  shown as it is now when the document is reopened or zoomed, instead of
+  as it was when first loaded.
+- A graphic over the document memory limit is drawn as soon as there is
+  room, wherever it is on the page, instead of waiting to be scrolled to.
+- "Ignore case" and smart-case search use full Unicode case folding:
+  `strasse` finds `Straße`, `file` finds `ﬁle`, final `ς` matches `Σ`.
+- After a zoom, scrolling with the keyboard, the scrollbar or a touch drag
+  is no longer pulled back to the line held at the top of the window (only
+  the mouse wheel used to let go of it).
+- Lists nested very deeply are indented at most four levels, so they no
+  longer take memory growing with the square of their depth.
+- Documents with very many graphics finish loading faster: each result is
+  stored directly instead of searching the whole document for its place.
+- A large image used inline several times is shrunk once and shared.
+- A file starting with a UTF-8 byte-order mark shows its first heading,
+  list or code block properly instead of as plain text.
+- Double-clicking a link in a table cell or on a linked picture opens it
+  once, not twice.
+- Escape, `n`, `N` and `/` go to an open dialog or menu instead of the
+  find bar behind it (Escape now cancels the error and confirmation
+  dialogs).
+- An image in a table cell that cannot be shown says why, as elsewhere.
+- Links to headings written for GitHub work too: `#install---linux` finds
+  `## Install - Linux`, as does the viewer's own `#install--linux`.
+- Regex search no longer matches the places where tables, code blocks and
+  pictures sit (`.` used to count each of them).
+- Closing a window no longer leaves its clickable table cells and its zoom
+  style behind in memory.
+
+### Details
+
+- Version 0.8.0 → 0.8.1. The link confirmation dialog is new behaviour
+  that would call for a minor version; it stays 0.8.1 by the maintainer's
+  explicit exception.
+- Hard decision recorded in `AGENTS.md` and enforced by
+  `tests/no_network.rs`: the viewer never fetches anything from the
+  network, and the code must not be able to (no network crates in
+  `Cargo.lock`, no socket or remote-URI APIs in `src/`).
+- Links: `Resolved` gained `Mail` and `Refused(reason)`;
+  `links::link_action` decides what a click does and `link_tooltip` what
+  the tooltip says; `local_file_risk` judges a local file from
+  `FileFacts` (regular file, executable bit, GIO content type by name and
+  by its first bytes via `read_head`, `content_type_can_be_executable`).
+  `DocWindow::confirm_open` shows an `adw::AlertDialog`.
+- `links::heading_blocks` maps anchors to blocks up front, so
+  `scroll_to_anchor` can `render_to` a heading not on the page yet.
+- The frame callback stops when idle (`Session::wake_ticks`,
+  `layout::IDLE_FRAMES`); search refreshes are throttled while loading
+  (`layout::refresh_delay`, `SEARCH_REFRESH_MS`).
+- Budget: shared buffers count once and are dropped whole
+  (`progressive::held_bytes`, `plan_budget`), the cache returns the entry
+  a racing worker inserted first, and graphics that do not fit near the
+  view show the document limit message (`Held::Limited`).
+- `read_limited` opens with `O_NONBLOCK` (`libc`, now a direct dependency)
+  and checks the opened file, closing the check-then-open race.
+- Heading anchors were computed per text block: a block holds many
+  headings, paragraphs and lists, so the one anchor registered was the slug
+  of the whole block's text. `links::heading_starts` now finds each heading
+  in a block (a run of spans with the same `Style::Heading`, plus adjacent
+  formulas and images), the GUI registers each at the buffer offset of its
+  first character, and `links::Anchors` (moved out of `main.rs`, tested)
+  adds the `-1`, `-2` suffixes. `resolve_link` percent-decodes fragments
+  (the URL parser encodes non-ASCII), using the `percent-encoding` crate
+  that `url` already depended on.
+- `graphics::zoom_limit` checks a graphic's size at 100% against
+  `RasterSettings::max_px` (ten times the window's monitor in device
+  pixels, `max_px_for`; `FALLBACK_MAX_PX` without a monitor) before any
+  pixmap is allocated, in floating point (a huge SVG size used to wrap to a
+  "no area" error). `rasterize` (SVG files, formulas, diagrams) refuses or
+  caps at `Image::max_zoom`; `decode_image` checks the oriented size from
+  the file header and sets `image::Limits` as a backstop, and no longer
+  resizes for the device scale (the slow Lanczos resize over the whole
+  file is gone; the texture is the file's pixels at scale 1). `cap_inline`
+  resamples a shrunk inline image to its drawn size (at least 32 pixels on
+  its shorter side). The settings key of both caches includes the limit.
+- `Zoom` has a ceiling (`set_ceiling`, `max`, `at_max`) that all zoom
+  changes are clamped to, and `scroll` stops at the ends instead of
+  stepping once per accumulated click. The session lowers its zoom limit as
+  graphics arrive (`note_limit`, also counting the largest heading via
+  `layout::text_zoom_limit`) and reports it after each poll; the window
+  then clamps its zoom, zooming out if needed. `Zoom::indicator` gives the
+  header bar text.
+- `Math::failure_note` gives the note after a formula's source, now also
+  for inline math.
+- `read_limited` (regular files only, at most `MAX_FILE_BYTES` = 512 MiB)
+  reads the document, image files and SVG references; a custom usvg
+  `ImageHrefResolver` resolves those against the SVG's folder, reads nothing
+  for formulas and diagrams, and checks embedded raster headers.
+- Worker pool: `Shared::cancel` sets the flag under the queue lock (a worker
+  about to wait could miss it and sleep forever); panics in a renderer are
+  caught (`render_caught`) and delivered as errors. Lazy rendering also
+  advances on the adjustment's `value-changed`, not only `changed`.
+- Memory: pixels are an `Arc<Vec<u8>>` shared by the cache, the document
+  and the texture (no copies); results are cleared from the parsed document
+  once their block is on the page; cache maps are bounded in bytes. A
+  per-document budget (`DOCUMENT_BUDGET`) drops far graphics
+  (`progressive::plan_budget`, `Session::enforce_budget`), showing an
+  `adw::SpinnerPaintable` until `Session::redraw_near` re-renders them.
+- Tests: heading detection and anchors (several headings per block,
+  duplicates, markup, formulas, lists and quotes), fragment decoding, the
+  size limit (oversized SVG, formula, diagram and PNG, a PNG bomb, Exif
+  orientation, zoom stopping at the limit, the cache per limit, inline
+  shrinking, no HiDPI enlargement), the zoom ceiling and indicator, a GUI
+  session test of the anchors and of the zoom ceiling, and a CLI smoke test
+  opening oversized graphics.
+- Monitors: `screen_scale` reads `gdk::Surface::scale` (fractional) rather
+  than the integer `scale_factor`, and `max_px_for` takes it as a float.
+  `DocWindow::follow_monitors` connects the surface's `notify::scale` and
+  `enter-monitor` on realize; `Session::rescale` takes the new scale and
+  limit, works the zoom limit out again from the text and the re-rendered
+  graphics, and restarts the run (`restart_run`, split out of
+  `rerender`). `keep_zoom` makes the window apply a lower limit with
+  `Zoom::set_ceiling_keeping_level` instead of zooming out, until the user
+  zooms; a window finding its first monitor is not a move.
+- The image cache key includes `graphics::file_stamp` (size, mtime,
+  inode), and inserting a new version drops the old one's entry.
+- `Session::redraw_near` asks for limited graphics anywhere, nearest first,
+  as long as they fit in the room left after the near dropped ones.
+- `src/casefold.rs`: the `C`/`F` mappings of Unicode 18.0's
+  `CaseFolding.txt` (generated once), used by `search::fold` instead of
+  `char::to_lowercase`.
+- Tests: file stamps and the cache re-decoding a changed or new file,
+  fractional `max_px_for` and rendering at a fractional scale, the
+  ceiling that keeps the level, a GUI test of rescaling (logical sizes
+  kept, device pixels following whole and fractional scales, no zoom-out
+  on a move, the limit rising again, following the headless monitor), a
+  far limited graphic drawn once there is room, and full case folding.
+- `progressive::Location` (table cell as row and column, inline index)
+  is recorded in each `Job`; `place(blocks, block, location, rendered)`
+  goes straight to the slot instead of walking every graphic.
+- `MAX_LIST_INDENT` (4) caps list indentation and code cards' `indent`.
+- `Cache::inline_images` keeps shrunk inline images by image key and
+  zoom (only those actually resampled), dropped with stale file versions.
+- `make_label_clickable` handlers take the label from their controller
+  (`widget()`) rather than capturing it, ending a label -> controller ->
+  closure -> label cycle; the close-request handler removes the window's
+  zoom CSS provider from the display (`remove_css`).
+- `Session::release_anchor_on_input`: a capture-phase key controller
+  (`layout::is_scroll_key`), a press gesture on the vertical scrollbar and
+  a touch-only drag gesture let go of the held spot.
+- `render` strips a leading U+FEFF; `layout::opens_link` gates every link
+  click handler on a single press; `DocWindow::keys_belong_elsewhere`
+  (a `visible_dialog`, or focus inside a `gtk4::Popover`) makes
+  `handle_key` pass keys on; `ImageRef::failure_reason` (and
+  `NETWORK_UNSUPPORTED`, moved to the library) gives placeholders their
+  reason in labels too; `links::github_slug` and a second map in `Anchors`
+  (ours looked up first); `search::regex_ranges` searches each piece
+  between U+FFFC placeholders.
+- Tests: byte-order mark handling, failure reasons and table-cell
+  placeholders, GitHub slugs and anchors in both spellings (also in the
+  GUI), regex pieces, single-click links, and key routing with a dialog
+  and a popover (fails without the guard).
+- Tests: placing by location (and refusing wrong locations), every
+  location reaching its graphic in the showcase fixture, deep list caps
+  (3000 levels, code cards), shared shrunk inline images, a freed
+  clickable label and a closed window's zoom CSS no longer applying, the
+  scroll keys, and the release controllers.
+
 ## v0.8.0 — Lazy rendering and complete search
 
 ### User-facing changes

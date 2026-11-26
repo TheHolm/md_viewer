@@ -27,25 +27,51 @@ pub fn for_each_graphic(
     blocks: &mut [Block],
     mut visit: impl FnMut(usize, Graphic, &mut Option<Rendered>),
 ) {
+    for_each_located(blocks, |block, _, graphic, image| {
+        visit(block, graphic, image)
+    });
+}
+
+/// Where a graphic is within its block, so its result can be stored
+/// without walking the document (see [`place`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Location {
+    /// The table cell it is in, as (row, column) with row 0 the header and
+    /// row `r + 1` the table's row `r`; `None` outside a table.
+    pub cell: Option<(usize, usize)>,
+    /// Its index among the inlines of its text block or cell; `None` for a
+    /// diagram (the whole block).
+    pub inline: Option<usize>,
+}
+
+/// [`for_each_graphic`], also telling where in its block each graphic is.
+fn for_each_located(
+    blocks: &mut [Block],
+    mut visit: impl FnMut(usize, Location, Graphic, &mut Option<Rendered>),
+) {
     for (index, block) in blocks.iter_mut().enumerate() {
         match block {
-            Block::Text(inlines) => visit_inlines(index, inlines, true, true, &mut visit),
+            Block::Text(inlines) => visit_inlines(index, None, inlines, true, true, &mut visit),
             Block::Table(table) => {
-                for cell in table
-                    .header
-                    .iter_mut()
-                    .chain(table.rows.iter_mut().flatten())
-                {
-                    // A table cell is a single line, so its images are always
-                    // inline, never standalone.
-                    visit_inlines(index, cell, true, false, &mut visit);
+                let rows = std::iter::once(&mut table.header).chain(table.rows.iter_mut());
+                for (row, cells) in rows.enumerate() {
+                    for (column, cell) in cells.iter_mut().enumerate() {
+                        // A table cell is a single line, so its images are
+                        // always inline, never standalone.
+                        let at = Some((row, column));
+                        visit_inlines(index, at, cell, true, false, &mut visit);
+                    }
                 }
             }
             Block::Mermaid(diagram) => {
                 let graphic = Graphic::Diagram {
                     source: diagram.source.clone(),
                 };
-                visit(index, graphic, &mut diagram.image);
+                let location = Location {
+                    cell: None,
+                    inline: None,
+                };
+                visit(index, location, graphic, &mut diagram.image);
             }
             Block::Code(_) => {}
         }
@@ -58,10 +84,11 @@ pub fn for_each_graphic(
 /// line; images in table cells are always inline.
 fn visit_inlines(
     index: usize,
+    cell: Option<(usize, usize)>,
     inlines: &mut [Inline],
     images: bool,
     allow_standalone: bool,
-    visit: &mut impl FnMut(usize, Graphic, &mut Option<Rendered>),
+    visit: &mut impl FnMut(usize, Location, Graphic, &mut Option<Rendered>),
 ) {
     let standalone: Vec<bool> = (0..inlines.len())
         .map(|at| {
@@ -72,13 +99,17 @@ fn visit_inlines(
         })
         .collect();
     for (at, inline) in inlines.iter_mut().enumerate() {
+        let location = Location {
+            cell,
+            inline: Some(at),
+        };
         match inline {
             Inline::Math(math) => {
                 let graphic = Graphic::Math {
                     tex: math.tex.clone(),
                     display: math.display,
                 };
-                visit(index, graphic, &mut math.image);
+                visit(index, location, graphic, &mut math.image);
             }
             Inline::Image(image) if images => {
                 if let ImageState::Local(path) = &image.state {
@@ -86,7 +117,7 @@ fn visit_inlines(
                         path: path.clone(),
                         inline: !standalone[at],
                     };
-                    visit(index, graphic, &mut image.image);
+                    visit(index, location, graphic, &mut image.image);
                 }
             }
             _ => {}
@@ -101,6 +132,8 @@ pub struct Job {
     pub id: usize,
     /// The index of the block the graphic is in.
     pub block: usize,
+    /// Where in the block it is.
+    pub location: Location,
     /// What to render.
     pub graphic: Graphic,
 }
@@ -108,28 +141,139 @@ pub struct Job {
 /// Every graphic in `blocks` as a job, in document order.
 pub fn jobs(blocks: &mut [Block]) -> Vec<Job> {
     let mut jobs = Vec::new();
-    for_each_graphic(blocks, |block, graphic, _| {
+    for_each_located(blocks, |block, location, graphic, _| {
         jobs.push(Job {
             id: jobs.len(),
             block,
+            location,
             graphic,
         });
     });
     jobs
 }
 
-/// Stores `rendered` as the result of graphic `id` in `blocks`. Returns
-/// false (and stores nothing) if there is no such graphic.
-pub fn place(blocks: &mut [Block], id: usize, rendered: Rendered) -> bool {
-    let mut rendered = Some(rendered);
-    let mut next = 0;
-    for_each_graphic(blocks, |_, _, image| {
-        if next == id {
-            *image = rendered.take();
+/// Stores `rendered` as the result of the graphic at `location` in block
+/// `block` (see [`Job`]), going straight there rather than walking the
+/// document. Returns false (and stores nothing) if no graphic is there.
+pub fn place(blocks: &mut [Block], block: usize, location: Location, rendered: Rendered) -> bool {
+    let Some(target) = blocks.get_mut(block) else {
+        return false;
+    };
+    let inlines = match (target, location.cell, location.inline) {
+        (Block::Mermaid(diagram), None, None) => {
+            diagram.image = Some(rendered);
+            return true;
         }
-        next += 1;
-    });
-    rendered.is_none()
+        (Block::Text(inlines), None, Some(_)) => inlines,
+        (Block::Table(table), Some((row, column)), Some(_)) => {
+            let cells = if row == 0 {
+                Some(&mut table.header)
+            } else {
+                table.rows.get_mut(row - 1)
+            };
+            match cells.and_then(|cells| cells.get_mut(column)) {
+                Some(cell) => cell,
+                None => return false,
+            }
+        }
+        _ => return false,
+    };
+    match location.inline.and_then(|at| inlines.get_mut(at)) {
+        Some(Inline::Math(math)) => math.image = Some(rendered),
+        Some(Inline::Image(image)) if matches!(image.state, ImageState::Local(_)) => {
+            image.image = Some(rendered)
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Forgets the rendered graphics of `block` (they become `None` again),
+/// once the block is on the page: its widgets hold what they show, so the
+/// parsed document need not keep a reference to every picture's pixels.
+pub fn clear_graphics(block: &mut Block) {
+    for_each_graphic(std::slice::from_mut(block), |_, _, image| *image = None);
+}
+
+/// One graphic on the page, as the memory budget sees it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Held {
+    /// The graphic's id.
+    pub id: usize,
+    /// Identifies its pixel buffer: graphics sharing a buffer (the same
+    /// formula shown many times) have the same key and count once.
+    pub key: usize,
+    /// The bytes of the buffer.
+    pub bytes: usize,
+    /// How far it is from the view (see
+    /// [`crate::layout::distance_from_view`]); 0 when on or near it.
+    pub distance: f64,
+    /// When it was put on the page (larger is newer).
+    pub arrived: u64,
+}
+
+/// The bytes `held` graphics hold, each shared buffer counted once.
+pub fn held_bytes(held: &[Held]) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    held.iter()
+        .filter(|graphic| seen.insert(graphic.key))
+        .map(|graphic| graphic.bytes)
+        .sum()
+}
+
+/// What to do so the `held` graphics fit in `budget` bytes: which to drop
+/// (pixels freed, a spinner in their place, drawn again when near the view)
+/// and which to show as over the document's memory limit.
+///
+/// Buffers are dropped whole, the farthest first: a buffer's distance is
+/// that of its graphic nearest the view, and one with a graphic on or near
+/// the view (distance 0) is never dropped. If what remains still exceeds
+/// the budget, the newest buffers near the view are limited (all their
+/// graphics) until it fits.
+pub fn plan_budget(held: &[Held], budget: usize) -> (Vec<usize>, Vec<usize>) {
+    let mut total = held_bytes(held);
+    if total <= budget {
+        return (Vec::new(), Vec::new());
+    }
+    // Buffers by key: bytes, nearest distance, newest arrival, ids.
+    let mut buffers: Vec<(usize, usize, f64, u64, Vec<usize>)> = Vec::new();
+    for graphic in held {
+        match buffers.iter_mut().find(|buffer| buffer.0 == graphic.key) {
+            Some(buffer) => {
+                buffer.2 = buffer.2.min(graphic.distance);
+                buffer.3 = buffer.3.max(graphic.arrived);
+                buffer.4.push(graphic.id);
+            }
+            None => buffers.push((
+                graphic.key,
+                graphic.bytes,
+                graphic.distance,
+                graphic.arrived,
+                vec![graphic.id],
+            )),
+        }
+    }
+    let (mut far, mut near): (Vec<_>, Vec<_>) =
+        buffers.into_iter().partition(|buffer| buffer.2 > 0.0);
+    far.sort_by(|a, b| b.2.total_cmp(&a.2));
+    near.sort_by_key(|buffer| std::cmp::Reverse(buffer.3));
+    let mut take = |list: Vec<(usize, usize, f64, u64, Vec<usize>)>| {
+        let mut ids = Vec::new();
+        for (_, bytes, _, _, members) in list {
+            if total <= budget {
+                break;
+            }
+            if bytes == 0 {
+                continue;
+            }
+            total = total.saturating_sub(bytes);
+            ids.extend(members);
+        }
+        ids
+    };
+    let drops = take(far);
+    let limited = take(near);
+    (drops, limited)
 }
 
 /// Tracks which graphics have been rendered and which blocks are on the
@@ -343,7 +487,15 @@ impl Shared {
     }
 
     /// Stops the workers and wakes any that are waiting for a job.
+    ///
+    /// The flag is set while holding the queue lock: a worker checks it and
+    /// goes to sleep under that lock, so setting it unlocked could fall
+    /// between the two, and the wake-up would be missed for good.
     fn cancel(&self) {
+        let _queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.cancelled.store(true, Ordering::Relaxed);
         self.condvar.notify_all();
     }
@@ -358,6 +510,22 @@ impl Pool {
         threads: usize,
         deliver: impl Fn(usize, Rendered) + Send + Sync + 'static,
     ) -> Pool {
+        Pool::start_with(jobs, threads, deliver, move |graphic| {
+            Cache::shared().render(graphic, &settings)
+        })
+    }
+
+    /// [`Pool::start`] with the function that renders a graphic given, so
+    /// tests can make one fail. A panic in `render` (a bug in a renderer
+    /// crate) is caught and delivered as an error, so the graphic shows its
+    /// source or placeholder and loading still finishes.
+    fn start_with(
+        jobs: Vec<Job>,
+        threads: usize,
+        deliver: impl Fn(usize, Rendered) + Send + Sync + 'static,
+        render: impl Fn(&Graphic) -> Rendered + Send + Sync + 'static,
+    ) -> Pool {
+        let render = Arc::new(render);
         let shared = Arc::new(Shared {
             queue: Mutex::new(VecDeque::from(jobs)),
             condvar: Condvar::new(),
@@ -365,12 +533,12 @@ impl Pool {
         });
         let deliver = Arc::new(deliver);
         for _ in 0..threads.max(1) {
-            let (shared, deliver) = (shared.clone(), deliver.clone());
+            let (shared, deliver, render) = (shared.clone(), deliver.clone(), render.clone());
             std::thread::spawn(move || loop {
                 let Some(job) = shared.next_job() else {
                     return;
                 };
-                let rendered = Cache::shared().render(&job.graphic, &settings);
+                let rendered = render_caught(|| render(&job.graphic));
                 if shared.cancelled.load(Ordering::Relaxed) {
                     return;
                 }
@@ -392,9 +560,115 @@ impl Pool {
     }
 }
 
+/// Runs `render`, turning a panic into an error naming its message.
+fn render_caught(render: impl FnOnce() -> Rendered) -> Rendered {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(render)).unwrap_or_else(|payload| {
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|text| text.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown error".to_string());
+        Err(format!("renderer failed: {message}"))
+    })
+}
+
 impl Drop for Pool {
     /// Dropping the pool cancels it.
     fn drop(&mut self) {
         self.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A math job with id `id`.
+    fn job(id: usize) -> Job {
+        Job {
+            id,
+            block: 0,
+            location: Location {
+                cell: None,
+                inline: Some(id),
+            },
+            graphic: Graphic::Math {
+                tex: format!("x_{id}"),
+                display: false,
+            },
+        }
+    }
+
+    /// A panic is turned into an error with its message (a `&str` or a
+    /// `String` payload); a normal result passes through.
+    #[test]
+    fn render_caught_turns_panics_into_errors() {
+        assert_eq!(
+            render_caught(|| Err("plain".to_string())),
+            Err("plain".to_string())
+        );
+        assert_eq!(
+            render_caught(|| panic!("boom")),
+            Err("renderer failed: boom".to_string())
+        );
+        let n = 3;
+        assert_eq!(
+            render_caught(|| panic!("boom {n}")),
+            Err("renderer failed: boom 3".to_string())
+        );
+        assert_eq!(
+            render_caught(|| std::panic::panic_any(7_u8)),
+            Err("renderer failed: unknown error".to_string())
+        );
+    }
+
+    /// A job whose renderer panics is delivered as an error, and the worker
+    /// carries on with the other jobs, so every job gets its result.
+    #[test]
+    fn panicking_job_is_delivered_as_an_error() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let sender = Mutex::new(sender);
+        let jobs: Vec<Job> = (0..6).map(job).collect();
+        let _pool = Pool::start_with(
+            jobs,
+            1,
+            move |id, rendered| {
+                let _ = sender.lock().unwrap().send((id, rendered));
+            },
+            |graphic| match graphic {
+                Graphic::Math { tex, .. } if tex == "x_2" => panic!("bad formula"),
+                _ => Err("not rendered in this test".to_string()),
+            },
+        );
+        let mut results: Vec<(usize, Rendered)> = (0..6)
+            .map(|_| receiver.recv_timeout(Duration::from_secs(10)).unwrap())
+            .collect();
+        results.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            results[2].1,
+            Err("renderer failed: bad formula".to_string())
+        );
+        assert!(results
+            .iter()
+            .all(|(id, rendered)| *id == 2 || rendered.is_err()));
+        assert_eq!(results.len(), 6);
+    }
+
+    /// Cancelling a pool whose workers are going to sleep on an empty
+    /// queue stops every worker: each drops its share of the pool's state
+    /// promptly. Repeated many times, since the race this guards against
+    /// (a cancel landing between a worker's check and its wait) is rare.
+    #[test]
+    fn cancel_never_strands_a_waiting_worker() {
+        for _ in 0..500 {
+            let pool = Pool::start_with(Vec::new(), 2, |_, _| {}, |_| Err(String::new()));
+            pool.cancel();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Arc::strong_count(&pool.shared) > 1 {
+                assert!(Instant::now() < deadline, "a worker never stopped");
+                std::thread::yield_now();
+            }
+        }
     }
 }

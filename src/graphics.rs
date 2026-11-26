@@ -32,11 +32,19 @@ pub struct Image {
     /// (non-zero for inline math with descenders, fractions and the like).
     pub depth: f32,
     /// Premultiplied RGBA pixels, row by row, `width * 4` bytes per row.
-    pub pixels: Vec<u8>,
+    /// Shared, so the cache, the document and the GUI's texture hold one
+    /// buffer between them rather than a copy each (an `Arc<Vec>` rather
+    /// than `Arc<[u8]>`, which would copy the buffer once more on creation).
+    pub pixels: Arc<Vec<u8>>,
     /// The text drawn in the SVG, in reading order. Diagrams use this for
     /// the find bar (their labels are otherwise only pixels); formulas draw
     /// outlines, so their list is empty.
     pub labels: Vec<String>,
+    /// The largest zoom this graphic can be shown at without exceeding
+    /// [`RasterSettings::max_px`] on screen (see [`zoom_limit`]); always at
+    /// least 1.0, since a graphic too large at 100% is refused instead. A
+    /// graphic asked for at a larger zoom is drawn at this one.
+    pub max_zoom: f32,
 }
 
 impl Image {
@@ -56,7 +64,8 @@ impl Image {
 pub struct RasterSettings {
     /// The body text size in logical pixels; math is sized relative to it.
     pub font_px: f32,
-    /// The device-pixel scale (2.0 on a HiDPI display).
+    /// The device-pixel scale: 2.0 on a HiDPI display, fractional (1.25,
+    /// 1.5, ...) with fractional scaling.
     pub scale: f32,
     /// The text colour math is drawn in, as RGB.
     pub color: [u8; 3],
@@ -64,6 +73,87 @@ pub struct RasterSettings {
     /// `font_px * zoom`, and diagrams are drawn `zoom` times their natural
     /// size; in both cases the image's logical size grows with the zoom.
     pub zoom: f32,
+    /// The largest a graphic may be on screen, in device pixels (width,
+    /// height): [`SCREEN_MULTIPLE`] times the screen (see [`max_px_for`]).
+    /// A graphic larger than this at 100% zoom is refused with an error;
+    /// one that fits is never drawn larger, whatever the zoom.
+    pub max_px: [u32; 2],
+}
+
+/// The most bytes of pixels one document's graphics may hold at once (see
+/// `progressive::pick_drops`); a single graphic needing more at 100% zoom is
+/// refused (see [`zoom_limit`]).
+pub const DOCUMENT_BUDGET: usize = 1024 * 1024 * 1024;
+
+/// How many screens wide and high a graphic may be at most.
+pub const SCREEN_MULTIPLE: u32 = 10;
+
+/// [`RasterSettings::max_px`] when the screen is not known (yet): ten times
+/// a 1920x1080 screen.
+pub const FALLBACK_MAX_PX: [u32; 2] = [1920 * SCREEN_MULTIPLE, 1080 * SCREEN_MULTIPLE];
+
+/// The largest a graphic may be on a screen of `width` x `height` logical
+/// pixels at device `scale` (fractional with fractional scaling, e.g.
+/// 1.25): [`SCREEN_MULTIPLE`] times its size in device pixels (rounded to
+/// whole pixels). An empty screen size or an invalid scale (not finite or
+/// not positive) gives [`FALLBACK_MAX_PX`].
+pub fn max_px_for(width: i32, height: i32, scale: f64) -> [u32; 2] {
+    if width <= 0 || height <= 0 || !scale.is_finite() || scale <= 0.0 {
+        return FALLBACK_MAX_PX;
+    }
+    // Float to integer casts saturate, so huge values stay at u32::MAX.
+    let side =
+        |pixels: i32| ((f64::from(pixels) * scale).round() as u32).saturating_mul(SCREEN_MULTIPLE);
+    [side(width), side(height)]
+}
+
+/// The largest zoom at which a graphic `width` x `height` device pixels at
+/// 100% zoom stays within `max_px`, never less than 1.0. Fails, with the
+/// message shown in the graphic's place, when it does not fit even at 100%
+/// (or its size is not a finite number), when it has no area, or when its
+/// pixels alone would take more than the [`DOCUMENT_BUDGET`].
+pub fn zoom_limit(width: f32, height: f32, max_px: [u32; 2]) -> Result<f32, String> {
+    if !(width.is_finite() && height.is_finite())
+        || width > max_px[0] as f32
+        || height > max_px[1] as f32
+    {
+        return Err(format!(
+            "too large ({} x {} px, limit {} x {})",
+            pixels_for_message(width),
+            pixels_for_message(height),
+            max_px[0],
+            max_px[1]
+        ));
+    }
+    if width < 0.5 || height < 0.5 {
+        let round = |side: f32| side.max(0.0).round() as u32;
+        return Err(format!(
+            "image has no area ({}x{})",
+            round(width),
+            round(height)
+        ));
+    }
+    let bytes = f64::from(width.ceil()) * f64::from(height.ceil()) * 4.0;
+    if bytes > DOCUMENT_BUDGET as f64 {
+        const MIB: f64 = 1024.0 * 1024.0;
+        return Err(format!(
+            "can't render: object memory limit reached ({} MiB, limit {} MiB)",
+            (bytes / MIB).ceil(),
+            DOCUMENT_BUDGET / (1024 * 1024)
+        ));
+    }
+    let limit = (max_px[0] as f32 / width).min(max_px[1] as f32 / height);
+    Ok(limit.max(1.0))
+}
+
+/// A pixel size as shown in an error message: rounded, or "huge" for a size
+/// too large to print meaningfully.
+fn pixels_for_message(side: f32) -> String {
+    if side.is_finite() && side < 1e12 {
+        format!("{}", side.round() as u64)
+    } else {
+        "huge".to_string()
+    }
 }
 
 impl Default for RasterSettings {
@@ -74,18 +164,20 @@ impl Default for RasterSettings {
             scale: 1.0,
             color: [0, 0, 0],
             zoom: 1.0,
+            max_px: FALLBACK_MAX_PX,
         }
     }
 }
 
 impl RasterSettings {
     /// An exact, hashable form of the settings, for cache keys.
-    fn key(&self) -> (u32, u32, u32, [u8; 3]) {
+    fn key(&self) -> SettingsKey {
         (
             self.font_px.to_bits(),
             self.scale.to_bits(),
             self.zoom.to_bits(),
             self.color,
+            self.max_px,
         )
     }
 }
@@ -141,27 +233,157 @@ fn pick_family(families: &[&str]) -> Option<String> {
 
 /// SVG parsing options using the shared system font database, with `em`
 /// units resolving to `font_px`.
+#[cfg(test)]
 fn svg_options(font_px: f32) -> usvg::Options<'static> {
+    svg_options_for(font_px, None, FALLBACK_MAX_PX)
+}
+
+/// The usvg options for an SVG whose `<image>` references to files resolve
+/// against `resources` (an SVG file's folder), with embedded images no
+/// larger than `max_px`.
+///
+/// usvg's own resolver reads any path relative to the working directory, with
+/// no limit; this one reads files only for an SVG file (`resources` is
+/// `None` for formulas and diagrams, which never refer to files), through
+/// [`crate::read_limited`], and checks a raster image's size from its header
+/// before resvg decodes it (for `data:` URLs too). Images that fail any of
+/// this are left out, as usvg does with broken ones.
+fn svg_options_for(
+    font_px: f32,
+    resources: Option<&Path>,
+    max_px: [u32; 2],
+) -> usvg::Options<'static> {
     let database = font_database().clone();
     let font_family = preferred_sans_family(&database).unwrap_or_else(|| "sans-serif".into());
+    let resources = resources.map(Path::to_path_buf);
+    let default_data = usvg::ImageHrefResolver::default_data_resolver();
+    let resolver = usvg::ImageHrefResolver {
+        resolve_data: Box::new(move |mime, data, options| {
+            if embedded_raster_fits(&data, max_px) {
+                default_data(mime, data, options)
+            } else {
+                None
+            }
+        }),
+        resolve_string: Box::new(move |href, options| {
+            let dir = resources.as_ref()?;
+            let bytes = read_svg_reference(dir, href)?;
+            embedded_image(bytes, max_px, options)
+        }),
+    };
     usvg::Options {
         fontdb: database,
         font_family,
         font_size: font_px,
+        resources_dir: None,
+        image_href_resolver: resolver,
         ..usvg::Options::default()
     }
 }
 
+/// Reads the file an SVG's `<image href>` names, relative to the SVG's
+/// folder `dir` (or absolute, or a `file:` URL); `None` for other URLs and
+/// for files [`crate::read_limited`] refuses.
+fn read_svg_reference(dir: &Path, href: &str) -> Option<Vec<u8>> {
+    let path = if href.starts_with("file:") {
+        url::Url::parse(href).ok()?.to_file_path().ok()?
+    } else if href.contains("://") {
+        return None;
+    } else {
+        let decoded = percent_encoding::percent_decode_str(href)
+            .decode_utf8()
+            .ok()?;
+        dir.join(decoded.as_ref())
+    };
+    crate::read_limited(&path, crate::MAX_FILE_BYTES).ok()
+}
+
+/// Turns the bytes of a file an SVG refers to into an image usvg can draw:
+/// a PNG, JPEG, GIF or WebP no larger than `max_px` (checked from its
+/// header), or a nested SVG (which, per the SVG specification, may not refer
+/// to further files).
+fn embedded_image(
+    bytes: Vec<u8>,
+    max_px: [u32; 2],
+    options: &usvg::Options,
+) -> Option<usvg::ImageKind> {
+    let format = image::guess_format(&bytes).ok();
+    if format.is_some() && !embedded_raster_fits(&bytes, max_px) {
+        return None;
+    }
+    let data = Arc::new(bytes);
+    match format {
+        Some(image::ImageFormat::Png) => Some(usvg::ImageKind::PNG(data)),
+        Some(image::ImageFormat::Jpeg) => Some(usvg::ImageKind::JPEG(data)),
+        Some(image::ImageFormat::Gif) => Some(usvg::ImageKind::GIF(data)),
+        Some(image::ImageFormat::WebP) => Some(usvg::ImageKind::WEBP(data)),
+        Some(_) => None,
+        None => usvg::Tree::from_data_nested(&data, options)
+            .ok()
+            .map(usvg::ImageKind::SVG),
+    }
+}
+
+/// False if `bytes` are a raster image whose header gives a size over
+/// `max_px` (or no readable size at all); true for anything else (an SVG,
+/// which has no pixels of its own to decode).
+fn embedded_raster_fits(bytes: &[u8], max_px: [u32; 2]) -> bool {
+    if image::guess_format(bytes).is_err() {
+        return true;
+    }
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format();
+    match reader.ok().and_then(|reader| reader.into_dimensions().ok()) {
+        Some((width, height)) => {
+            width <= max_px[0].max(max_px[1]) && height <= max_px[0].max(max_px[1])
+        }
+        None => false,
+    }
+}
+
 /// Rasterizes `svg` at `scale` device pixels per SVG pixel, with `em` units
-/// resolving to `font_px`. Fails on invalid SVG or an empty image.
+/// resolving to `font_px`, within [`FALLBACK_MAX_PX`]. Fails on invalid SVG,
+/// an empty image or one larger than the limit.
 pub fn rasterize(svg: &str, font_px: f32, scale: f32) -> Rendered {
-    let tree = usvg::Tree::from_str(svg, &svg_options(font_px)).map_err(|e| e.to_string())?;
-    let labels = text_labels(&tree);
+    rasterize_within(svg, font_px, scale, 1.0, FALLBACK_MAX_PX, None)
+}
+
+/// Rasterizes `svg` at `scale` device pixels per SVG pixel (`em` units
+/// resolving to `font_px`), where `zoom` is the part of that size due to the
+/// document zoom, so the size at 100% is the drawn size divided by `zoom`.
+///
+/// The size is checked against `max_px` before anything is allocated: a
+/// graphic larger than `max_px` at 100% is refused (see [`zoom_limit`]), and
+/// one that would only exceed it at `zoom` is drawn at its
+/// [`Image::max_zoom`] instead - smaller than asked, never larger than the
+/// limit. The returned image's `scale` is the device-pixel scale actually
+/// drawn at. `<image>` references to files resolve against `resources`
+/// (see [`svg_options_for`]); without it, they are left out.
+fn rasterize_within(
+    svg: &str,
+    font_px: f32,
+    scale: f32,
+    zoom: f32,
+    max_px: [u32; 2],
+    resources: Option<&Path>,
+) -> Rendered {
+    let options = svg_options_for(font_px, resources, max_px);
+    let tree = usvg::Tree::from_str(svg, &options).map_err(|e| e.to_string())?;
     let size = tree.size();
-    let width = (size.width() * scale).ceil() as u32;
-    let height = (size.height() * scale).ceil() as u32;
+    let zoom = if zoom.is_finite() && zoom > 0.0 {
+        zoom
+    } else {
+        1.0
+    };
+    let max_zoom = zoom_limit(
+        size.width() * scale / zoom,
+        size.height() * scale / zoom,
+        max_px,
+    )?;
+    let scale = scale * (max_zoom / zoom).min(1.0);
+    let width = ((size.width() * scale).ceil() as u32).clamp(1, max_px[0]);
+    let height = ((size.height() * scale).ceil() as u32).clamp(1, max_px[1]);
     let mut pixmap = tiny_skia::Pixmap::new(width, height)
-        .ok_or_else(|| format!("image has no area ({width}x{height})"))?;
+        .ok_or_else(|| format!("cannot allocate a {width}x{height} image"))?;
     resvg::render(
         &tree,
         tiny_skia::Transform::from_scale(scale, scale),
@@ -172,9 +394,20 @@ pub fn rasterize(svg: &str, font_px: f32, scale: f32) -> Rendered {
         height,
         scale,
         depth: 0.0,
-        pixels: pixmap.take(),
-        labels,
+        pixels: pixmap.take().into(),
+        labels: text_labels(&tree),
+        max_zoom,
     })
+}
+
+/// How much smaller than asked `image` was drawn because of its zoom limit:
+/// 1.0 when drawn at `zoom`, less when `zoom` exceeds [`Image::max_zoom`].
+fn cap_factor(image: &Image, zoom: f32) -> f32 {
+    if zoom > image.max_zoom {
+        image.max_zoom / zoom
+    } else {
+        1.0
+    }
 }
 
 /// Every text node drawn in `tree`, as its decoded text, in document order
@@ -182,6 +415,8 @@ pub fn rasterize(svg: &str, font_px: f32, scale: f32) -> Rendered {
 /// usvg, so labels appear at their drawn position rather than in the
 /// `<defs>` they are stored in.
 fn text_labels(tree: &usvg::Tree) -> Vec<String> {
+    /// Appends the text of every text node in `group` and its subgroups to
+    /// `labels`, in document order.
     fn walk(group: &usvg::Group, labels: &mut Vec<String>) {
         for node in group.children() {
             match node {
@@ -248,8 +483,19 @@ pub fn render_math(tex: &str, display: bool, settings: &RasterSettings) -> Rende
     let svg = math_svg(tex, display)?;
     let font_px = settings.font_px * settings.zoom * MATH_SCALE;
     let svg = svg.replace("currentColor", &hex_color(settings.color));
-    let mut image = rasterize(&svg, font_px, settings.scale)?;
-    image.depth = math_depth_em(&svg) * font_px;
+    let mut image = rasterize_within(
+        &svg,
+        font_px,
+        settings.scale,
+        settings.zoom,
+        settings.max_px,
+        None,
+    )?;
+    // Drawn smaller than asked when capped; the logical size and depth stay
+    // those of the formula as drawn.
+    let factor = cap_factor(&image, settings.zoom);
+    image.scale = settings.scale;
+    image.depth = math_depth_em(&svg) * font_px * factor;
     // Formulas are drawn as outlines; any SVG text mathra emits is not the
     // TeX source, so it is never offered to the find bar.
     image.labels.clear();
@@ -356,7 +602,14 @@ fn mermaid_svg_with(
 /// size (on a transparent background; the GUI puts it on a light card, as
 /// Mermaid's colours assume).
 fn rasterize_diagram(svg: &str, settings: &RasterSettings) -> Rendered {
-    let mut image = rasterize(svg, DIAGRAM_FONT_PX, settings.scale * settings.zoom)?;
+    let mut image = rasterize_within(
+        svg,
+        DIAGRAM_FONT_PX,
+        settings.scale * settings.zoom,
+        settings.zoom,
+        settings.max_px,
+        None,
+    )?;
     image.scale = settings.scale;
     Ok(image)
 }
@@ -401,17 +654,34 @@ const INLINE_IMAGE_MAX_LINES: f32 = 1.5;
 /// The widest an inline image is drawn, as a multiple of the body font size.
 const INLINE_IMAGE_MAX_EM: f32 = 12.0;
 
-/// Decodes the image file at `path` into premultiplied RGBA, honouring the
-/// file's Exif orientation and the device scale (so a HiDPI texture maps one
-/// texel to one device pixel and stays sharp). SVG files are rasterized with
-/// [`rasterize`] (which also draws raster images embedded in the SVG); other
-/// files go through the `image` crate (PNG, JPEG, GIF - first frame only - and
-/// WebP).
+/// The fewest pixels a shrunk inline image keeps on its shorter side.
+const INLINE_IMAGE_MIN_TEXELS: f32 = 32.0;
+
+/// Decodes the image file at `path` into premultiplied RGBA at 100% zoom,
+/// honouring the file's Exif orientation. SVG files are rasterized at the
+/// device scale with [`rasterize`]'s limits (which also draws raster images
+/// embedded in the SVG); other files go through the `image` crate (PNG,
+/// JPEG, GIF - first frame only - and WebP) and keep the file's own pixels:
+/// a raster image is never enlarged for a HiDPI screen (that adds no
+/// detail), its logical size is simply its size in pixels.
+///
+/// Either way the picture's size on screen at 100% is checked against
+/// `settings.max_px` (see [`zoom_limit`]); a raster file over it is refused
+/// from its header, before its pixels are decoded.
 pub fn decode_image(path: &Path, settings: &RasterSettings) -> Rendered {
-    let bytes = std::fs::read(path).map_err(|e| format!("cannot read file: {e}"))?;
+    let bytes = crate::read_limited(path, crate::MAX_FILE_BYTES)
+        .map_err(|e| format!("cannot read file: {e}"))?;
+    let device_scale = settings.scale.max(1.0);
     if is_svg_path(path) {
         let svg = String::from_utf8(bytes).map_err(|e| format!("invalid SVG text: {e}"))?;
-        return rasterize(&svg, settings.font_px, settings.scale.max(1.0));
+        return rasterize_within(
+            &svg,
+            settings.font_px,
+            device_scale,
+            1.0,
+            settings.max_px,
+            path.parent(),
+        );
     }
     let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
@@ -419,25 +689,21 @@ pub fn decode_image(path: &Path, settings: &RasterSettings) -> Rendered {
         .into_decoder()
         .map_err(|e| e.to_string())?;
     let orientation = decoder.orientation().map_err(|e| e.to_string())?;
+    let (file_width, file_height) = oriented(decoder.dimensions(), orientation);
+    // One file pixel is one logical pixel, `device_scale` device pixels.
+    let max_zoom = zoom_limit(
+        file_width as f32 * device_scale,
+        file_height as f32 * device_scale,
+        settings.max_px,
+    )?;
+    // A backstop in case the header lied about the size.
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(file_width.max(file_height));
+    limits.max_image_height = Some(file_width.max(file_height));
+    decoder.set_limits(limits).map_err(|e| e.to_string())?;
     let mut decoded = image::DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
     decoded.apply_orientation(orientation);
-
-    // Render at the device scale, keeping the logical size at the file's
-    // natural size: `width / scale` stays the same, but the texture gains the
-    // device pixels a HiDPI screen draws 1:1.
-    let scale = settings.scale.max(1.0);
-    let rgba = if scale > 1.0 {
-        let width = (decoded.width() as f32 * scale).round().max(1.0) as u32;
-        let height = (decoded.height() as f32 * scale).round().max(1.0) as u32;
-        image::imageops::resize(
-            &decoded,
-            width,
-            height,
-            image::imageops::FilterType::Lanczos3,
-        )
-    } else {
-        decoded.to_rgba8()
-    };
+    let rgba = decoded.into_rgba8();
     let (width, height) = rgba.dimensions();
     if width == 0 || height == 0 {
         return Err("empty image".to_string());
@@ -445,11 +711,22 @@ pub fn decode_image(path: &Path, settings: &RasterSettings) -> Rendered {
     Ok(Image {
         width,
         height,
-        scale,
+        scale: 1.0,
         depth: 0.0,
-        pixels: premultiply(rgba.into_raw()),
+        pixels: premultiply(rgba.into_raw()).into(),
         labels: Vec::new(),
+        max_zoom,
     })
+}
+
+/// The size of an image of `size` (as stored in the file) once `orientation`
+/// is applied: a quarter turn swaps width and height.
+fn oriented(size: (u32, u32), orientation: image::metadata::Orientation) -> (u32, u32) {
+    use image::metadata::Orientation::{Rotate270, Rotate270FlipH, Rotate90, Rotate90FlipH};
+    match orientation {
+        Rotate90 | Rotate270 | Rotate90FlipH | Rotate270FlipH => (size.1, size.0),
+        _ => size,
+    }
 }
 
 /// Loads the image file at `path` for display at the zoom in `settings`: its
@@ -481,9 +758,11 @@ fn is_svg_path(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("svg"))
 }
 
-/// Scales an image's logical size by `zoom` (its pixels stay the same, so a
-/// raster image is upscaled when zoomed in).
+/// Scales an image's logical size by `zoom`, but never past its
+/// [`Image::max_zoom`] (its pixels stay the same, so a raster image is
+/// upscaled when zoomed in).
 fn zoom_image(mut image: Image, zoom: f32) -> Image {
+    let zoom = zoom.min(image.max_zoom);
     if zoom > 0.0 && (zoom - 1.0).abs() > f32::EPSILON {
         image.scale /= zoom;
     }
@@ -493,7 +772,10 @@ fn zoom_image(mut image: Image, zoom: f32) -> Image {
 /// Shrinks `image` (keeping its aspect ratio) so an inline image does not
 /// dwarf the line it sits on: at most [`INLINE_IMAGE_MAX_LINES`] lines tall
 /// and [`INLINE_IMAGE_MAX_EM`] body-font widths wide. Smaller images are left
-/// alone.
+/// alone. A shrunk image also keeps only the pixels it is drawn with (its
+/// capped size at the device scale), so a large file used as an inline icon
+/// does not hold its full resolution in the texture; its zoom limit grows
+/// accordingly.
 fn cap_inline(mut image: Image, settings: &RasterSettings) -> Image {
     let line = settings.font_px * settings.zoom;
     let max_height = line * INLINE_IMAGE_MAX_LINES;
@@ -506,14 +788,71 @@ fn cap_inline(mut image: Image, settings: &RasterSettings) -> Image {
     if width > max_width && width > 0.0 {
         factor = factor.min(max_width / width);
     }
-    if factor < 1.0 {
-        image.scale /= factor;
+    if factor >= 1.0 {
+        return image;
     }
+    let logical_width = width * factor;
+    // Keep the pixels drawn at the device scale, but at least
+    // INLINE_IMAGE_MIN_TEXELS on the shorter side, so rounding the texture
+    // size to whole pixels barely changes the aspect ratio.
+    let shorter = image.width.min(image.height) as f32;
+    let resample = (logical_width * settings.scale.max(1.0) / image.width as f32)
+        .max(INLINE_IMAGE_MIN_TEXELS / shorter);
+    if resample < 1.0 {
+        let texels_width = (image.width as f32 * resample).round().max(1.0) as u32;
+        let texels_height = (image.height as f32 * resample).round().max(1.0) as u32;
+        // Premultiplied pixels resample correctly as they are.
+        let buffer = image::ImageBuffer::<image::Rgba<u8>, &[u8]>::from_raw(
+            image.width,
+            image.height,
+            &image.pixels,
+        );
+        if let Some(buffer) = buffer {
+            let resized = image::imageops::resize(
+                &buffer,
+                texels_width,
+                texels_height,
+                image::imageops::FilterType::Triangle,
+            );
+            image.width = texels_width;
+            image.height = texels_height;
+            image.pixels = resized.into_raw().into();
+        }
+    }
+    image.scale = image.width as f32 / logical_width;
+    image.max_zoom /= factor;
     image
 }
 
+/// The exact, hashable form of [`RasterSettings`].
+type SettingsKey = (u32, u32, u32, [u8; 3], [u32; 2]);
+
 /// What a cached formula is looked up by: source, display flag, settings.
-type MathKey = (String, bool, (u32, u32, u32, [u8; 3]));
+type MathKey = (String, bool, SettingsKey);
+
+/// What a decoded image is looked up by: path, the file's stamp, device
+/// scale, body font size, size limit.
+type ImageKey = (PathBuf, Option<FileStamp>, u32, u32, [u32; 2]);
+
+/// What identifies one version of a file for the image cache: its size,
+/// modification time (seconds and nanoseconds since the epoch) and inode.
+/// A file rewritten, replaced or created since it was cached has another
+/// stamp, so it is decoded again.
+pub type FileStamp = (u64, i64, i64, u64);
+
+/// The stamp of the file at `path` as it is now, or `None` when it cannot
+/// be read (missing, for instance; a missing file that appears later then
+/// has a stamp and misses the cache).
+pub fn file_stamp(path: &Path) -> Option<FileStamp> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ino(),
+    ))
+}
 
 /// How many rendered formulas [`Cache`] keeps before it starts over.
 const MATH_CACHE_LIMIT: usize = 4096;
@@ -529,15 +868,21 @@ const IMAGE_CACHE_LIMIT: usize = 128;
 /// once, and zooming only re-rasterizes diagrams instead of laying them out
 /// again (the slow part). Safe to share between worker threads; work is
 /// done outside the lock, so two threads may occasionally both compute the
-/// same entry. Each map is simply emptied when it reaches its limit.
+/// same entry. Each map is simply emptied when it reaches its entry or byte
+/// limit ([`CACHE_BYTES`]); pixels are shared with the windows showing them.
 #[derive(Debug, Default)]
 pub struct Cache {
     /// Rendered formulas by (source, display, settings).
     math: Mutex<HashMap<MathKey, Rendered>>,
     /// Laid-out diagram SVG (or the layout error) by source.
     diagrams: Mutex<HashMap<String, Result<Arc<String>, String>>>,
-    /// Decoded images by (path, device scale, body font size), at 100% zoom.
-    images: Mutex<HashMap<(PathBuf, u32, u32), Rendered>>,
+    /// Decoded images by (path, file stamp, device scale, body font size,
+    /// size limit), at 100% zoom.
+    images: Mutex<HashMap<ImageKey, Rendered>>,
+    /// Inline images shrunk to the text (see `cap_inline`), by image key
+    /// and zoom, so an image used inline many times is resampled once and
+    /// every use shares its pixels.
+    inline_images: Mutex<HashMap<(ImageKey, u32), Image>>,
     /// How many times a formula was typeset or a diagram laid out.
     misses: AtomicUsize,
 }
@@ -565,8 +910,7 @@ impl Cache {
                 }
                 self.misses.fetch_add(1, Ordering::Relaxed);
                 let rendered = render_math(tex, *display, settings);
-                insert_bounded(&self.math, key, rendered.clone(), MATH_CACHE_LIMIT);
-                rendered
+                insert_bounded(&self.math, key, rendered, MATH_CACHE_LIMIT, rendered_bytes)
             }
             Graphic::Diagram { source } => {
                 if source.trim().is_empty() {
@@ -581,38 +925,69 @@ impl Cache {
                         insert_bounded(
                             &self.diagrams,
                             source.clone(),
-                            svg.clone(),
+                            svg,
                             DIAGRAM_CACHE_LIMIT,
-                        );
-                        svg
+                            svg_bytes,
+                        )
                     }
                 };
                 rasterize_diagram(&svg?, settings)
             }
             Graphic::Image { path, inline } => {
+                let stamp = file_stamp(path);
                 let key = (
                     path.clone(),
+                    stamp,
                     settings.scale.to_bits(),
                     settings.font_px.to_bits(),
+                    settings.max_px,
                 );
+                let inline_key = (key.clone(), settings.zoom.to_bits());
+                if *inline {
+                    if let Some(found) = lock(&self.inline_images).get(&inline_key).cloned() {
+                        return Ok(found);
+                    }
+                }
                 let cached = lock(&self.images).get(&key).cloned();
                 let decoded = match cached {
                     Some(found) => found,
                     None => {
                         self.misses.fetch_add(1, Ordering::Relaxed);
                         let decoded = decode_image(path, settings);
-                        insert_bounded(&self.images, key, decoded.clone(), IMAGE_CACHE_LIMIT);
-                        decoded
+                        // Results for an older version of the file are
+                        // stale: drop them rather than hold their pixels.
+                        lock(&self.images).retain(|(cached, cached_stamp, ..), _| {
+                            cached != path || *cached_stamp == stamp
+                        });
+                        lock(&self.inline_images).retain(|((cached, cached_stamp, ..), _), _| {
+                            cached != path || *cached_stamp == stamp
+                        });
+                        insert_bounded(
+                            &self.images,
+                            key,
+                            decoded,
+                            IMAGE_CACHE_LIMIT,
+                            rendered_bytes,
+                        )
                     }
                 };
-                decoded.map(|image| {
-                    let image = zoom_image(image, settings.zoom);
-                    if *inline {
-                        cap_inline(image, settings)
-                    } else {
-                        image
-                    }
-                })
+                let image = zoom_image(decoded?, settings.zoom);
+                if !*inline {
+                    return Ok(image);
+                }
+                let original = image.pixels.clone();
+                let capped = cap_inline(image, settings);
+                if Arc::ptr_eq(&original, &capped.pixels) {
+                    // Not shrunk: it already shares the decoded pixels.
+                    return Ok(capped);
+                }
+                Ok(insert_bounded(
+                    &self.inline_images,
+                    inline_key,
+                    capped,
+                    IMAGE_CACHE_LIMIT,
+                    |image| image.pixels.len(),
+                ))
             }
         }
     }
@@ -626,18 +1001,48 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Inserts into a cache map, emptying it first if it holds `limit` entries.
-fn insert_bounded<K: std::hash::Hash + Eq, V>(
+/// The most bytes of pixels (or SVG text) each cache map holds; the three
+/// together stay within about 256 MiB however many windows are open.
+const CACHE_BYTES: usize = 96 * 1024 * 1024;
+
+/// Inserts into a cache map, emptying it first if it holds `limit` entries
+/// or the new value would take it past [`CACHE_BYTES`] (`weigh` gives a
+/// value's size). A value larger than that on its own is not cached.
+///
+/// Returns the value to use: if another thread cached the same key while
+/// this one was computing it, that value (so every user of an entry shares
+/// one pixel buffer), otherwise `value`.
+fn insert_bounded<K: std::hash::Hash + Eq, V: Clone>(
     map: &Mutex<HashMap<K, V>>,
     key: K,
     value: V,
     limit: usize,
-) {
+    weigh: fn(&V) -> usize,
+) -> V {
     let mut map = lock(map);
-    if map.len() >= limit {
+    if let Some(found) = map.get(&key) {
+        return found.clone();
+    }
+    let size = weigh(&value);
+    if size > CACHE_BYTES {
+        return value;
+    }
+    let held: usize = map.values().map(weigh).sum();
+    if map.len() >= limit || held + size > CACHE_BYTES {
         map.clear();
     }
-    map.insert(key, value);
+    map.insert(key, value.clone());
+    value
+}
+
+/// The bytes of pixels a rendered result holds.
+fn rendered_bytes(rendered: &Rendered) -> usize {
+    rendered.as_ref().map_or(0, |image| image.pixels.len())
+}
+
+/// The bytes of SVG text a laid-out diagram holds.
+fn svg_bytes(svg: &Result<Arc<String>, String>) -> usize {
+    svg.as_ref().map_or(0, |svg| svg.len())
 }
 
 /// Renders every graphic in `blocks` (math, in text and in table cells, and
@@ -654,6 +1059,146 @@ pub fn render_document(blocks: &mut [Block], settings: &RasterSettings) {
 mod tests {
     use super::*;
 
+    /// Only raster data with a readable header within the limit fits;
+    /// anything else that is not raster (an SVG) passes, and broken raster
+    /// data does not.
+    #[test]
+    fn embedded_raster_fits_checks_the_header() {
+        let mut png = Vec::new();
+        image::RgbaImage::new(30, 10)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        assert!(embedded_raster_fits(&png, [30, 30]));
+        assert!(!embedded_raster_fits(&png, [20, 20]));
+        assert!(!embedded_raster_fits(&png[..12], [30, 30]));
+        assert!(embedded_raster_fits(b"<svg/>", [1, 1]));
+    }
+
+    /// A file an SVG refers to becomes the usvg image kind of its format
+    /// (PNG, JPEG, GIF, WebP, or a nested SVG); a raster format without a
+    /// decoder (BMP), one over the size limit, and bytes that are neither
+    /// raster nor SVG are left out.
+    #[test]
+    fn embedded_image_kinds() {
+        let encode = |format: image::ImageFormat| {
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgb8(image::RgbImage::new(4, 4))
+                .write_to(&mut std::io::Cursor::new(&mut bytes), format)
+                .unwrap();
+            bytes
+        };
+        let options = svg_options(15.0);
+        let kind = |bytes: Vec<u8>, max_px: [u32; 2]| embedded_image(bytes, max_px, &options);
+        let roomy = [100, 100];
+        assert!(matches!(
+            kind(encode(image::ImageFormat::Png), roomy),
+            Some(usvg::ImageKind::PNG(_))
+        ));
+        assert!(matches!(
+            kind(encode(image::ImageFormat::Jpeg), roomy),
+            Some(usvg::ImageKind::JPEG(_))
+        ));
+        assert!(matches!(
+            kind(encode(image::ImageFormat::Gif), roomy),
+            Some(usvg::ImageKind::GIF(_))
+        ));
+        assert!(matches!(
+            kind(encode(image::ImageFormat::WebP), roomy),
+            Some(usvg::ImageKind::WEBP(_))
+        ));
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"/>"#;
+        assert!(matches!(
+            kind(svg.to_vec(), roomy),
+            Some(usvg::ImageKind::SVG(_))
+        ));
+        // A BMP header: recognised, but there is no decoder to size it.
+        let mut bmp = b"BM".to_vec();
+        bmp.resize(64, 0);
+        assert!(kind(bmp, roomy).is_none());
+        assert!(kind(encode(image::ImageFormat::Png), [2, 2]).is_none());
+        assert!(kind(b"not an image".to_vec(), roomy).is_none());
+    }
+
+    /// References from an SVG are read relative to its folder, as absolute
+    /// paths or `file:` URLs, but never from the network or with invalid
+    /// percent-encoding.
+    #[test]
+    fn read_svg_reference_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a b.txt"), "x").unwrap();
+        let read = |href: &str| read_svg_reference(dir.path(), href);
+        assert_eq!(read("a b.txt").as_deref(), Some(&b"x"[..]));
+        assert_eq!(read("a%20b.txt").as_deref(), Some(&b"x"[..]));
+        let absolute = dir.path().join("a b.txt");
+        assert!(read(absolute.to_str().unwrap()).is_some());
+        let url = url::Url::from_file_path(&absolute).unwrap();
+        assert!(read(url.as_str()).is_some());
+        assert_eq!(read("http://example.com/a.png"), None);
+        assert_eq!(read("file://host/a.png"), None);
+        assert_eq!(read("%FF.txt"), None);
+        assert_eq!(read("missing"), None);
+    }
+
+    /// A quarter turn swaps width and height; other orientations (flips,
+    /// half turn) keep them.
+    #[test]
+    fn oriented_swaps_on_quarter_turns() {
+        use image::metadata::Orientation::*;
+        for turn in [Rotate90, Rotate270, Rotate90FlipH, Rotate270FlipH] {
+            assert_eq!(oriented((3, 7), turn), (7, 3), "{turn:?}");
+        }
+        for same in [NoTransforms, Rotate180, FlipHorizontal, FlipVertical] {
+            assert_eq!(oriented((3, 7), same), (3, 7), "{same:?}");
+        }
+    }
+
+    /// How much smaller a capped graphic was drawn: the ratio of its limit
+    /// to the zoom asked for, or 1.0 when within the limit.
+    #[test]
+    fn cap_factor_is_limit_over_zoom() {
+        let image = Image {
+            width: 1,
+            height: 1,
+            scale: 1.0,
+            depth: 0.0,
+            pixels: vec![0; 4].into(),
+            labels: Vec::new(),
+            max_zoom: 1.5,
+        };
+        assert_eq!(cap_factor(&image, 3.0), 0.5);
+        assert_eq!(cap_factor(&image, 1.5), 1.0);
+        assert_eq!(cap_factor(&image, 1.0), 1.0);
+    }
+
+    /// Sizes in error messages are whole pixels, or "huge" when not
+    /// printable meaningfully.
+    #[test]
+    fn pixels_for_message_rounds_or_says_huge() {
+        assert_eq!(pixels_for_message(10.4), "10");
+        assert_eq!(pixels_for_message(19_201.0), "19201");
+        assert_eq!(pixels_for_message(1e30), "huge");
+        assert_eq!(pixels_for_message(f32::NAN), "huge");
+        assert_eq!(pixels_for_message(f32::INFINITY), "huge");
+    }
+
+    /// A shrunk inline image whose pixel buffer does not match its size (a
+    /// hand-made `Image`) is left with its pixels rather than panicking; its
+    /// logical size is still capped.
+    #[test]
+    fn cap_inline_tolerates_mismatched_pixels() {
+        let image = Image {
+            width: 1000,
+            height: 1000,
+            scale: 1.0,
+            depth: 0.0,
+            pixels: vec![0; 4].into(),
+            labels: Vec::new(),
+            max_zoom: 1.0,
+        };
+        let capped = cap_inline(image, &RasterSettings::default());
+        assert_eq!((capped.width, capped.pixels.len()), (1000, 4));
+        assert!((capped.logical_height() - 22.5).abs() < 0.01);
+    }
     /// The preferred families win in order; otherwise any family is used.
     #[test]
     fn pick_family_order() {
@@ -839,11 +1384,58 @@ mod tests {
     fn cache_is_bounded() {
         let map = Mutex::new(HashMap::new());
         for key in 0..5 {
-            insert_bounded(&map, key, (), 3);
+            insert_bounded(&map, key, (), 3, |_| 0);
         }
         let map = lock(&map);
         assert!(map.len() <= 3);
         assert!(map.contains_key(&4));
+    }
+
+    /// A cache map also starts over when its bytes would exceed
+    /// `CACHE_BYTES`, and a value larger than that alone is not kept.
+    #[test]
+    fn cache_is_bounded_in_bytes() {
+        let map = Mutex::new(HashMap::new());
+        let third = CACHE_BYTES / 3;
+        for key in 0..3 {
+            insert_bounded(&map, key, third, 100, |size| *size);
+        }
+        assert_eq!(lock(&map).len(), 3);
+        insert_bounded(&map, 3, third, 100, |size| *size);
+        assert_eq!(lock(&map).keys().copied().collect::<Vec<_>>(), [3]);
+        insert_bounded(&map, 4, CACHE_BYTES + 1, 100, |size| *size);
+        assert!(!lock(&map).contains_key(&4));
+        assert_eq!(lock(&map).len(), 1);
+    }
+
+    /// Two threads computing the same entry end up sharing one value: the
+    /// later insert returns the one already cached.
+    #[test]
+    fn cache_insert_returns_the_cached_value() {
+        let map = Mutex::new(HashMap::new());
+        let first = insert_bounded(&map, 1, Arc::new(10), 100, |_| 0);
+        let second = insert_bounded(&map, 1, Arc::new(20), 100, |_| 0);
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(*second, 10);
+    }
+
+    /// The weights: an image's pixel bytes (none for an error), a diagram's
+    /// SVG length.
+    #[test]
+    fn cache_weights() {
+        let image = Image {
+            width: 2,
+            height: 1,
+            scale: 1.0,
+            depth: 0.0,
+            pixels: vec![0; 8].into(),
+            labels: Vec::new(),
+            max_zoom: 1.0,
+        };
+        assert_eq!(rendered_bytes(&Ok(image)), 8);
+        assert_eq!(rendered_bytes(&Err("x".to_string())), 0);
+        assert_eq!(svg_bytes(&Ok(Arc::new("<svg/>".to_string()))), 6);
+        assert_eq!(svg_bytes(&Err("bad".to_string())), 0);
     }
 
     /// A poisoned cache lock (a worker panicked) is still usable.
@@ -858,6 +1450,93 @@ mod tests {
         .join();
         assert!(mutex.is_poisoned());
         assert_eq!(*lock(&mutex), 1);
+    }
+
+    /// An image file changed on disk (or created after it was found
+    /// missing) is decoded again rather than answered from the cache, and
+    /// the entry for its old version is dropped.
+    #[test]
+    fn cache_notices_changed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("picture.png");
+        let cache = Cache::default();
+        let settings = RasterSettings::default();
+        let graphic = Graphic::Image {
+            path: path.clone(),
+            inline: false,
+        };
+        assert!(cache.render(&graphic, &settings).is_err());
+        image::RgbaImage::new(4, 3).save(&path).unwrap();
+        let first = cache.render(&graphic, &settings).unwrap();
+        assert_eq!((first.width, first.height), (4, 3));
+        assert_eq!(cache.render(&graphic, &settings).unwrap(), first);
+        let misses = cache.misses();
+        // A different size, so the stamp differs even within one second.
+        image::RgbaImage::new(7, 5).save(&path).unwrap();
+        let second = cache.render(&graphic, &settings).unwrap();
+        assert_eq!((second.width, second.height), (7, 5));
+        assert_eq!(cache.misses(), misses + 1);
+        let images = lock(&cache.images);
+        assert_eq!(images.len(), 1);
+        assert!(images.keys().all(|key| key.1 == file_stamp(&path)));
+    }
+
+    /// An inline image shrunk to the text is resampled once per zoom: its
+    /// uses share one pixel buffer, another zoom gets its own, and a new
+    /// version of the file replaces the shrunk entries of the old one. An
+    /// inline image too small to shrink is not stored a second time.
+    #[test]
+    fn inline_images_are_shrunk_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.png");
+        image::RgbaImage::new(400, 300).save(&path).unwrap();
+        let cache = Cache::default();
+        let settings = RasterSettings::default();
+        let graphic = Graphic::Image {
+            path: path.clone(),
+            inline: true,
+        };
+        let first = cache.render(&graphic, &settings).unwrap();
+        assert!(first.width < 400);
+        let second = cache.render(&graphic, &settings).unwrap();
+        assert!(Arc::ptr_eq(&first.pixels, &second.pixels));
+        let zoomed = RasterSettings {
+            zoom: 2.0,
+            ..settings
+        };
+        let large = cache.render(&graphic, &zoomed).unwrap();
+        assert!(!Arc::ptr_eq(&first.pixels, &large.pixels));
+        assert_eq!(lock(&cache.inline_images).len(), 2);
+        image::RgbaImage::new(500, 300).save(&path).unwrap();
+        let replaced = cache.render(&graphic, &settings).unwrap();
+        assert!(!Arc::ptr_eq(&first.pixels, &replaced.pixels));
+        let inline = lock(&cache.inline_images);
+        assert_eq!(inline.len(), 1);
+        assert!(inline.keys().all(|(key, _)| key.1 == file_stamp(&path)));
+        drop(inline);
+        let small = dir.path().join("small.png");
+        image::RgbaImage::new(8, 8).save(&small).unwrap();
+        let icon = Graphic::Image {
+            path: small,
+            inline: true,
+        };
+        assert_eq!(cache.render(&icon, &settings).unwrap().width, 8);
+        assert_eq!(lock(&cache.inline_images).len(), 1);
+    }
+
+    /// `file_stamp` is `None` for a missing file and changes with the
+    /// file's contents.
+    #[test]
+    fn file_stamp_follows_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        assert_eq!(file_stamp(&path), None);
+        std::fs::write(&path, "a").unwrap();
+        let first = file_stamp(&path);
+        assert!(first.is_some());
+        assert_eq!(file_stamp(&path), first);
+        std::fs::write(&path, "ab").unwrap();
+        assert_ne!(file_stamp(&path), first);
     }
 
     /// The shared cache is one instance.

@@ -28,7 +28,27 @@ Background on the rendering crates is in `NOTES.md`.
   sharp pictures arrive; the line at the top of the window is held in
   place for a moment, but not after the user scrolls.
 
+- The memory budget is enforced on the GUI thread, after results arrive:
+  the render workers do not reserve their bytes before allocating, so while
+  rendering the document can briefly hold up to one graphic per worker
+  over the budget (accepted as not a problem).
+- An image file changed on disk shows the change only when the document is
+  reopened or zoomed (nothing watches the file), and a change to a file an
+  SVG image refers to (`<image href>`) is not noticed at all until restart.
+- Regex mode's `(?i)` uses the regex crate's simple case folding (`ß`
+  does not match `ss` there, unlike in the other modes).
+
 ## Limitations
+
+- Heading anchors are matched in two spellings: ours (runs of whitespace
+  collapse to one hyphen, a trailing hyphen is dropped; GitLab's rule is
+  close to it) and GitHub's (`Install - Linux` is `install---linux`).
+  Combining marks are dropped in both, so a heading in a script that uses
+  them (Devanagari vowel signs, for instance) has a different anchor than
+  on GitHub.
+
+- Lists (and, for code cards, block quotes) are indented at most
+  `MAX_LIST_INDENT` (4) levels; deeper items line up at the fourth level.
 
 - merman's diagram engines make the binary much larger (about 26.5 MB
   stripped in 0.4.0, 24.7 MB in 0.3.0, about 1.3 MB for 0.1.0).
@@ -44,6 +64,13 @@ Background on the rendering crates is in `NOTES.md`.
   planned: the viewer deliberately loads nothing over the network. Such an
   image shows a placeholder saying so.
 - An animated GIF shows only its first frame.
+- Nothing is drawn larger than ten screens. A graphic too large even at 100%
+  is refused ("too large" in its place); a very large one lowers the
+  document's maximum zoom, so the whole page stops zooming in where that
+  graphic reaches the limit. At a ceiling of exactly 100% the zoom indicator
+  is hidden (as at every 100%), so nothing says why zooming in does nothing.
+- A standalone raster image keeps the file's full resolution even though
+  it is shown at the window width.
 - A match inside a diagram highlights the whole diagram card, not the exact
   label characters. Likewise a match on a standalone or table-cell image's
   alt text highlights the whole picture, and a match on an inline image's alt
@@ -63,6 +90,18 @@ Background on the rendering crates is in `NOTES.md`.
 
 ## Testing gaps
 
+- The link confirmation dialog's "Open Anyway" (which hands the file to
+  its default application) is not exercised by the tests, to launch
+  nothing; the tests check that a dangerous file shows the dialog with
+  Cancel as the default, and that nothing else is launched.
+- Moving a window to another monitor (the surface's `notify::scale` and
+  `enter-monitor` signals) is not tested: headless X has one monitor and
+  one scale. The GUI unit tests call `Session::rescale` directly (whole and
+  fractional scales, a lower and a higher limit) and check following the
+  headless monitor once.
+- A real window resize is not tested (headless X without a window manager
+  does not resize windows); the tests check that the width signal wakes the
+  frame callback.
 - The file chooser's response and the error dialog need user interaction,
   so the tests do not reach them; check them by hand after changing them.
 - Zooming (Ctrl+wheel, Ctrl+plus/minus/0, pinch) and the code cards' copy
@@ -78,7 +117,16 @@ Background on the rendering crates is in `NOTES.md`.
   cross-file/anchor scrolling) needs input events and a running desktop
   session, so the GUI tests do not reach it; the resolution and range logic
   is fully tested, and the interaction is checked by hand (or with `xdotool`
-  on Xvfb, see `NOTES.md`).
+  on Xvfb, see `NOTES.md`). That only a single click opens a link (not the
+  second click of a double click) is tested through `layout::opens_link`,
+  not with real clicks. The GUI unit tests do open a real document
+  session and check that every heading is registered at its own buffer
+  offset and that a clicked fragment is resolved and found, but not the
+  scrolling itself.
+- The zoom ceiling is tested end to end in the GUI unit tests (a picture
+  lowering it zooms the window out, the indicator shows "(max)", zooming in
+  is refused), but the indicator's click and keyboard/wheel zooming against
+  the ceiling are checked by hand.
 - How a loaded image is placed (standalone at the window width, inline at
   the line height, in a table cell, and its place in a zoom re-render) needs
   a display and input events, as do clicking a linked image and the
