@@ -531,16 +531,23 @@ run there; runtime verification on a real FreeBSD system is a manual step.
   the `cargo-llvm-cov` subcommand). Run it with a display so the GUI is
   covered too; headless, e.g. `Xvfb :77 & DISPLAY=:77 GDK_BACKEND=x11
   GSK_RENDERER=cairo cargo llvm-cov --tests`. With a display line coverage
-  is about 80%: the library (`lib.rs`, `graphics.rs`, `links.rs`,
+  is about 94%: the library (`lib.rs`, `graphics.rs`, `links.rs`,
   `progressive.rs`, `search.rs`, `zoom.rs`, `layout.rs`) is about 98-100%,
-  and `main.rs` is about 64%. The library's few uncovered lines are
+  and `main.rs` is about 90%. The library's few uncovered lines are
   defensive branches that cannot be reached (no fonts installed, a `file:`
-  URL with a host, parser events for extensions that are not enabled, and
-  `Option` arms that cannot be `None`). Almost all of `main.rs`'s remainder
+  URL with a host, parser events for extensions that are not enabled, a
+  raster format other than PNG/JPEG/GIF/WebP referenced from an SVG - the
+  `Some(_) => None` arm of `graphics::embedded_image`, see "Gotchas and
+  techniques" - and `Option` arms that cannot be
+  `None`). Almost all of `main.rs`'s remainder
   is interactive GUI wiring that needs input events or a live window - the
-  file chooser and error dialogs, click/zoom/search gestures, hover
-  tooltips, and placing loaded images - so it is checked by hand (or with
-  `xdotool` on Xvfb, see below). The display-independent helpers
+  file chooser and error dialogs, primary-button clicks, hover tooltips,
+  monitor changes, and handing links to other applications - so it is
+  checked by hand (or with `xdotool` on Xvfb, see below); the rest are
+  defensive arms, such as a `ScaledTexture` with neither texture, message
+  nor spinner, which no constructor or setter leaves it in. Controller
+  signals the tests can emit (motion, a non-primary release, key presses)
+  are emitted in `main.rs`'s `gtk_helpers` checks. The display-independent helpers
   (`label_attributes` and friends) and the GTK-helper checks (`tag_for`/
   `create_tags`, `code_card`, `ScaledTexture::scale_size`,
   `label_link_at`) are unit-tested in `main.rs`'s test module
@@ -568,6 +575,19 @@ cargo install cargo-llvm-cov --locked
 ## Gotchas and techniques
 
 Things learned the hard way; add to this list when you learn another.
+
+- `image::guess_format` recognises every format the `image` crate knows by
+  its magic bytes, even ones whose feature is off (BMP gives `Some(Bmp)`),
+  but `ImageReader::into_dimensions` needs the format's decoder, and only
+  `png`, `jpeg`, `gif` and `webp` are enabled. So in
+  `graphics::embedded_image` any other raster format is refused by the
+  `embedded_raster_fits` size check before the `match`, and the
+  `Some(_) => None` arm is unreachable (left uncovered on purpose). It is
+  kept because enabling another decoder feature would make it reachable,
+  and it then refuses formats usvg has no image kind for. It could be
+  covered from a test only with `image::hooks` (a format-detection hook
+  plus a mock decoder), which are process-wide and cannot be unregistered;
+  that was judged not worth the global test state.
 
 - mathra returns `Ok` for LaTeX it does not understand: an unknown command
   such as `\notacommand` becomes transparent (invisible) text, not an error.

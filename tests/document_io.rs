@@ -98,6 +98,24 @@ fn read_limited_size_limit() {
     assert_eq!(MAX_FILE_BYTES, 512 * 1024 * 1024);
 }
 
+/// A file that holds more than its size said when it was checked (as if it
+/// grew meanwhile) is still refused: at most `limit + 1` bytes are read.
+/// Linux `/proc` files are regular files that report size 0 but have
+/// content, which stands in for a file growing after the check.
+#[test]
+#[cfg(target_os = "linux")]
+fn read_limited_refuses_a_file_that_grew() {
+    let path = Path::new("/proc/self/status");
+    assert_eq!(fs::metadata(path).unwrap().len(), 0);
+    let error = read_limited(path, 10).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert_eq!(
+        error.to_string(),
+        "file too large (11 bytes, limit 10 bytes)"
+    );
+    assert!(!read_limited(path, MAX_FILE_BYTES).unwrap().is_empty());
+}
+
 /// Anything but a regular file is refused before it is opened: a directory,
 /// an endless device and a FIFO (opening which would block until a writer
 /// appears). A missing file is an ordinary not-found error.

@@ -4082,8 +4082,10 @@ mod tests {
     /// aligned with buffer offsets (an embedded child anchor becomes U+FFFC
     /// via `slice`), replacing a plain-text label's attributes drops its
     /// previous highlights, every style gets a text tag, code cards show
-    /// their code and language, a scaled texture stretches its logical size,
-    /// and a label's link hit-testing finds the destination under a point.
+    /// their code and language, a scaled texture stretches its logical size
+    /// and swaps its spinner or message without losing it, a widget not yet
+    /// in a window has scale 1, and a label's link hit-testing finds the
+    /// destination under a point.
     #[test]
     fn gtk_helpers() {
         if !gtk_ready() {
@@ -4178,6 +4180,31 @@ mod tests {
         let texture = ScaledTexture::new(&image);
         assert_eq!(texture.scale_size(2.0), (40.0, 20.0));
 
+        // A spinner replaces an earlier spinner, and a message replaces a
+        // spinner; neither changes the logical size.
+        let owner = gtk4::Label::new(None);
+        let width = texture.intrinsic_width();
+        texture.show_spinner(owner.upcast_ref());
+        texture.show_spinner(owner.upcast_ref());
+        assert!(texture.shows_spinner());
+        texture.show_message(owner.upcast_ref(), "limit");
+        assert!(!texture.shows_spinner());
+        assert_eq!(texture.message().as_deref(), Some("limit"));
+        assert_eq!(texture.intrinsic_width(), width);
+        // A spinner is drawn into an area big enough for it, and left out
+        // of one too small (under 8 pixels), drawing nothing at all.
+        texture.show_spinner(owner.upcast_ref());
+        let drawn = |size: f64| {
+            let snapshot = gtk4::Snapshot::new();
+            texture.snapshot(snapshot.upcast_ref::<gdk::Snapshot>(), size, size);
+            snapshot.to_node().is_some()
+        };
+        assert!(drawn(40.0));
+        assert!(!drawn(4.0));
+
+        // A widget in no window yet has its own scale factor (1 here).
+        assert_eq!(screen_scale(&owner), 1.0);
+
         // A click inside the first characters finds a link covering them; a
         // point in a gap or with no links finds nothing.
         let link_label = gtk4::Label::new(Some("Alice coffee"));
@@ -4259,6 +4286,7 @@ mod tests {
         assert!(session.ticking.get());
         session.release_anchor();
         window.window.close();
+        dropped_session_checks(&app);
         resize_after_idle_checks(&app);
         far_heading_checks(&app);
         size_limit_checks(&app);
@@ -4366,6 +4394,45 @@ mod tests {
         window.window.close();
     }
 
+    /// A frame callback that outlives its session (the view still on screen,
+    /// the session freed) stops at its next frame instead of acting on
+    /// the freed session (part of [`gtk_helpers`]).
+    fn dropped_session_checks(app: &adw::Application) {
+        let window = DocWindow::new(app);
+        let session =
+            window.show_document(Path::new("/doc/drop.md"), md_viewer::render("Some text.\n"));
+        session.start(RasterSettings::default());
+        settle(&session);
+        let view = session.view.clone();
+        let context = glib::MainContext::default();
+        assert!(view.is_mapped(), "the view is on screen");
+        // A callback runs only on a later frame: wake it, then free the
+        // session while the view stays in the window.
+        session.ticking.set(false);
+        session.wake_ticks();
+        let weak = Rc::downgrade(&session);
+        window.session.replace(None);
+        drop(session);
+        assert!(weak.upgrade().is_none(), "the session is freed");
+        // The callback stops (removing itself): a fresh one added after it
+        // still sees its frames.
+        let frames = Rc::new(Cell::new(0));
+        {
+            let frames = frames.clone();
+            view.add_tick_callback(move |_, _| {
+                frames.set(frames.get() + 1);
+                glib::ControlFlow::Continue
+            });
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while frames.get() < 3 {
+            assert!(std::time::Instant::now() < deadline, "frames are drawn");
+            context.iteration(false);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        window.window.close();
+    }
+
     /// A change of the view's width wakes the stopped frame callback
     /// (part of [`gtk_helpers`]): GTK reports a new width through the
     /// horizontal adjustment's `changed` signal, and the callback then
@@ -4396,6 +4463,10 @@ mod tests {
 
     /// A link to a heading far beyond what lazy rendering has put on the
     /// page renders up to it and scrolls there (part of [`gtk_helpers`]).
+    /// While it loads, a search refresh requested within
+    /// [`layout::SEARCH_REFRESH_MS`] of the last one is delayed (further
+    /// requests merge into it), stepping to the next match refreshes at
+    /// once, and the delayed refresh still runs.
     fn far_heading_checks(app: &adw::Application) {
         let mut markdown = String::from("# Top\n\n[far](#far-away)\n\n");
         for i in 0..400 {
@@ -4412,6 +4483,23 @@ mod tests {
         assert!(session.anchors.borrow().lookup("far-away").is_none());
         let summary = session.search("Formula", SearchMode::SmartCase);
         assert_eq!(summary.total, 400);
+        // Blocks appended soon after a refresh wait for one later refresh:
+        // a second request meanwhile is merged into it, and stepping
+        // through the matches refreshes them first.
+        assert!(!session.progress.borrow().all_shown());
+        let recently = std::time::Instant::now() - Duration::from_millis(20);
+        session.last_refresh.set(Some(recently));
+        session.request_refresh();
+        assert!(session.refresh_waiting.get(), "the refresh is delayed");
+        session.request_refresh();
+        assert!(session.refresh_waiting.get());
+        let before = session.last_refresh.get().expect("refreshed");
+        let stepped = session.navigate(true);
+        assert!(
+            session.last_refresh.get().expect("refreshed") > before,
+            "navigating refreshes"
+        );
+        assert_eq!(stepped.total, 400);
         session.click_link("#far-away");
         assert_eq!(session.pending_anchor.borrow().as_deref(), Some("far-away"));
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
@@ -4517,8 +4605,10 @@ mod tests {
     /// [`gtk_helpers`]), with the budget lowered to fit four pictures: a
     /// long document with many pictures loads completely while holding no
     /// more than the budget; pictures far from the view are dropped, keeping
-    /// their size and showing a spinner; scrolling to the end draws the
-    /// pictures there again, and the ones at the top are dropped instead.
+    /// their size and showing a spinner; a request left over from an earlier
+    /// rendering run for a far picture is dropped by a new run; scrolling to
+    /// the end draws the pictures there again, and the ones at the top are
+    /// dropped instead.
     fn budget_checks(app: &adw::Application) {
         let dir = tempfile::tempdir().expect("temporary directory");
         let mut markdown = String::new();
@@ -4567,6 +4657,24 @@ mod tests {
             assert_eq!(last.texture.intrinsic_width(), 200);
             assert_eq!(last.texture.intrinsic_height(), 100);
         }
+        // A new rendering run forgets a request from the old one for a
+        // picture far from the view: it is dropped, to be asked for again
+        // once it is near.
+        session.slots.borrow()[11]
+            .as_ref()
+            .expect("last picture")
+            .held
+            .set(Held::Requested(session.generation.get()));
+        session.restart_run();
+        assert_eq!(
+            session.slots.borrow()[11]
+                .as_ref()
+                .expect("last")
+                .held
+                .get(),
+            Held::Dropped
+        );
+        settle(&session);
         // Scroll to the last picture: it is drawn again, the first one
         // dropped, and the budget still holds.
         let offset = session.slots.borrow()[11].as_ref().expect("last").offset;
@@ -5039,6 +5147,135 @@ mod tests {
         );
         drop(anchors);
         session.click_link("#install---linux");
+        assert!(session.pending_anchor.borrow().is_none());
+        window.window.close();
+        picture_link_checks(app);
+    }
+
+    /// Every widget below `widget`, depth first.
+    fn descendants(widget: &gtk4::Widget) -> Vec<gtk4::Widget> {
+        let mut found = Vec::new();
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            found.push(current.clone());
+            found.extend(descendants(&current));
+            child = current.next_sibling();
+        }
+        found
+    }
+
+    /// The first controller of type `T` on `widget`.
+    fn controller<T: IsA<gtk4::EventController> + IsA<glib::Object>>(widget: &gtk4::Widget) -> T {
+        let controllers = widget.observe_controllers();
+        (0..controllers.n_items())
+            .find_map(|at| controllers.item(at).and_downcast::<T>())
+            .expect("the controller")
+    }
+
+    /// Links, images and searching on a real window (part of
+    /// [`gtk_helpers`]; controller signals are emitted, as the tests cannot
+    /// click): a linked picture, standalone or in a table cell, gets a
+    /// pointer cursor and the link's tooltip, and a release that is not a
+    /// primary-button click opens nothing; a remote image is shown as a
+    /// placeholder saying why; moving over a link in a table cell shows the
+    /// pointer cursor, which goes away off the link; an invalid regular
+    /// expression is reported as a search error with no matches.
+    fn picture_link_checks(app: &adw::Application) {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        image::RgbaImage::from_pixel(20, 10, image::Rgba([0, 0, 0, 255]))
+            .save(dir.path().join("p.png"))
+            .expect("write picture");
+        let document = dir.path().join("doc.md");
+        let markdown = "[![pic](p.png)](other.md)\n\n\
+                        | cell | text |\n|---|---|\n\
+                        | [![cell](p.png)](other.md) | [link](other.md) and more |\n\n\
+                        ![remote](https://example.com/x.png)\n";
+        let mut blocks = md_viewer::render(markdown);
+        md_viewer::resolve_images(&mut blocks, &document);
+        let window = DocWindow::new(app);
+        let session = window.show_document(&document, blocks);
+        session.start(RasterSettings::default());
+        settle(&session);
+        let windows = app.windows().len();
+        let widgets = descendants(session.view.upcast_ref());
+        let cards: Vec<&gtk4::Widget> = widgets
+            .iter()
+            .filter(|widget| widget.has_css_class("md-image"))
+            .collect();
+        assert_eq!(cards.len(), 2, "a standalone and a cell picture");
+        let tooltip = session.link_tooltip("other.md");
+        for card in cards {
+            assert_eq!(card.tooltip_text().as_deref(), Some(tooltip.as_str()));
+            let cursor = card.cursor().and_then(|cursor| cursor.name());
+            assert_eq!(cursor.as_deref(), Some("pointer"));
+            controller::<gtk4::GestureClick>(card)
+                .emit_by_name::<()>("released", &[&1i32, &1.0f64, &1.0f64]);
+        }
+        let text = searchable_text(&session.view.buffer());
+        assert!(
+            text.contains(&format!(
+                "[image: remote — {}]",
+                md_viewer::NETWORK_UNSUPPORTED
+            )),
+            "{text}"
+        );
+
+        let label = widgets
+            .iter()
+            .filter_map(|widget| widget.clone().downcast::<gtk4::Label>().ok())
+            .find(|label| label.text().starts_with("link and more"))
+            .expect("the cell label with a link");
+        let (_, height) = label.layout().pixel_size();
+        let y = f64::from(height) / 2.0;
+        let motion = controller::<gtk4::EventControllerMotion>(label.upcast_ref());
+        let cursor = || label.cursor().and_then(|cursor| cursor.name());
+        motion.emit_by_name::<()>("motion", &[&0.5f64, &y]);
+        assert_eq!(cursor().as_deref(), Some("pointer"));
+        let (width, _) = label.layout().pixel_size();
+        motion.emit_by_name::<()>("motion", &[&(f64::from(width) - 0.5), &y]);
+        assert_eq!(cursor(), None);
+        controller::<gtk4::GestureClick>(label.upcast_ref())
+            .emit_by_name::<()>("released", &[&1i32, &0.5f64, &y]);
+        while glib::MainContext::default().iteration(false) {}
+        assert_eq!(app.windows().len(), windows, "nothing was opened");
+
+        let summary = session.search("(", SearchMode::Regex);
+        assert!(summary.error);
+        assert_eq!(summary.total, 0);
+        window.window.close();
+        open_fragment_checks(app);
+    }
+
+    /// Opening a document at a fragment (as following `other.md#heading`
+    /// does) shows it and goes to that heading once it is on the page (part
+    /// of [`gtk_helpers`]).
+    fn open_fragment_checks(app: &adw::Application) {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let mut markdown = String::from("# Top\n\n");
+        for i in 0..300 {
+            markdown += &format!("Paragraph {i}.\n\n");
+        }
+        markdown += "## Far away\n\nThe end.\n";
+        let path = dir.path().join("far.md");
+        std::fs::write(&path, markdown).expect("write document");
+        let window = DocWindow::new(app);
+        open_file_to(
+            &window,
+            path.clone(),
+            Origin::Chooser,
+            Some("far-away".into()),
+        );
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while window.session.borrow().is_none() {
+            assert!(std::time::Instant::now() < deadline, "the document opens");
+            context.iteration(false);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(window.document.borrow().as_deref(), Some(path.as_path()));
+        let session = window.session.borrow().clone().expect("the session");
+        settle(&session);
+        assert!(session.anchors.borrow().lookup("far-away").is_some());
         assert!(session.pending_anchor.borrow().is_none());
         window.window.close();
     }

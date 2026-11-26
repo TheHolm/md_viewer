@@ -35,8 +35,9 @@ fn web_and_mail_destinations() {
     );
 }
 
-/// An empty destination does nothing; unsafe and unsupported schemes, and
-/// a `file:` URL naming another computer, are refused with the reason.
+/// An empty destination does nothing; unsafe and unsupported schemes, a
+/// `file:` URL naming another computer, and a destination that is not a
+/// valid URL at all, are refused with the reason.
 #[test]
 fn refused_destinations() {
     assert_eq!(resolve_link(base(), ""), Resolved::Ignored);
@@ -49,6 +50,8 @@ fn refused_destinations() {
             "file://server/share/x.md",
             "files on other computers are not opened",
         ),
+        ("http://[", "not a valid link"),
+        ("https://exa mple.com/", "not a valid link"),
     ] {
         assert_eq!(
             resolve_link(base(), dest),
@@ -525,8 +528,8 @@ fn safe_file_types() {
 
 /// Every other local file is potentially dangerous, and the reason says
 /// why: executable bit, program or script, launcher, a name that lies about
-/// the content, a type not known to be safe (SVG included), or no regular
-/// file at all.
+/// the content, a type not known to be safe (SVG included; by content when
+/// neither name nor content is safe), or no regular file at all.
 #[test]
 fn dangerous_file_reasons() {
     let risk = |name: &str, facts: FileFacts| local_file_risk(name, &facts).expect(name);
@@ -558,6 +561,13 @@ fn dangerous_file_reasons() {
     assert!(risk("a.zip", facts("application/zip", None))
         .contains("(application/zip) is not known to be safe"));
     assert!(risk("a.svg", facts("image/svg+xml", None)).contains("image/svg+xml"));
+    assert_eq!(
+        risk(
+            "a.bin",
+            facts("application/octet-stream", Some("application/zip"))
+        ),
+        "its type (application/zip) is not known to be safe; the application that opens it could run code"
+    );
     assert!(risk(
         "x.bin",
         facts("text/plain", Some("application/x-sharedlib"))

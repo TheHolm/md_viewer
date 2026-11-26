@@ -415,6 +415,8 @@ fn cap_factor(image: &Image, zoom: f32) -> f32 {
 /// usvg, so labels appear at their drawn position rather than in the
 /// `<defs>` they are stored in.
 fn text_labels(tree: &usvg::Tree) -> Vec<String> {
+    /// Appends the text of every text node in `group` and its subgroups to
+    /// `labels`, in document order.
     fn walk(group: &usvg::Group, labels: &mut Vec<String>) {
         for node in group.children() {
             match node {
@@ -1070,6 +1072,51 @@ mod tests {
         assert!(!embedded_raster_fits(&png, [20, 20]));
         assert!(!embedded_raster_fits(&png[..12], [30, 30]));
         assert!(embedded_raster_fits(b"<svg/>", [1, 1]));
+    }
+
+    /// A file an SVG refers to becomes the usvg image kind of its format
+    /// (PNG, JPEG, GIF, WebP, or a nested SVG); a raster format without a
+    /// decoder (BMP), one over the size limit, and bytes that are neither
+    /// raster nor SVG are left out.
+    #[test]
+    fn embedded_image_kinds() {
+        let encode = |format: image::ImageFormat| {
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgb8(image::RgbImage::new(4, 4))
+                .write_to(&mut std::io::Cursor::new(&mut bytes), format)
+                .unwrap();
+            bytes
+        };
+        let options = svg_options(15.0);
+        let kind = |bytes: Vec<u8>, max_px: [u32; 2]| embedded_image(bytes, max_px, &options);
+        let roomy = [100, 100];
+        assert!(matches!(
+            kind(encode(image::ImageFormat::Png), roomy),
+            Some(usvg::ImageKind::PNG(_))
+        ));
+        assert!(matches!(
+            kind(encode(image::ImageFormat::Jpeg), roomy),
+            Some(usvg::ImageKind::JPEG(_))
+        ));
+        assert!(matches!(
+            kind(encode(image::ImageFormat::Gif), roomy),
+            Some(usvg::ImageKind::GIF(_))
+        ));
+        assert!(matches!(
+            kind(encode(image::ImageFormat::WebP), roomy),
+            Some(usvg::ImageKind::WEBP(_))
+        ));
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"/>"#;
+        assert!(matches!(
+            kind(svg.to_vec(), roomy),
+            Some(usvg::ImageKind::SVG(_))
+        ));
+        // A BMP header: recognised, but there is no decoder to size it.
+        let mut bmp = b"BM".to_vec();
+        bmp.resize(64, 0);
+        assert!(kind(bmp, roomy).is_none());
+        assert!(kind(encode(image::ImageFormat::Png), [2, 2]).is_none());
+        assert!(kind(b"not an image".to_vec(), roomy).is_none());
     }
 
     /// References from an SVG are read relative to its folder, as absolute
