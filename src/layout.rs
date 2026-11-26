@@ -22,6 +22,33 @@ pub const MIN_DIAGRAM_WIDTH: i32 = 50;
 /// nested in, in pixels.
 pub const CODE_INDENT: i32 = 28;
 
+/// Whether the key named `name` (GDK's key name, as `gdk::Key::name`
+/// gives it) scrolls the document: the arrows up and down, Page Up/Down,
+/// Home, End and Space, also on the keypad. Pressing one lets go of the
+/// spot held after a zoom, as the user is scrolling.
+pub fn is_scroll_key(name: &str) -> bool {
+    matches!(
+        name,
+        "Up" | "Down"
+            | "Page_Up"
+            | "Page_Down"
+            | "Prior"
+            | "Next"
+            | "Home"
+            | "End"
+            | "space"
+            | "KP_Up"
+            | "KP_Down"
+            | "KP_Page_Up"
+            | "KP_Page_Down"
+            | "KP_Prior"
+            | "KP_Next"
+            | "KP_Home"
+            | "KP_End"
+            | "KP_Space"
+    )
+}
+
 /// How long the copy button of a code card shows its check mark after
 /// copying, in milliseconds.
 pub const COPY_FEEDBACK_MS: u64 = 1500;

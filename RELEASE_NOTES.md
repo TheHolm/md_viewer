@@ -67,6 +67,16 @@ section for the GitHub Release body.
   room, wherever it is on the page, instead of waiting to be scrolled to.
 - "Ignore case" and smart-case search use full Unicode case folding:
   `strasse` finds `Straße`, `file` finds `ﬁle`, final `ς` matches `Σ`.
+- After a zoom, scrolling with the keyboard, the scrollbar or a touch drag
+  is no longer pulled back to the line held at the top of the window (only
+  the mouse wheel used to let go of it).
+- Lists nested very deeply are indented at most four levels, so they no
+  longer take memory growing with the square of their depth.
+- Documents with very many graphics finish loading faster: each result is
+  stored directly instead of searching the whole document for its place.
+- A large image used inline several times is shrunk once and shared.
+- Closing a window no longer leaves its clickable table cells and its zoom
+  style behind in memory.
 
 ### Details
 
@@ -166,6 +176,24 @@ section for the GitHub Release body.
   kept, device pixels following whole and fractional scales, no zoom-out
   on a move, the limit rising again, following the headless monitor), a
   far limited graphic drawn once there is room, and full case folding.
+- `progressive::Location` (table cell as row and column, inline index)
+  is recorded in each `Job`; `place(blocks, block, location, rendered)`
+  goes straight to the slot instead of walking every graphic.
+- `MAX_LIST_INDENT` (4) caps list indentation and code cards' `indent`.
+- `Cache::inline_images` keeps shrunk inline images by image key and
+  zoom (only those actually resampled), dropped with stale file versions.
+- `make_label_clickable` handlers take the label from their controller
+  (`widget()`) rather than capturing it, ending a label -> controller ->
+  closure -> label cycle; the close-request handler removes the window's
+  zoom CSS provider from the display (`remove_css`).
+- `Session::release_anchor_on_input`: a capture-phase key controller
+  (`layout::is_scroll_key`), a press gesture on the vertical scrollbar and
+  a touch-only drag gesture let go of the held spot.
+- Tests: placing by location (and refusing wrong locations), every
+  location reaching its graphic in the showcase fixture, deep list caps
+  (3000 levels, code cards), shared shrunk inline images, a freed
+  clickable label and a closed window's zoom CSS no longer applying, the
+  scroll keys, and the release controllers.
 
 ## v0.8.0 — Lazy rendering and complete search
 

@@ -877,6 +877,10 @@ pub struct Cache {
     /// Decoded images by (path, file stamp, device scale, body font size,
     /// size limit), at 100% zoom.
     images: Mutex<HashMap<ImageKey, Rendered>>,
+    /// Inline images shrunk to the text (see `cap_inline`), by image key
+    /// and zoom, so an image used inline many times is resampled once and
+    /// every use shares its pixels.
+    inline_images: Mutex<HashMap<(ImageKey, u32), Image>>,
     /// How many times a formula was typeset or a diagram laid out.
     misses: AtomicUsize,
 }
@@ -936,6 +940,12 @@ impl Cache {
                     settings.font_px.to_bits(),
                     settings.max_px,
                 );
+                let inline_key = (key.clone(), settings.zoom.to_bits());
+                if *inline {
+                    if let Some(found) = lock(&self.inline_images).get(&inline_key).cloned() {
+                        return Ok(found);
+                    }
+                }
                 let cached = lock(&self.images).get(&key).cloned();
                 let decoded = match cached {
                     Some(found) => found,
@@ -947,6 +957,9 @@ impl Cache {
                         lock(&self.images).retain(|(cached, cached_stamp, ..), _| {
                             cached != path || *cached_stamp == stamp
                         });
+                        lock(&self.inline_images).retain(|((cached, cached_stamp, ..), _), _| {
+                            cached != path || *cached_stamp == stamp
+                        });
                         insert_bounded(
                             &self.images,
                             key,
@@ -956,14 +969,23 @@ impl Cache {
                         )
                     }
                 };
-                decoded.map(|image| {
-                    let image = zoom_image(image, settings.zoom);
-                    if *inline {
-                        cap_inline(image, settings)
-                    } else {
-                        image
-                    }
-                })
+                let image = zoom_image(decoded?, settings.zoom);
+                if !*inline {
+                    return Ok(image);
+                }
+                let original = image.pixels.clone();
+                let capped = cap_inline(image, settings);
+                if Arc::ptr_eq(&original, &capped.pixels) {
+                    // Not shrunk: it already shares the decoded pixels.
+                    return Ok(capped);
+                }
+                Ok(insert_bounded(
+                    &self.inline_images,
+                    inline_key,
+                    capped,
+                    IMAGE_CACHE_LIMIT,
+                    |image| image.pixels.len(),
+                ))
             }
         }
     }
@@ -1410,6 +1432,49 @@ mod tests {
         let images = lock(&cache.images);
         assert_eq!(images.len(), 1);
         assert!(images.keys().all(|key| key.1 == file_stamp(&path)));
+    }
+
+    /// An inline image shrunk to the text is resampled once per zoom: its
+    /// uses share one pixel buffer, another zoom gets its own, and a new
+    /// version of the file replaces the shrunk entries of the old one. An
+    /// inline image too small to shrink is not stored a second time.
+    #[test]
+    fn inline_images_are_shrunk_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.png");
+        image::RgbaImage::new(400, 300).save(&path).unwrap();
+        let cache = Cache::default();
+        let settings = RasterSettings::default();
+        let graphic = Graphic::Image {
+            path: path.clone(),
+            inline: true,
+        };
+        let first = cache.render(&graphic, &settings).unwrap();
+        assert!(first.width < 400);
+        let second = cache.render(&graphic, &settings).unwrap();
+        assert!(Arc::ptr_eq(&first.pixels, &second.pixels));
+        let zoomed = RasterSettings {
+            zoom: 2.0,
+            ..settings
+        };
+        let large = cache.render(&graphic, &zoomed).unwrap();
+        assert!(!Arc::ptr_eq(&first.pixels, &large.pixels));
+        assert_eq!(lock(&cache.inline_images).len(), 2);
+        image::RgbaImage::new(500, 300).save(&path).unwrap();
+        let replaced = cache.render(&graphic, &settings).unwrap();
+        assert!(!Arc::ptr_eq(&first.pixels, &replaced.pixels));
+        let inline = lock(&cache.inline_images);
+        assert_eq!(inline.len(), 1);
+        assert!(inline.keys().all(|(key, _)| key.1 == file_stamp(&path)));
+        drop(inline);
+        let small = dir.path().join("small.png");
+        image::RgbaImage::new(8, 8).save(&small).unwrap();
+        let icon = Graphic::Image {
+            path: small,
+            inline: true,
+        };
+        assert_eq!(cache.render(&icon, &settings).unwrap().width, 8);
+        assert_eq!(lock(&cache.inline_images).len(), 1);
     }
 
     /// `file_stamp` is `None` for a missing file and changes with the

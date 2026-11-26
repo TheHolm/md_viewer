@@ -329,3 +329,35 @@ fn refresh_delays() {
     assert_eq!(refresh_delay(Some(ms(200)), false), None);
     assert_eq!(refresh_delay(Some(ms(50)), false), Some(ms(150)));
 }
+
+/// The keys that scroll the document (and so let go of the spot held after
+/// a zoom), on the main block and the keypad; other keys do not.
+#[test]
+fn scroll_keys() {
+    for key in [
+        "Up",
+        "Down",
+        "Page_Up",
+        "Page_Down",
+        "Home",
+        "End",
+        "space",
+        "KP_Up",
+        "KP_Page_Down",
+        "KP_End",
+    ] {
+        assert!(md_viewer::layout::is_scroll_key(key), "{key}");
+    }
+    for key in [
+        "Left",
+        "Right",
+        "a",
+        "n",
+        "slash",
+        "Escape",
+        "Control_L",
+        "Return",
+    ] {
+        assert!(!md_viewer::layout::is_scroll_key(key), "{key}");
+    }
+}

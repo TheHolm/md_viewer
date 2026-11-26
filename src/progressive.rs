@@ -27,25 +27,51 @@ pub fn for_each_graphic(
     blocks: &mut [Block],
     mut visit: impl FnMut(usize, Graphic, &mut Option<Rendered>),
 ) {
+    for_each_located(blocks, |block, _, graphic, image| {
+        visit(block, graphic, image)
+    });
+}
+
+/// Where a graphic is within its block, so its result can be stored
+/// without walking the document (see [`place`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Location {
+    /// The table cell it is in, as (row, column) with row 0 the header and
+    /// row `r + 1` the table's row `r`; `None` outside a table.
+    pub cell: Option<(usize, usize)>,
+    /// Its index among the inlines of its text block or cell; `None` for a
+    /// diagram (the whole block).
+    pub inline: Option<usize>,
+}
+
+/// [`for_each_graphic`], also telling where in its block each graphic is.
+fn for_each_located(
+    blocks: &mut [Block],
+    mut visit: impl FnMut(usize, Location, Graphic, &mut Option<Rendered>),
+) {
     for (index, block) in blocks.iter_mut().enumerate() {
         match block {
-            Block::Text(inlines) => visit_inlines(index, inlines, true, true, &mut visit),
+            Block::Text(inlines) => visit_inlines(index, None, inlines, true, true, &mut visit),
             Block::Table(table) => {
-                for cell in table
-                    .header
-                    .iter_mut()
-                    .chain(table.rows.iter_mut().flatten())
-                {
-                    // A table cell is a single line, so its images are always
-                    // inline, never standalone.
-                    visit_inlines(index, cell, true, false, &mut visit);
+                let rows = std::iter::once(&mut table.header).chain(table.rows.iter_mut());
+                for (row, cells) in rows.enumerate() {
+                    for (column, cell) in cells.iter_mut().enumerate() {
+                        // A table cell is a single line, so its images are
+                        // always inline, never standalone.
+                        let at = Some((row, column));
+                        visit_inlines(index, at, cell, true, false, &mut visit);
+                    }
                 }
             }
             Block::Mermaid(diagram) => {
                 let graphic = Graphic::Diagram {
                     source: diagram.source.clone(),
                 };
-                visit(index, graphic, &mut diagram.image);
+                let location = Location {
+                    cell: None,
+                    inline: None,
+                };
+                visit(index, location, graphic, &mut diagram.image);
             }
             Block::Code(_) => {}
         }
@@ -58,10 +84,11 @@ pub fn for_each_graphic(
 /// line; images in table cells are always inline.
 fn visit_inlines(
     index: usize,
+    cell: Option<(usize, usize)>,
     inlines: &mut [Inline],
     images: bool,
     allow_standalone: bool,
-    visit: &mut impl FnMut(usize, Graphic, &mut Option<Rendered>),
+    visit: &mut impl FnMut(usize, Location, Graphic, &mut Option<Rendered>),
 ) {
     let standalone: Vec<bool> = (0..inlines.len())
         .map(|at| {
@@ -72,13 +99,17 @@ fn visit_inlines(
         })
         .collect();
     for (at, inline) in inlines.iter_mut().enumerate() {
+        let location = Location {
+            cell,
+            inline: Some(at),
+        };
         match inline {
             Inline::Math(math) => {
                 let graphic = Graphic::Math {
                     tex: math.tex.clone(),
                     display: math.display,
                 };
-                visit(index, graphic, &mut math.image);
+                visit(index, location, graphic, &mut math.image);
             }
             Inline::Image(image) if images => {
                 if let ImageState::Local(path) = &image.state {
@@ -86,7 +117,7 @@ fn visit_inlines(
                         path: path.clone(),
                         inline: !standalone[at],
                     };
-                    visit(index, graphic, &mut image.image);
+                    visit(index, location, graphic, &mut image.image);
                 }
             }
             _ => {}
@@ -101,6 +132,8 @@ pub struct Job {
     pub id: usize,
     /// The index of the block the graphic is in.
     pub block: usize,
+    /// Where in the block it is.
+    pub location: Location,
     /// What to render.
     pub graphic: Graphic,
 }
@@ -108,28 +141,51 @@ pub struct Job {
 /// Every graphic in `blocks` as a job, in document order.
 pub fn jobs(blocks: &mut [Block]) -> Vec<Job> {
     let mut jobs = Vec::new();
-    for_each_graphic(blocks, |block, graphic, _| {
+    for_each_located(blocks, |block, location, graphic, _| {
         jobs.push(Job {
             id: jobs.len(),
             block,
+            location,
             graphic,
         });
     });
     jobs
 }
 
-/// Stores `rendered` as the result of graphic `id` in `blocks`. Returns
-/// false (and stores nothing) if there is no such graphic.
-pub fn place(blocks: &mut [Block], id: usize, rendered: Rendered) -> bool {
-    let mut rendered = Some(rendered);
-    let mut next = 0;
-    for_each_graphic(blocks, |_, _, image| {
-        if next == id {
-            *image = rendered.take();
+/// Stores `rendered` as the result of the graphic at `location` in block
+/// `block` (see [`Job`]), going straight there rather than walking the
+/// document. Returns false (and stores nothing) if no graphic is there.
+pub fn place(blocks: &mut [Block], block: usize, location: Location, rendered: Rendered) -> bool {
+    let Some(target) = blocks.get_mut(block) else {
+        return false;
+    };
+    let inlines = match (target, location.cell, location.inline) {
+        (Block::Mermaid(diagram), None, None) => {
+            diagram.image = Some(rendered);
+            return true;
         }
-        next += 1;
-    });
-    rendered.is_none()
+        (Block::Text(inlines), None, Some(_)) => inlines,
+        (Block::Table(table), Some((row, column)), Some(_)) => {
+            let cells = if row == 0 {
+                Some(&mut table.header)
+            } else {
+                table.rows.get_mut(row - 1)
+            };
+            match cells.and_then(|cells| cells.get_mut(column)) {
+                Some(cell) => cell,
+                None => return false,
+            }
+        }
+        _ => return false,
+    };
+    match location.inline.and_then(|at| inlines.get_mut(at)) {
+        Some(Inline::Math(math)) => math.image = Some(rendered),
+        Some(Inline::Image(image)) if matches!(image.state, ImageState::Local(_)) => {
+            image.image = Some(rendered)
+        }
+        _ => return false,
+    }
+    true
 }
 
 /// Forgets the rendered graphics of `block` (they become `None` again),
@@ -533,6 +589,10 @@ mod tests {
         Job {
             id,
             block: 0,
+            location: Location {
+                cell: None,
+                inline: Some(id),
+            },
             graphic: Graphic::Math {
                 tex: format!("x_{id}"),
                 display: false,

@@ -6,7 +6,7 @@
 use md_viewer::graphics::{Graphic, RasterSettings};
 use md_viewer::progressive::{
     clear_graphics, for_each_graphic, held_bytes, jobs, place, plan_budget, worker_count,
-    zoom_order, Held, Job, Phase, Pool, Progress, SPINNER_DELAY_MS,
+    zoom_order, Held, Job, Location, Phase, Pool, Progress, SPINNER_DELAY_MS,
 };
 use md_viewer::{render, Block, Inline};
 use std::path::Path;
@@ -90,12 +90,57 @@ fn for_each_graphic_visits_slots() {
     assert_eq!(seen, ["#0", "#1", "#2", "#3", "#4"]);
 }
 
-/// `place` stores a result with the right graphic and rejects unknown ids.
+/// `place` stores a result with the graphic at a job's location, and
+/// refuses locations that hold no graphic (a missing block, cell or inline,
+/// plain text, a code block, a diagram location in a text block).
 #[test]
 fn place_stores_results() {
     let mut blocks = render(DOCUMENT);
-    assert!(place(&mut blocks, 2, Err("cell".to_string())));
-    assert!(!place(&mut blocks, 5, Err("none".to_string())));
+    let found = jobs(&mut blocks);
+    let cell = &found[2];
+    assert_eq!(cell.block, 1);
+    assert_eq!(
+        cell.location,
+        Location {
+            cell: Some((1, 0)),
+            inline: Some(0)
+        }
+    );
+    assert!(place(
+        &mut blocks,
+        cell.block,
+        cell.location,
+        Err("cell".to_string())
+    ));
+    let text = Location {
+        cell: None,
+        inline: Some(0),
+    };
+    let whole = Location {
+        cell: None,
+        inline: None,
+    };
+    let err = || Err("none".to_string());
+    assert!(!place(&mut blocks, 9, text, err()));
+    assert!(!place(&mut blocks, 0, text, err()), "plain text");
+    assert!(!place(&mut blocks, 0, whole, err()));
+    assert!(!place(&mut blocks, 5, whole, err()), "code block");
+    assert!(!place(&mut blocks, 3, text, err()), "inline in a diagram");
+    let missing_cell = Location {
+        cell: Some((5, 0)),
+        inline: Some(0),
+    };
+    assert!(!place(&mut blocks, 1, missing_cell, err()));
+    let missing_inline = Location {
+        cell: Some((1, 0)),
+        inline: Some(7),
+    };
+    assert!(!place(&mut blocks, 1, missing_inline, err()));
+    let header = Location {
+        cell: Some((0, 0)),
+        inline: Some(0),
+    };
+    assert!(!place(&mut blocks, 1, header, err()), "header text");
     let Block::Table(table) = &blocks[1] else {
         panic!("expected the table");
     };
@@ -422,7 +467,13 @@ fn progress_waits_for_images() {
 fn place_stores_image_result() {
     let mut blocks = render("![a](one.png)");
     md_viewer::resolve_images(&mut blocks, Path::new("/docs/notes.md"));
-    assert!(place(&mut blocks, 0, Err("broken".to_string())));
+    let job = jobs(&mut blocks).remove(0);
+    assert!(place(
+        &mut blocks,
+        job.block,
+        job.location,
+        Err("broken".to_string())
+    ));
     let Block::Text(inlines) = &blocks[0] else {
         panic!("expected a text block");
     };
@@ -430,6 +481,36 @@ fn place_stores_image_result() {
         panic!("expected an image");
     };
     assert_eq!(image.image, Some(Err("broken".to_string())));
+}
+
+/// Every job's location reaches its own graphic: placing a numbered result
+/// at each job's location stores it exactly where `for_each_graphic` finds
+/// that graphic, in the showcase fixture (text, tables, lists, diagrams,
+/// images) and the test document.
+#[test]
+fn every_location_reaches_its_graphic() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/showcase.md");
+    let showcase = std::fs::read_to_string(&fixture).expect("read the showcase fixture");
+    for source in [showcase.as_str(), DOCUMENT] {
+        let mut blocks = render(source);
+        md_viewer::resolve_images(&mut blocks, &fixture);
+        let found = jobs(&mut blocks);
+        assert!(!found.is_empty());
+        for job in &found {
+            assert!(place(
+                &mut blocks,
+                job.block,
+                job.location,
+                Err(format!("#{}", job.id))
+            ));
+        }
+        let mut seen = Vec::new();
+        for_each_graphic(&mut blocks, |_, _, image| {
+            seen.push(image.clone().unwrap().unwrap_err());
+        });
+        let expected: Vec<_> = (0..found.len()).map(|id| format!("#{id}")).collect();
+        assert_eq!(seen, expected);
+    }
 }
 
 /// A graphic for the budget tests.

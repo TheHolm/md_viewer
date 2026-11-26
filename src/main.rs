@@ -182,6 +182,10 @@ fn quit_on_signals(app: &adw::Application) {
     }
 }
 
+/// The name of the controllers that let go of the spot held after a zoom
+/// (see `Session::release_anchor_on_input`), so the tests can find them.
+const RELEASE_CONTROLLER: &str = "md-release-anchor";
+
 /// Installs `css` for the whole application through `provider`.
 fn add_css(provider: &gtk4::CssProvider, css: &str) {
     provider.load_from_string(css);
@@ -191,6 +195,15 @@ fn add_css(provider: &gtk4::CssProvider, css: &str) {
             provider,
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
+    }
+}
+
+/// Removes a provider added with [`add_css`] from the display (a closed
+/// window's zoom CSS), so it is freed rather than kept for the rest of the
+/// run.
+fn remove_css(provider: &gtk4::CssProvider) {
+    if let Some(display) = gdk::Display::default() {
+        gtk4::style_context_remove_provider_for_display(&display, provider);
     }
 }
 
@@ -712,7 +725,13 @@ impl Session {
                     }
                 }
             } else {
-                progressive::place(&mut self.blocks.borrow_mut(), id, rendered);
+                let job = &self.jobs[id];
+                progressive::place(
+                    &mut self.blocks.borrow_mut(),
+                    job.block,
+                    job.location,
+                    rendered,
+                );
                 self.progress.borrow_mut().complete(id);
             }
         }
@@ -872,6 +891,50 @@ impl Session {
                 glib::ControlFlow::Continue
             }
         });
+    }
+
+    /// Lets go of the held spot as soon as the user scrolls by other means
+    /// than the mouse wheel (which the window's zoom controller handles): a
+    /// scrolling key, pressing on the scrollbar (dragging it, clicking its
+    /// trough or arrows), or a touch drag on the page. Only input counts:
+    /// GTK moving the scroll value itself (as a zoom changes the page
+    /// height) must not let go.
+    fn release_anchor_on_input(self: &Rc<Self>) {
+        let keys = gtk4::EventControllerKey::new();
+        keys.set_name(Some(RELEASE_CONTROLLER));
+        keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let weak = Rc::downgrade(self);
+        keys.connect_key_pressed(move |_, key, _, _| {
+            let scrolls = key.name().is_some_and(|name| layout::is_scroll_key(&name));
+            if let (true, Some(session)) = (scrolls, weak.upgrade()) {
+                session.release_anchor();
+            }
+            glib::Propagation::Proceed
+        });
+        self.scrolled.add_controller(keys);
+
+        let bar = gtk4::GestureClick::new();
+        bar.set_name(Some(RELEASE_CONTROLLER));
+        bar.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let weak = Rc::downgrade(self);
+        bar.connect_pressed(move |_, _, _, _| {
+            if let Some(session) = weak.upgrade() {
+                session.release_anchor();
+            }
+        });
+        self.scrolled.vscrollbar().add_controller(bar);
+
+        let touch = gtk4::GestureDrag::new();
+        touch.set_name(Some(RELEASE_CONTROLLER));
+        touch.set_touch_only(true);
+        touch.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let weak = Rc::downgrade(self);
+        touch.connect_drag_begin(move |_, _, _| {
+            if let Some(session) = weak.upgrade() {
+                session.release_anchor();
+            }
+        });
+        self.scrolled.add_controller(touch);
     }
 
     /// Lets go of the held spot at once (the user scrolled).
@@ -1878,18 +1941,22 @@ impl Session {
             .borrow()
             .clone()
             .expect("session weak handle set after construction");
-        let label_for_click = label.clone();
+        // The handlers get the label from their controller: holding it in
+        // the closures would make label -> controller -> closure -> label a
+        // cycle that keeps every clickable label alive after its window.
         let links = content.links.clone();
         let click = gtk4::GestureClick::new();
         {
             let weak = weak.clone();
-            let label = label_for_click.clone();
             let links = links.clone();
             click.connect_released(move |gesture, _, x, y| {
                 if gesture.current_button() != gdk::BUTTON_PRIMARY {
                     return;
                 }
                 let Some(session) = weak.upgrade() else {
+                    return;
+                };
+                let Some(label) = gesture.widget().and_downcast::<gtk4::Label>() else {
                     return;
                 };
                 if let Some(dest) = label_link_at(&label, &links, x, y) {
@@ -1900,9 +1967,11 @@ impl Session {
         label.add_controller(click);
         let motion = gtk4::EventControllerMotion::new();
         {
-            let label = label_for_click.clone();
             let links = links.clone();
-            motion.connect_motion(move |_, x, y| {
+            motion.connect_motion(move |controller, x, y| {
+                let Some(label) = controller.widget().and_downcast::<gtk4::Label>() else {
+                    return;
+                };
                 let over_link = label_link_at(&label, &links, x, y).is_some();
                 label.set_cursor_from_name(if over_link { Some("pointer") } else { None });
             });
@@ -2306,7 +2375,7 @@ fn code_card(code: &CodeBlock) -> (gtk4::Box, gtk4::Label) {
         .orientation(gtk4::Orientation::Vertical)
         .css_classes(["md-code"])
         .halign(gtk4::Align::Start)
-        .margin_start(layout::CODE_INDENT * code.indent.min(16) as i32)
+        .margin_start(layout::CODE_INDENT * code.indent.min(md_viewer::MAX_LIST_INDENT) as i32)
         .overflow(gtk4::Overflow::Hidden)
         .build();
     card.append(&header);
@@ -2514,8 +2583,10 @@ impl DocWindow {
         this.install_zoom();
         this.install_search();
         this.follow_monitors();
-        this.window.connect_close_request(|window| {
+        let zoom_css = this.zoom_css.clone();
+        this.window.connect_close_request(move |window| {
             window.remove_action("open");
+            remove_css(&zoom_css);
             glib::Propagation::Proceed
         });
         this.window.present();
@@ -3127,6 +3198,7 @@ impl DocWindow {
                     }
                 });
         }
+        session.release_anchor_on_input();
         {
             let weak = Rc::downgrade(&session);
             session.scrolled.vadjustment().connect_changed(move |_| {
@@ -4794,6 +4866,111 @@ mod tests {
         assert!(window.on_monitor.get());
         assert_eq!(session.settings.get().max_px, screen_max_px(&session.view));
         assert_eq!(session.settings.get().scale, screen_scale(&session.view));
+        window.window.close();
+        leak_checks(app);
+    }
+
+    /// Nothing of a closed window outlives it (part of [`gtk_helpers`]): a
+    /// clickable label (a table cell with a link) is freed once dropped,
+    /// its controllers not keeping it alive; and a closed window's zoom CSS
+    /// no longer applies to anything.
+    fn leak_checks(app: &adw::Application) {
+        let blocks = md_viewer::render("| [link](other.md) |\n|---|\n| x |\n");
+        let window = DocWindow::new(app);
+        let session = window.show_document(Path::new("/doc/leak.md"), blocks.clone());
+        let Block::Table(table) = &blocks[0] else {
+            panic!("expected a table");
+        };
+        let content = label_text(&table.header[0]);
+        assert!(!content.links.is_empty());
+        let label = gtk4::Label::new(Some(&content.text));
+        session.make_label_clickable(&label, &content);
+        let weak = label.downgrade();
+        drop(label);
+        assert!(weak.upgrade().is_none(), "a clickable label is freed");
+
+        // A label carrying the window's zoom class is zoomed while the
+        // window is open, and not once it is closed.
+        window.change_zoom(|zoom| zoom.set(2.0));
+        let probe_window = gtk4::Window::new();
+        let probe = gtk4::Label::new(Some("probe"));
+        probe.add_css_class(&window.zoom_class);
+        probe_window.set_child(Some(&probe));
+        probe_window.present();
+        let context = glib::MainContext::default();
+        while context.iteration(false) {}
+        let size = |label: &gtk4::Label| {
+            label
+                .pango_context()
+                .font_description()
+                .map_or(0, |font| font.size())
+        };
+        let zoomed = size(&probe);
+        let expected = (f64::from(window.base_px) * 2.0 * f64::from(pango::SCALE)) as i32;
+        assert!(
+            (zoomed - expected).abs() <= pango::SCALE,
+            "{zoomed} {expected}"
+        );
+        window.window.close();
+        while context.iteration(false) {}
+        let fresh = gtk4::Label::new(Some("fresh"));
+        fresh.add_css_class(&window.zoom_class);
+        probe_window.set_child(Some(&fresh));
+        while context.iteration(false) {}
+        assert!(size(&fresh) < zoomed * 3 / 4, "{} {zoomed}", size(&fresh));
+        probe_window.close();
+        release_checks(app);
+    }
+
+    /// The spot held after a zoom is let go of on any scrolling input
+    /// (part of [`gtk_helpers`]; the controllers' signals are emitted, as
+    /// the tests cannot press keys): a scrolling key, a press on the
+    /// scrollbar and a touch drag release it; another key does not.
+    fn release_checks(app: &adw::Application) {
+        use glib::translate::IntoGlib;
+        let window = DocWindow::new(app);
+        let session =
+            window.show_document(Path::new("/doc/r.md"), md_viewer::render("Some text.\n"));
+        session.start(RasterSettings::default());
+        settle(&session);
+        let find = |widget: &gtk4::Widget| -> Vec<gtk4::EventController> {
+            let controllers = widget.observe_controllers();
+            (0..controllers.n_items())
+                .filter_map(|at| controllers.item(at).and_downcast::<gtk4::EventController>())
+                .filter(|controller| controller.name().as_deref() == Some(RELEASE_CONTROLLER))
+                .collect()
+        };
+        let on_view = find(session.scrolled.upcast_ref());
+        let keys = on_view
+            .iter()
+            .find_map(|c| c.clone().downcast::<gtk4::EventControllerKey>().ok())
+            .expect("key controller");
+        let touch = on_view
+            .iter()
+            .find_map(|c| c.clone().downcast::<gtk4::GestureDrag>().ok())
+            .expect("touch controller");
+        assert!(touch.is_touch_only());
+        let bar = find(&session.scrolled.vscrollbar())
+            .into_iter()
+            .find_map(|c| c.downcast::<gtk4::GestureClick>().ok())
+            .expect("scrollbar controller");
+        let press = |key: gdk::Key| {
+            keys.emit_by_name::<bool>(
+                "key-pressed",
+                &[&key.into_glib(), &0u32, &gdk::ModifierType::empty()],
+            )
+        };
+        session.hold_anchor();
+        assert!(!press(gdk::Key::n));
+        assert!(session.anchor.borrow().is_some(), "another key keeps it");
+        assert!(!press(gdk::Key::Page_Down));
+        assert!(session.anchor.borrow().is_none(), "a scrolling key");
+        session.hold_anchor();
+        bar.emit_by_name::<()>("pressed", &[&1i32, &0.0f64, &0.0f64]);
+        assert!(session.anchor.borrow().is_none(), "the scrollbar");
+        session.hold_anchor();
+        touch.emit_by_name::<()>("drag-begin", &[&0.0f64, &0.0f64]);
+        assert!(session.anchor.borrow().is_none(), "a touch drag");
         window.window.close();
     }
 }

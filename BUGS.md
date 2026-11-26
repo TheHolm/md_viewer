@@ -32,12 +32,8 @@ Background on the rendering crates is in `NOTES.md`.
   the render workers do not reserve their bytes before allocating, so while
   rendering the document can briefly hold up to one graphic per worker
   over the budget (accepted as not a problem).
-- A large image used inline several times is shrunk separately for each
-  use, so each holds its own (small) pixel buffer.
 - A UTF-8 byte-order mark at the start of a file is not stripped, so the
   first heading, list or fence of such a file is shown as plain text.
-- Deeply nested lists cost memory quadratic in the depth (each item writes
-  four spaces per level).
 - Heading anchors collapse runs of hyphens and drop trailing ones, unlike
   GitHub (`Install - Linux` is `install--linux` here, `install---linux` on
   GitHub), so a table of contents copied from GitHub can miss; combining
@@ -45,17 +41,10 @@ Background on the rendering crates is in `NOTES.md`.
 - An image file changed on disk shows the change only when the document is
   reopened or zoomed (nothing watches the file), and a change to a file an
   SVG image refers to (`<image href>`) is not noticed at all until restart.
-- Placing each rendered graphic walks every graphic of the document
-  (`progressive::place`), quadratic in the number of graphics.
-- Clickable table-cell labels hold strong references to themselves through
-  their own controllers, and each window's zoom CSS provider is never
-  removed from the display, so both leak a little per closed window.
 - In regex mode, `.`/`\W`/`\S` match the placeholder character of embedded
   objects (tables, code cards, pictures), inflating the match count. Regex
   mode's `(?i)` uses the regex crate's simple case folding (`ß` does not
   match `ss` there, unlike in the other modes).
-- Only mouse-wheel scrolling releases the "hold the top line" after a zoom;
-  keyboard and scrollbar scrolling are pulled back while it lasts.
 - The window's key handler takes Escape, `n`, `N` and `/` from the error
   dialog and popovers; a double click on a link in a table cell or on a
   linked picture opens it twice.
@@ -63,6 +52,9 @@ Background on the rendering crates is in `NOTES.md`.
   shows `[image: <alt>]` without the reason.
 
 ## Limitations
+
+- Lists (and, for code cards, block quotes) are indented at most
+  `MAX_LIST_INDENT` (4) levels; deeper items line up at the fourth level.
 
 - merman's diagram engines make the binary much larger (about 26.5 MB
   stripped in 0.4.0, 24.7 MB in 0.3.0, about 1.3 MB for 0.1.0).

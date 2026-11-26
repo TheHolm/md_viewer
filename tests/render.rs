@@ -269,6 +269,32 @@ fn nested_lists() {
     assert_eq!(plain_text(&r(source)), "1. a\n    • b\n        • c\n2. d");
 }
 
+/// Indentation stops at `MAX_LIST_INDENT` (4) levels: deeper items line up
+/// there, so a list nested thousands deep (`- - - ... x` on one line) costs
+/// text linear in its depth, not quadratic; code cards stop at that depth
+/// too.
+#[test]
+fn deep_lists_are_capped() {
+    assert_eq!(md_viewer::MAX_LIST_INDENT, 4);
+    let deep = |depth: usize| plain_text(&r(&format!("{}x", "- ".repeat(depth))));
+    let six = deep(6);
+    let lines: Vec<&str> = six.lines().collect();
+    assert_eq!(lines.len(), 6);
+    assert_eq!(lines[3], format!("{}• ", " ".repeat(12)));
+    assert_eq!(lines[4], format!("{}• ", " ".repeat(16)));
+    assert_eq!(lines[5], format!("{}• x", " ".repeat(16)));
+    let depth = 3000;
+    let text = deep(depth);
+    assert!(text.len() < depth * 25, "{} bytes", text.len());
+    let mut nested = String::new();
+    for level in 0..6 {
+        nested += &format!("{}- l{level}\n", "  ".repeat(level));
+    }
+    let fence = "  ".repeat(6);
+    nested += &format!("\n{fence}```\n{fence}y\n{fence}```\n");
+    assert_eq!(code_blocks(&nested), vec![code(None, "y", 4)]);
+}
+
 /// Task list items show `[x]` or `[ ]` after the bullet.
 #[test]
 fn task_list() {

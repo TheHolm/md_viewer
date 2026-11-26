@@ -691,6 +691,24 @@ Things learned the hard way; add to this list when you learn another.
   zooms); the window finding its first monitor is not a move and zooms out
   as usual. The unit tests turn following off (`follows_monitor`) and call
   `rescale` directly; a real monitor move is only checked by hand.
+- The spot held after a zoom (`hold_anchor`) is let go of on user input
+  only: Ctrl-less wheel scrolling (the window's scroll controller), a
+  scrolling key (`layout::is_scroll_key`), a press on the vertical
+  scrollbar and a touch drag (`Session::release_anchor_on_input`, named
+  `RELEASE_CONTROLLER` so the tests find and emit them). Do not release on
+  `value-changed`: GTK moves the value itself while a zoom resizes the page.
+- Each `Job` carries a `progressive::Location` (table cell as row and
+  column, index among the inlines), so `place` stores a result without
+  walking the document; keep `for_each_graphic`'s order and the locations
+  in step (`every_location_reaches_its_graphic`).
+- A GTK controller's closures must not capture the widget the controller
+  is added to (widget -> controller -> closure -> widget is a cycle that is
+  never freed); take it from the controller (`widget()`) or the signal's
+  arguments, as `make_label_clickable` does. A window's zoom CSS provider
+  is added to the display, so its close-request handler removes it.
+- Shrunk inline images are cached by image key and zoom
+  (`Cache::inline_images`), so repeated inline uses share one buffer and
+  the budget counts it once.
 - `read_limited` checks the path, opens with `O_NONBLOCK` (a file swapped
   for a FIFO cannot block the open) and checks the opened file again.
 - `Session::budget` is the document budget as a field only so the GUI unit

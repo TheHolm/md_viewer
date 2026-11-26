@@ -95,6 +95,12 @@ pub fn version() -> &'static str {
     VERSION_FILE.trim()
 }
 
+/// The most levels of indentation written for nested lists (and block
+/// quotes, for code cards): deeper items line up at this depth. Without a
+/// cap, every item of an N-deep list would carry N indentation steps, so
+/// the text (and its memory) would grow with the square of the depth.
+pub const MAX_LIST_INDENT: usize = 4;
+
 /// The text a horizontal rule is rendered as.
 pub const RULE_TEXT: &str = "────────────────────────────────────────";
 
@@ -1140,7 +1146,7 @@ impl Renderer {
             }
             _ => "• ".to_string(),
         };
-        let indent = "    ".repeat(depth);
+        let indent = "    ".repeat(depth.min(MAX_LIST_INDENT));
         self.push(&format!("{indent}{marker}"), Vec::new());
         self.item_fresh = true;
     }
@@ -1203,7 +1209,7 @@ impl Renderer {
             self.item_fresh = false;
         } else if !self.lists.is_empty() {
             self.ensure_newlines(1);
-            let indent = "    ".repeat(self.lists.len());
+            let indent = "    ".repeat(self.lists.len().min(MAX_LIST_INDENT));
             self.push(&indent, Vec::new());
         } else {
             self.ensure_newlines(2);
@@ -1226,7 +1232,7 @@ impl Renderer {
             .iter()
             .filter(|style| **style == Style::Quote)
             .count();
-        quotes + self.lists.len()
+        (quotes + self.lists.len()).min(MAX_LIST_INDENT)
     }
 
     /// Makes the output end with at least `count` newlines, unless the output
